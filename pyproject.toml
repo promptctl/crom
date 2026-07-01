@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "crom"
 version = "0.1.0"
-description = "Chrome profile manager with CDP-enabled launches"
+description = "lunch crom bowser"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
