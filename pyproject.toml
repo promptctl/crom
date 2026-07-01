@@ -3,9 +3,9 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "chrome-connect"
+name = "crom"
 version = "0.1.0"
-description = "Add your description here"
+description = "Chrome profile manager with CDP-enabled launches"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
