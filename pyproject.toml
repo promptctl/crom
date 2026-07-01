@@ -1,0 +1,19 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "chrome-connect"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "click>=8.3.1",
+]
+
+[project.scripts]
+crom = "crom.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["crom"]
