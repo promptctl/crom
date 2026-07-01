@@ -19,7 +19,7 @@ def main(ctx):
 def list_cmd():
     """List all profiles"""
     for name in profiles.list_profiles():
-        status = f"running, port={chrome.debug_port(name)}" if chrome.is_running(name) else "stopped"
+        status = f"running, port={profiles.profile_port(name)}" if chrome.is_running(name) else "stopped"
         click.echo(f"  {name:20s}  [{status}]")
 
 
@@ -74,7 +74,7 @@ def up_cmd(name: str):
         click.echo(f"Unknown profile '{name}'. Run: crom list", err=True)
         return
     if chrome.is_running(name):
-        click.echo(f"Profile '{name}' is already running on port {chrome.debug_port(name)}")
+        click.echo(f"Profile '{name}' is already running on port {profiles.profile_port(name)}")
         return
     port = chrome.launch(name)
     click.echo(f"Started '{name}' on port {port}")

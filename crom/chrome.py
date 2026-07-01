@@ -11,9 +11,11 @@ import shutil
 import signal
 import subprocess
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
-from .profiles import CHROME_SRC, profile_state_dir
+from .profiles import CHROME_SRC, profile_port, profile_state_dir
 
 CHROME_BIN = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 
@@ -60,46 +62,54 @@ def _find_main_pids(name: str) -> list[int]:
     return pids
 
 
-def debug_port(name: str) -> int | None:
-    """The CDP port Chrome chose, read from the DevToolsActivePort file it
-    writes into the profile dir. None when the file is absent (not running,
-    or a running instance that carries no remote-debugging port).
+def _cdp_ready(port: int) -> bool:
+    """True once Chrome's CDP HTTP endpoint answers on this port.
+
+    We probe the endpoint we intend to use rather than Chrome's DevToolsActivePort
+    file: Chrome only writes that file to *report* a port it chose itself (the
+    `--remote-debugging-port=0` case), not when we hand it a fixed port. The live
+    endpoint is the honest readiness signal.
     """
-    port_file = profile_state_dir(name) / "DevToolsActivePort"
     try:
-        return int(port_file.read_text().splitlines()[0])
-    except (FileNotFoundError, IndexError, ValueError):
-        return None
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/json/version", timeout=1
+        ) as resp:
+            return resp.status == 200
+    except (urllib.error.URLError, OSError):
+        return False
 
 
 def launch(name: str) -> int:
-    """Launch Chrome for this profile and return the CDP port it chose.
+    """Launch Chrome for this profile on its stable CDP port and return it.
 
-    `--remote-debugging-port=0` tells Chrome to bind a free port itself and
-    record it in <user-data-dir>/DevToolsActivePort. We clear any stale file
-    first, then poll until Chrome writes the fresh one. [LAW:no-silent-failure]
-    if the port never appears, we raise rather than return a lie.
+    The port comes from the profile config (profile_port), so it is the same on
+    every launch — the contract a client config can rely on. We launch on that
+    port, then poll the CDP endpoint until it answers. [LAW:no-silent-failure]
+    if it never comes up (e.g. the port is already in use), we raise rather than
+    return a lie.
     """
     state_dir = profile_state_dir(name)
     state_dir.mkdir(parents=True, exist_ok=True)
-    (state_dir / "DevToolsActivePort").unlink(missing_ok=True)
+    port = profile_port(name)
     subprocess.Popen(
         [
             CHROME_BIN,
             f"--user-data-dir={state_dir}",
-            "--remote-debugging-port=0",
+            f"--remote-debugging-port={port}",
         ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
-    deadline = time.time() + 10.0
+    deadline = time.time() + 30.0
     while time.time() < deadline:
-        port = debug_port(name)
-        if port is not None:
+        if _cdp_ready(port):
             return port
-        time.sleep(0.05)
-    raise RuntimeError(f"Chrome did not report a debug port for '{name}' within 10s")
+        time.sleep(0.1)
+    raise RuntimeError(
+        f"Chrome did not open CDP port {port} for '{name}' within 30s "
+        f"(is port {port} already in use?)"
+    )
 
 
 def kill(name: str) -> int | None:
