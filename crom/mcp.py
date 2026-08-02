@@ -26,16 +26,23 @@ def write(port: int, path: Path) -> None:
     """Merge the chrome-devtools-mcp server entry for `port` into `path`.
 
     Preserves any other servers already declared in `path`. Raises ValueError
-    if `path` exists and is not valid JSON — we never overwrite a file we
-    can't parse.
+    if `path` exists and its content isn't a JSON object we can merge into
+    (invalid JSON, a non-object root, or a non-object "mcpServers") — we
+    never overwrite a file we can't parse into that shape.
     """
     if path.exists():
         try:
             config = json.loads(path.read_text())
         except json.JSONDecodeError as e:
             raise ValueError(f"{path} exists but is not valid JSON: {e}") from e
+        if not isinstance(config, dict):
+            raise ValueError(f"{path} must contain a JSON object, got {type(config).__name__}")
+        servers = config.setdefault("mcpServers", {})
+        if not isinstance(servers, dict):
+            raise ValueError(f'{path}: "mcpServers" must be an object, got {type(servers).__name__}')
     else:
         config = {}
+        servers = config.setdefault("mcpServers", {})
 
-    config.setdefault("mcpServers", {})[SERVER_NAME] = server_entry(port)
+    servers[SERVER_NAME] = server_entry(port)
     path.write_text(json.dumps(config, indent=2) + "\n")
