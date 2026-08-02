@@ -40,14 +40,18 @@ class WriteTest(unittest.TestCase):
         self.assertEqual(self.path.read_text(), "not json")
 
     def test_rejects_non_object_root(self):
-        self.path.write_text(json.dumps([1, 2, 3]))
+        original = json.dumps([1, 2, 3])
+        self.path.write_text(original)
         with self.assertRaises(ValueError):
             mcp.write(9222, self.path)
+        self.assertEqual(self.path.read_text(), original)
 
     def test_rejects_non_object_mcp_servers(self):
-        self.path.write_text(json.dumps({"mcpServers": "oops"}))
+        original = json.dumps({"mcpServers": "oops"})
+        self.path.write_text(original)
         with self.assertRaises(ValueError):
             mcp.write(9222, self.path)
+        self.assertEqual(self.path.read_text(), original)
 
 
 if __name__ == "__main__":
