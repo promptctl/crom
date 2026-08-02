@@ -19,6 +19,38 @@ from .profiles import CHROME_SRC, profile_port, profile_state_dir
 
 CHROME_BIN = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 
+# How every crom-managed Chrome launches, independent of *which* profile: one quiet,
+# non-phone-home, no-upsell launch policy applied identically on every launch.
+# [LAW:one-source-of-truth] this list is the sole owner of that policy;
+# [LAW:dataflow-not-control-flow] it is data spread into argv, not branches in launch().
+#
+# The top-level switches are long-stable Chrome/Chromium command-line switches. The
+# trailing --disable-features entries are the version-fragile part: Chrome silently
+# ignores feature names it no longer knows, so new promo/upsell surfaces get suppressed
+# by adding a name there, not by touching launch().
+LAUNCH_POLICY_FLAGS = [
+    # "Don't check for default browser" — suppress the default-browser nag.
+    "--no-default-browser-check",
+
+    # "Don't send telemetry." No single switch does this; --disable-background-networking
+    # is the big one (kills UMA metrics upload, field-trial fetches, and component /
+    # safe-browsing update pings at once), and the rest close the remaining back-channels.
+    "--disable-background-networking",
+    "--disable-breakpad",            # crash-report upload
+    "--disable-domain-reliability",  # network-error reports to Google
+    "--no-pings",                    # hyperlink-auditing pings
+
+    # "Don't register a profile / sign-in junk" — skip the first-run welcome/registration
+    # flow and the account sync machinery entirely.
+    "--no-first-run",
+    "--disable-sync",
+
+    # "Don't try to sell me things" — the upsell surfaces. --disable-search-engine-choice-screen
+    # kills the search-engine chooser; ChromeWhatsNewUI is the post-update "What's New" promo tab.
+    "--disable-search-engine-choice-screen",
+    "--disable-features=ChromeWhatsNewUI",
+]
+
 
 def copy_profile(name: str) -> Path:
     dest = profile_state_dir(name)
@@ -94,6 +126,7 @@ def launch(name: str) -> int:
     subprocess.Popen(
         [
             CHROME_BIN,
+            *LAUNCH_POLICY_FLAGS,
             f"--user-data-dir={state_dir}",
             f"--remote-debugging-port={port}",
         ],
