@@ -1,8 +1,10 @@
 """CLI commands for crom"""
 
+from pathlib import Path
+
 import click
 
-from . import chrome, profiles
+from . import chrome, mcp, profiles
 
 
 @click.group(invoke_without_command=True)
@@ -78,6 +80,24 @@ def up_cmd(name: str):
         return
     port = chrome.launch(name)
     click.echo(f"Started '{name}' on port {port}")
+
+
+@main.command("mcp")
+@click.argument("name", required=False, default="default")
+def mcp_cmd(name: str):
+    """Write .mcp.json in the current directory, wired to this profile's CDP port"""
+    if profiles.get_profile(name) is None:
+        click.echo(f"Unknown profile '{name}'. Run: crom list", err=True)
+        return
+
+    port = profiles.profile_port(name)
+    try:
+        mcp.write(port, Path(".mcp.json"))
+    except ValueError as e:
+        click.echo(str(e), err=True)
+        return
+
+    click.echo(f"Wrote .mcp.json wired to profile '{name}' (port {port})")
 
 
 @main.command("down")
