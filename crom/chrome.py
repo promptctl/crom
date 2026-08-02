@@ -39,6 +39,9 @@ LAUNCH_POLICY_FLAGS = [
     "--disable-breakpad",            # crash-report upload
     "--disable-domain-reliability",  # network-error reports to Google
     "--no-pings",                    # hyperlink-auditing pings
+    # A separate real-time channel background-networking does NOT close: the Safe
+    # Browsing phishing lookup on navigation. Trade-off: no client-side phishing check.
+    "--disable-client-side-phishing-detection",
 
     # "Don't register a profile / sign-in junk" — skip the first-run welcome/registration
     # flow and the account sync machinery entirely.
@@ -49,6 +52,9 @@ LAUNCH_POLICY_FLAGS = [
     # kills the search-engine chooser; ChromeWhatsNewUI is the post-update "What's New" promo tab.
     "--disable-search-engine-choice-screen",
     "--disable-features=ChromeWhatsNewUI",
+
+    # Quiet UI — chrome-only nags, invisible to web content.
+    "--disable-session-crashed-bubble",  # no "Chrome didn't shut down correctly" bubble
 ]
 
 
