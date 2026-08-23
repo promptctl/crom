@@ -3,13 +3,34 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from crom import config
-from crom.model import CromError, SeedChrome, SeedFresh, SeedPath
+from crom.model import Conflict, CromError, SeedChrome, SeedFresh, SeedPath
 
 SOURCE = Path("/proj/.crom.toml")
 
 MINIMAL = 'namespace = "myapp"\n'
+
+_chrome_stub = None
+
+
+def setUpModule():
+    """Keep the parser's tests about the parser.
+
+    `config.parse` resolves `chrome_binary` unconditionally, and the fixtures here omit
+    it — so without this every test below falls through to a live `find_chrome()`, and
+    the whole module fails with "no Chrome executable found" on a machine that has none,
+    while claiming to test unknown-key rejection and friends. The tests that are
+    genuinely about `chrome_binary` pass one explicitly and never reach the stub.
+    """
+    global _chrome_stub
+    _chrome_stub = mock.patch.object(config, "find_chrome", return_value=Path("/stub/chrome"))
+    _chrome_stub.start()
+
+
+def tearDownModule():
+    _chrome_stub.stop()
 
 
 def parse(text: str, **kwargs):
@@ -22,7 +43,11 @@ class NamespaceTest(unittest.TestCase):
             parse("[profiles.dev]\n")
 
     def test_user_namespace_is_reserved(self):
-        with self.assertRaisesRegex(CromError, "reserved"):
+        # Conflict specifically, not merely CromError: `crom init` and
+        # `registry.forget_namespace` refuse the same reserved name as exit 4, and a
+        # script branching on that code must see it from every path that decides it.
+        # Conflict subclasses CromError, so asserting the base would pass either way.
+        with self.assertRaisesRegex(Conflict, "reserved"):
             parse('namespace = "user"\n')
 
     def test_user_scope_file_may_not_redeclare_its_namespace(self):
@@ -72,7 +97,12 @@ class ChromeSeedNameTest(unittest.TestCase):
             parse(MINIMAL + '[profiles.dev]\nseed = "chrome:/etc"\n')
 
     def test_a_traversal_cannot_masquerade_as_a_profile_name(self):
-        for which in ("../../../etc", "..", ".", "sub/dir", "~/secrets"):
+        # The last three are the ones that slipped an earlier version of this check:
+        # `Path("/").parts` is `('/',)` — one component — and pathlib drops `.` and
+        # trailing-empty components, so `../` and `./..` normalize to `('..',)` while
+        # the raw string equals neither `.` nor `..`. Listed explicitly because they are
+        # exactly what a reader will not re-derive.
+        for which in ("../../../etc", "..", ".", "sub/dir", "~/secrets", "/", "../", "./.."):
             with self.subTest(which=which), self.assertRaisesRegex(CromError, "not a profile name"):
                 parse(MINIMAL + f'[profiles.dev]\nseed = "chrome:{which}"\n')
 

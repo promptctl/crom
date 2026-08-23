@@ -151,7 +151,14 @@ def _parse_chrome_profile(which: str, where: str, source: Path) -> str:
             f"{source}: {where}.seed = 'chrome:' names no profile. Use 'chrome' for the "
             f"default profile, or 'chrome:<Profile Name>' for a specific one."
         )
-    if which in (".", "..") or len(Path(which).parts) != 1 or which.startswith("~"):
+    # Each clause tests the representation it is actually about. Mixing them — a
+    # normalized component count against a raw-string comparison — leaves a gap between
+    # the two: pathlib drops `.` and empty components, so `../` and `./..` both normalize
+    # to `('..',)` while the raw value equals neither `.` nor `..`; and `Path('/').parts`
+    # is `('/',)`, one component, so a bare `/` passed a length check and then collapsed
+    # the join to the filesystem root.
+    parts = Path(which).parts
+    if "/" in which or which.startswith("~") or len(parts) != 1 or parts[0] in (".", ".."):
         raise CromError(
             f"{source}: {where}.seed = 'chrome:{which}' is not a profile name. It must "
             f"name one directory inside your Chrome user-data-dir (e.g. 'Default', "
@@ -217,7 +224,10 @@ def parse(text: str, source: Path, *, namespace: str | None = None) -> Scope:
             )
         namespace = validate_name("namespace", declared)
         if namespace == USER_NAMESPACE:
-            raise CromError(
+            # `Conflict` (exit 4), matching `crom init` and `registry.forget_namespace`,
+            # which refuse the same reserved name. A script branching on exit 4 to detect
+            # "that name is taken" must see it from every path that decides it.
+            raise Conflict(
                 f'{source}: namespace "{USER_NAMESPACE}" is reserved for your personal '
                 f"profiles in {user_config_file()}. Choose another name."
             )
