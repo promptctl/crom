@@ -40,17 +40,52 @@ jobs:
     name: Review
     runs-on: ubuntu-latest
     # Cap a hung review (network stall, API retry loop) instead of letting it hold
-    # a runner for GitHub's 6-hour default. Reviews finish in ~2-4 min.
-    timeout-minutes: 15
+    # a runner for GitHub's 6-hour default. Reviews finish in ~2-4 min typically,
+    # but API congestion has stretched successful runs to 11-15 min (observed
+    # 2026-08: two runs were killed at a 15-min cap and passed on rerun), so the
+    # cap sits well above that tail.
+    timeout-minutes: 30
     steps:
       - name: Checkout pull request
+        # Moving major tag, for the same reason as the action pin above: a SHA here puts
+        # every consuming repo back on the re-bump treadmill, for a first-party GitHub
+        # action where the major tag is the standard reference. The rule is "track the
+        # moving major", not "the literal string v1" — `v6` IS checkout's current major,
+        # and `@v1` would pin a 2019 Node-12 release that no longer runs.
+        #
+        # No label rides beside it: the ref already says v6, so a trailing `# v6` would be
+        # a copy of the line it sits on. [LAW:comments-carry-meaning]
         uses: actions/checkout@v6
         with:
           ref: ${{ github.event.pull_request.head.sha }}
+          # This is an UNTRUSTED checkout — the PR head, from any fork. The default
+          # (persist-credentials: true) writes GITHUB_TOKEN into .git/config inside that
+          # tree, where anything later executing out of the checkout can read a credential
+          # it was never handed. The token's scope here is issues+PR write, not the
+          # contents:read the checkout itself needs, so what leaks is broader than what
+          # the step does. Nothing in this job pushes or fetches over authenticated git —
+          # the review reads the diff through the API with the GITHUB_TOKEN input, and
+          # DEPENDENCY_DIFF uses the compare API — so persisting it buys nothing and is
+          # off. The review action still gets a token explicitly, via its own
+          # `default: ${{ github.token }}` input; this only stops the copy on disk.
+          persist-credentials: false
 
+      # Pinned to the moving `v1` tag on purpose: this repo tracks the action's latest
+      # release with no edit here, ever. Pinning a SHA instead would mean a PR against
+      # every consuming repo for every release, which in practice means none of them get
+      # updated. The ref is chosen in install.sh, which owns this file.
+      #
+      # BOTH credentials are passed on purpose. PROVIDER defaults to `auto`, which the
+      # action retargets centrally — it moved from deepseek to claude-subscription in
+      # 1.42.0 — and a workflow carrying only the then-current target's secret breaks the
+      # day it moves. Passing both means a retarget needs no edit here: PROVIDER alone
+      # selects the provider and credential presence never steers it, so the unused input
+      # is simply never read. The action fails loudly, before spending anything, if the
+      # credential for the CURRENT target is the one missing.
       - name: Code Review
-        uses: brandon-fryslie/coding-agent-review@v1
+        uses: promptctl/copirate-code-review-agent@v1
         with:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           # DEPENDENCY_DIFF is on for EVERY repo this installs into — a deliberate
           # universal default baked into the template, NOT a per-repo divergence that
