@@ -133,6 +133,91 @@ class CliTest(unittest.TestCase):
         self.crom("init")
         self.crom("add", "ci", "--flag", "--user-data-dir=/tmp/x", expect=1)
 
+    def test_add_refuses_a_port_outside_the_legal_range(self):
+        """click only proves `--port` is an int. An out-of-range value used to be written
+        to the file and then rejected by the parser on the next load — bricking every
+        command in the project, the exact failure `add` is otherwise careful to avoid."""
+        self.crom("init")
+        before = (self.project / ".crom.toml").read_text()
+
+        for bad in ("0", "-5", "99999"):
+            with self.subTest(port=bad):
+                self.crom("add", "ci", "--port", bad, expect=1)
+
+        self.assertEqual((self.project / ".crom.toml").read_text(), before)
+        self.crom("list")  # the project is still usable
+
+    def test_add_refuses_the_port_reserved_for_the_default_profile(self):
+        self.crom("init")
+        self.crom("add", "ci", "--port", "9222", expect=4)
+
+    def test_a_failed_declaration_leaves_no_port_reserved(self):
+        """Resolution persists a reservation before the declaration is written. A write
+        that fails would strand it: no config declares the profile, so `crom rm` cannot
+        reach it, and it can refuse a later profile that port."""
+        self.crom("init")
+        target = self.project / ".crom.toml"
+
+        with mock.patch("crom.configwrite.add_profile", side_effect=OSError("disk full")):
+            self.crom("add", "ci", expect=1)
+
+        self.assertNotIn("ci", target.read_text())
+        reserved = json.loads((state_home() / "registry.json").read_text())["ports"]
+        self.assertNotIn("myproj/ci", reserved)
+
+    def test_forget_refuses_the_reserved_user_namespace(self):
+        """`crom forget user` would release the ports personal profiles are using; they
+        would then silently come back on different numbers."""
+        self.crom("list")  # bootstraps user/default and reserves its port
+        before = self.crom("port", "user/default")
+
+        self.crom("forget", "user", expect=4)
+
+        self.assertEqual(self.crom("port", "user/default"), before)
+
+    def test_list_all_survives_a_namespace_whose_config_is_gone(self):
+        """`crom forget` is the documented cleanup for a stale namespace — but listing is
+        how a user discovers there is one, so it must not be the command that dies."""
+        other = self.root / "other"
+        other.mkdir()
+        self.crom("init", cwd=other)
+        self.crom("add", "dev", cwd=other)
+        (other / ".crom.toml").unlink()
+
+        self.crom("init")
+        self.crom("add", "mine")
+
+        output = self.crom("list", "--all")
+
+        self.assertIn("myproj/mine", output)   # the healthy profile is still listed
+        self.assertIn("other", output)         # and the broken namespace is named
+        self.assertIn("unavailable", output)
+
+    def test_list_reports_an_unresolvable_profile_without_hiding_the_others(self):
+        self.crom("init")
+        self.crom("add", "good")
+        config_path = self.project / ".crom.toml"
+        config_path.write_text(
+            config_path.read_text() + '\n[profiles.broken]\nflags = ["--x=${CROM_NOPE}"]\n'
+        )
+
+        output = self.crom("list")
+
+        self.assertIn("myproj/good", output)
+        self.assertIn("myproj/broken", output)
+        self.assertIn("unresolved", output)
+
+    def test_init_names_a_namespace_after_a_dotted_or_underscored_directory(self):
+        """`_slug` stripped only `-`, so `.dotfiles` slugified unchanged and then failed
+        name validation — a confusing error from a command that promises to work in any
+        directory."""
+        for raw, expected in ((".dotfiles", "dotfiles"), ("_internal", "internal"), ("...", "project")):
+            with self.subTest(directory=raw):
+                here = self.root / raw
+                here.mkdir()
+                self.crom("init", cwd=here)
+                self.assertIn(f'namespace = "{expected}"', (here / ".crom.toml").read_text())
+
     def test_up_on_an_undeclared_profile_exits_not_found(self):
         self.crom("init")
         self.crom("up", "ghost", expect=3)

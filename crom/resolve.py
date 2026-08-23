@@ -13,7 +13,9 @@ from . import registry
 from .config import load_file, load_user_scope
 from .model import (
     CromError,
+    FailedProfile,
     NotFound,
+    ProfileEntry,
     ProfileRef,
     ProfileSpec,
     ResolvedProfile,
@@ -38,6 +40,39 @@ def _expand(text: str, variables: dict[str, str], where: str) -> str:
         return variables[key]
 
     return _VAR_RE.sub(replace, text)
+
+
+def _variables(ref: ProfileRef, profile_dir: Path, config_dir: Path, port: int | None) -> dict[str, str]:
+    """The closed vocabulary a config may interpolate, in one place.
+
+    `port` is None while we are still checking *which* names a config refers to — the
+    set of legal names is the same either way, and deriving both the check and the
+    expansion from this one function keeps them from drifting into two vocabularies.
+    [LAW:one-source-of-truth]
+    """
+    return {
+        "CROM_NAMESPACE": ref.namespace,
+        "CROM_PROFILE": ref.name,
+        "CROM_PORT": "" if port is None else str(port),
+        "CROM_PROFILE_DIR": str(profile_dir),
+        "CROM_CONFIG_DIR": str(config_dir),
+    }
+
+
+def _reject_unknown_variables(texts: tuple[str, ...], known: dict[str, str], where: str) -> None:
+    """Raise for any `${VAR}` outside the vocabulary, expanding nothing.
+
+    Exists so the one way resolution can fail is reachable *before* a port is reserved.
+    A `${CROM_PROFIL_DIR}` typo used to raise after `port_for` had already written to the
+    machine-wide ledger, stranding a reservation for a profile that never resolved —
+    which then blocked an unrelated profile from claiming that port, with no command
+    able to release it.
+    """
+    for text in texts:
+        for match in _VAR_RE.finditer(text):
+            if match.group(1) not in known:
+                names = ", ".join(f"${{{k}}}" for k in sorted(known))
+                raise CromError(f"{where}: unknown variable ${{{match.group(1)}}} (known: {names})")
 
 
 def build_argv(
@@ -101,18 +136,25 @@ def resolve(ref: ProfileRef, ambient: Scope) -> ResolvedProfile:
 
 def resolve_spec(ref: ProfileRef, scope: Scope, spec: ProfileSpec) -> ResolvedProfile:
     profile_dir = scope.profiles_root / ref.namespace / ref.name
+    where = str(scope.source or "user config")
+    raw_flags = (*scope.default_flags, *spec.flags)
+    raw_env = {**scope.default_env, **spec.env}
+
+    # [LAW:effects-at-boundaries] Every way this resolution can fail runs first, while
+    # it is still pure. `port_for` writes a reservation into the machine-wide ledger the
+    # moment it is called, so a failure after it would leave that reservation behind
+    # with no profile and no way for the user to reclaim the port.
+    _reject_unknown_variables(
+        (*raw_flags, *raw_env.values()),
+        _variables(ref, profile_dir, scope.config_dir, None),
+        where,
+    )
+
     port = registry.port_for(ref, pinned=spec.port, source=scope.source)
 
-    variables = {
-        "CROM_NAMESPACE": ref.namespace,
-        "CROM_PROFILE": ref.name,
-        "CROM_PORT": str(port),
-        "CROM_PROFILE_DIR": str(profile_dir),
-        "CROM_CONFIG_DIR": str(scope.config_dir),
-    }
-    where = str(scope.source or "user config")
-    flags = tuple(_expand(f, variables, where) for f in (*scope.default_flags, *spec.flags))
-    env = {k: _expand(v, variables, where) for k, v in {**scope.default_env, **spec.env}.items()}
+    variables = _variables(ref, profile_dir, scope.config_dir, port)
+    flags = tuple(_expand(f, variables, where) for f in raw_flags)
+    env = {k: _expand(v, variables, where) for k, v in raw_env.items()}
 
     seed: Seed = spec.seed if spec.seed is not None else scope.default_seed
 
@@ -128,9 +170,19 @@ def resolve_spec(ref: ProfileRef, scope: Scope, spec: ProfileSpec) -> ResolvedPr
     )
 
 
-def resolve_all(scope: Scope) -> list[ResolvedProfile]:
-    """Every profile a scope declares, resolved — the list `crom list` reports."""
-    return [
-        resolve_spec(ProfileRef(scope.namespace, name), scope, spec)
-        for name, spec in sorted(scope.profiles.items())
-    ]
+def resolve_all(scope: Scope) -> list[ProfileEntry]:
+    """Every profile a scope declares, resolved or explained — what `crom list` reports.
+
+    Failures are isolated per profile and returned as `FailedProfile`. Letting one bad
+    declaration propagate would abort the whole listing, and `crom list` is exactly what
+    a user runs to find out which declaration is bad — the command would fail hardest in
+    the situation it exists for.
+    """
+    entries: list[ProfileEntry] = []
+    for name, spec in sorted(scope.profiles.items()):
+        ref = ProfileRef(scope.namespace, name)
+        try:
+            entries.append(resolve_spec(ref, scope, spec))
+        except CromError as error:
+            entries.append(FailedProfile(ref, str(error)))
+    return entries

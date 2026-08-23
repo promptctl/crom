@@ -21,10 +21,11 @@ from pathlib import Path
 import click
 
 from . import chrome, config, configwrite, mcp, migrate, registry, resolve as resolver, seed
-from .config import discover, load_ambient, load_user_scope, parse_flags, parse_seed
+from .config import discover, load_ambient, load_user_scope, parse_flags, parse_port, parse_seed
 from .model import (
     Conflict,
     CromError,
+    FailedProfile,
     NotFound,
     ProfileRef,
     ProfileSpec,
@@ -128,7 +129,8 @@ def up_cmd(session: _Session, ref: str, as_json: bool):
     if not profile.profile_dir.exists():
         # Say so before the copy, not after: a `chrome` seed moves hundreds of megabytes
         # and an unexplained pause looks like a hang.
-        click.echo(f"Creating {profile.ref} from seed '{configwrite.render_seed(profile.seed)}' …", err=True)
+        rendered = configwrite.render_seed(profile.seed, profile.config_dir)
+        click.echo(f"Creating {profile.ref} from seed '{rendered}' …", err=True)
     seed.materialize(profile)
 
     pids = chrome.find_pids(profile)
@@ -166,28 +168,55 @@ def down_cmd(session: _Session, ref: str, as_json: bool):
 @click.pass_obj
 def list_cmd(session: _Session, everything: bool, as_json: bool):
     """List the profiles addressable from here."""
-    scopes = [session.scope]
-    if not session.scope.is_user:
-        scopes.append(load_user_scope())
-    if everything:
-        scopes.extend(
-            resolver.scope_for(namespace, session.scope)
-            for namespace in sorted(registry.namespaces())
-            if namespace != session.scope.namespace
-        )
+    scopes, unavailable = _scopes_to_list(session, everything)
 
     live = chrome.scan()
     records, lines = [], []
     for scope in scopes:
-        for profile in resolver.resolve_all(scope):
-            running, pids = _status(profile, live)
-            records.append(profile.describe(running=running, pids=pids))
-            state = f"running :{profile.port}" if running else f"stopped :{profile.port}"
-            lines.append(f"  {str(profile.ref):28s}  {state}")
+        for entry in resolver.resolve_all(scope):
+            match entry:
+                case ResolvedProfile():
+                    running, pids = _status(entry, live)
+                    records.append(entry.describe(running=running, pids=pids))
+                    state = f"running :{entry.port}" if running else f"stopped :{entry.port}"
+                    lines.append(f"  {str(entry.ref):28s}  {state}")
+                case FailedProfile():
+                    records.append(entry.describe())
+                    lines.append(f"  {str(entry.ref):28s}  unresolved — {entry.error}")
         if not scope.profiles:
             lines.append(f"  {scope.namespace}/ — no profiles declared in {scope.source or 'user config'}")
 
+    for namespace, error in unavailable:
+        records.append({"namespace": namespace, "error": error})
+        lines.append(f"  {namespace + '/':28s}  unavailable — {error}")
+
     _emit(as_json, records, lines)
+
+
+def _scopes_to_list(session: _Session, everything: bool) -> tuple[list[Scope], list[tuple[str, str]]]:
+    """The scopes `crom list` should report, plus the namespaces it could not load.
+
+    A remembered namespace whose config file has been deleted or moved raises `NotFound`
+    from `scope_for` — and `crom forget` is the documented cleanup for exactly that. One
+    stale entry used to abort the entire listing, so the command that would have shown
+    the user which namespace was broken was the one command that could not run. Each
+    namespace is isolated and reported by name instead. [LAW:no-silent-failure] nothing
+    is skipped quietly: the failure is a row in the output, human and JSON alike.
+    """
+    scopes = [session.scope]
+    if not session.scope.is_user:
+        scopes.append(load_user_scope())
+
+    unavailable: list[tuple[str, str]] = []
+    if everything:
+        for namespace in sorted(registry.namespaces()):
+            if namespace == session.scope.namespace:
+                continue
+            try:
+                scopes.append(resolver.scope_for(namespace, session.scope))
+            except CromError as error:
+                unavailable.append((namespace, str(error)))
+    return scopes, unavailable
 
 
 @main.command("add")
@@ -206,11 +235,18 @@ def add_cmd(session: _Session, name: str, seed_text: str, flags: tuple[str, ...]
     validate_name("profile name", name)
     scope = session.scope
     target = scope.source or user_config_file()
+    where = f"[profiles.{name}]"
     spec = ProfileSpec(
         name=name,
-        flags=parse_flags(list(flags), f"[profiles.{name}]", target),
-        seed=parse_seed(seed_text, f"[profiles.{name}]", target, scope.config_dir),
-        port=port,
+        flags=parse_flags(list(flags), where, target),
+        seed=parse_seed(seed_text, where, target, scope.config_dir),
+        # Through `parse_port`, the same validator a port from the file goes through.
+        # click only proves this is an int, so `--port 0` or `--port 99999` used to be
+        # written to disk and then rejected by the parser on the next load — bricking
+        # every command in the project, which is the failure the comment below is about
+        # to describe going to lengths to avoid. [LAW:single-enforcer] the range rule has
+        # one home; this path was bypassing it rather than needing a copy.
+        port=parse_port(port, where, target),
     )
     # Every reason to refuse this profile is checked before anything is persisted, and
     # the two orderings that look equivalent are not:
@@ -230,10 +266,19 @@ def add_cmd(session: _Session, name: str, seed_text: str, flags: tuple[str, ...]
     config.reject_duplicate_ports({**scope.profiles, name: spec}, target)
     profile = resolver.resolve_spec(ProfileRef(scope.namespace, name), scope, spec)
 
+    # Resolution above already persisted a port reservation. If the declaration does not
+    # land, that reservation is for a profile no config declares — unreachable by `crom
+    # rm` (which resolves by name first) and able to refuse a legitimate profile the port
+    # later via `_reject_foreign_claim`. Any failure releases it, not only the
+    # anticipated one: a permission error or a full disk strands it exactly the same way.
     try:
         configwrite.add_profile(target, spec, header=configwrite.USER_CONFIG_HEADER)
     except FileExistsError as e:
+        registry.forget(profile.ref)
         raise Conflict(str(e)) from e
+    except BaseException:
+        registry.forget(profile.ref)
+        raise
 
     click.echo(f"Declared {profile.ref} in {target}")
     click.echo(f"  port {profile.port} · {profile.profile_dir}")
@@ -260,8 +305,14 @@ def rm_cmd(session: _Session, ref: str, yes: bool, keep_data: bool):
         )
 
     scope = resolver.scope_for(profile.ref.namespace, session.scope)
-    configwrite.remove_profile(scope.source or user_config_file(), profile.ref.name)
+    # Release the reservation before removing the declaration, not after. Both orderings
+    # can be interrupted, but they strand different things: undeclaring first leaves a
+    # port held by a profile no longer nameable, so no command can reach it to retry.
+    # Releasing first leaves a declared profile without a reservation, which the next
+    # resolve heals by assigning one. Between two interruptible steps, take the one whose
+    # failure is recoverable.
     registry.forget(profile.ref)
+    configwrite.remove_profile(scope.source or user_config_file(), profile.ref.name)
     if not keep_data and profile.profile_dir.exists():
         shutil.rmtree(profile.profile_dir)
     click.echo(f"Removed {profile.ref}")
@@ -368,7 +419,15 @@ def forget_cmd(namespace: str):
 
 
 def _slug(text: str) -> str:
-    return re.sub(r"[^a-z0-9._-]+", "-", text.lower()).strip("-") or "project"
+    """A directory name turned into something `validate_name` will accept.
+
+    Stripping `._-` from both ends, not just `-`: `.` and `_` survive the substitution
+    because they are inside the allowed class, so a directory named `.dotfiles` or
+    `_internal` used to slugify unchanged and then fail name validation — a confusing
+    error from a command whose whole promise is that it works in any directory. Stripping
+    them also lets an all-punctuation name fall through to the `project` fallback.
+    """
+    return re.sub(r"[^a-z0-9._-]+", "-", text.lower()).strip("._-") or "project"
 
 
 def _human_size(directory: Path) -> str:

@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 
 from crom import config, registry, resolve
-from crom.model import CromError, ProfileRef, parse_ref
+from crom.model import CromError, FailedProfile, ProfileRef, ResolvedProfile, parse_ref
 from crom.policy import LAUNCH_POLICY_FLAGS
 
 MINIMAL = 'namespace = "myapp"\n'
@@ -133,6 +133,41 @@ class ResolveTest(unittest.TestCase):
         scope = self.scope(MINIMAL + '[profiles.dev]\nflags = ["--x=${CROM_NOPE}"]\n')
         with self.assertRaisesRegex(CromError, "unknown variable"):
             resolve.resolve(ProfileRef("myapp", "dev"), scope)
+
+    def test_a_failed_resolution_reserves_no_port(self):
+        """`port_for` writes to the machine-wide ledger the moment it is called.
+
+        Reserving before the last thing that can fail left a port held by a profile that
+        never resolved — unreleasable, and able to refuse a legitimate profile that port
+        later. Every fallible step now runs while resolution is still pure.
+        """
+        scope = self.scope(MINIMAL + '[profiles.dev]\nflags = ["--x=${CROM_PROFIL_DIR}"]\n')
+        with self.assertRaisesRegex(CromError, "unknown variable"):
+            resolve.resolve(ProfileRef("myapp", "dev"), scope)
+        self.assertEqual(registry.reservations(), {})
+
+    def test_an_unknown_variable_in_env_also_reserves_no_port(self):
+        scope = self.scope(MINIMAL + '[profiles.dev]\nenv = {A = "${CROM_NOPE}"}\n')
+        with self.assertRaisesRegex(CromError, "unknown variable"):
+            resolve.resolve(ProfileRef("myapp", "dev"), scope)
+        self.assertEqual(registry.reservations(), {})
+
+    def test_one_bad_profile_does_not_hide_the_others_in_a_listing(self):
+        """`crom list` is what a user runs *because* something is broken.
+
+        Letting one unresolvable declaration propagate made the command fail hardest in
+        the situation it exists for. The failure is returned as a value instead — still
+        reported, just no longer fatal to its neighbours.
+        """
+        scope = self.scope(
+            MINIMAL + '[profiles.good]\n[profiles.bad]\nflags = ["--x=${CROM_NOPE}"]\n'
+        )
+        entries = resolve.resolve_all(scope)
+        by_name = {str(e.ref): e for e in entries}
+
+        self.assertIsInstance(by_name["myapp/good"], ResolvedProfile)
+        self.assertIsInstance(by_name["myapp/bad"], FailedProfile)
+        self.assertIn("unknown variable", by_name["myapp/bad"].error)
 
     def test_an_undeclared_profile_names_what_is_declared(self):
         scope = self.scope(MINIMAL + "[profiles.dev]\n[profiles.ci]\n")

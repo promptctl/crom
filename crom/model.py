@@ -154,6 +154,15 @@ class ResolvedProfile:
     def cdp_url(self) -> str:
         return f"http://127.0.0.1:{self.port}"
 
+    @property
+    def config_dir(self) -> Path:
+        """The directory this profile's relative paths are written and read against.
+
+        The same notion `Scope.config_dir` carries, available downstream of resolution
+        so a seed can be rendered back in the spelling its config file would use.
+        """
+        return self.source.parent if self.source else Path.cwd()
+
     def describe(self, *, running: bool, pids: tuple[int, ...]) -> dict:
         """The machine-readable view — the contract `--json` output promises.
 
@@ -172,6 +181,37 @@ class ResolvedProfile:
             "running": running,
             "pids": list(pids),
         }
+
+
+@dataclass(frozen=True)
+class FailedProfile:
+    """A declared profile that could not be resolved, carried as a value not a raise.
+
+    `crom list` is the command a user reaches for *because* something is broken, so one
+    unresolvable declaration must not hide every working one. [LAW:no-silent-failure]
+    this is not a swallow: the failure is rendered inline in the listing and present in
+    `--json`, so it is strictly more visible than the traceback it replaces — what
+    changes is that it no longer takes the other profiles down with it.
+
+    [LAW:dataflow-not-control-flow] `resolve_all` returns this alongside
+    `ResolvedProfile`, so the variability is in the values the caller matches on rather
+    than in whether the listing runs.
+    """
+
+    ref: ProfileRef
+    error: str
+
+    def describe(self) -> dict:
+        return {
+            "namespace": self.ref.namespace,
+            "profile": self.ref.name,
+            "ref": str(self.ref),
+            "error": self.error,
+        }
+
+
+# What one entry in a listing is: resolved, or explaining why it is not.
+ProfileEntry = ResolvedProfile | FailedProfile
 
 
 def parse_ref(text: str, ambient: str) -> ProfileRef:
