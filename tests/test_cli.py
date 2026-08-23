@@ -29,6 +29,13 @@ class CliTest(unittest.TestCase):
         self.env = mock.patch.dict(
             os.environ,
             {
+                # HOME as well as the XDG variables, and not optional: `main` runs
+                # `migrate.run_if_needed()` before every command, and migration locates
+                # the legacy installation through `Path.home()` — the one lookup that
+                # deliberately ignores XDG, because that is where the pre-namespace crom
+                # actually wrote. Without this the suite would find a developer's real
+                # `~/.config/crom/profiles.json` and migrate their actual profiles.
+                "HOME": str(self.root / "home"),
                 "XDG_CONFIG_HOME": str(self.root / "config"),
                 "XDG_STATE_HOME": str(self.root / "state"),
             },
@@ -56,6 +63,22 @@ class CliTest(unittest.TestCase):
         return result.output
 
     # --- bootstrap ------------------------------------------------------------------
+
+    def test_the_suite_cannot_reach_the_real_home(self):
+        """A guard rail rather than a feature test.
+
+        `main` runs `migrate.run_if_needed()` before every command, and migration
+        locates the legacy installation through `Path.home()` — the one lookup that
+        deliberately ignores XDG, because that is where the pre-namespace crom actually
+        wrote. A harness redirecting only the XDG variables would let this suite find a
+        developer's real `~/.config/crom/profiles.json` and migrate their profiles
+        mid-run. If this fails, stop and fix the harness before trusting any result.
+        """
+        from crom import migrate
+
+        self.assertTrue(str(Path.home()).startswith(str(self.root)))
+        self.assertTrue(str(migrate.legacy_registry_file()).startswith(str(self.root)))
+        self.assertFalse(migrate.needed())
 
     def test_first_run_declares_a_user_default_profile(self):
         self.crom("list")
@@ -392,6 +415,50 @@ class CliTest(unittest.TestCase):
             self.crom("rm", "ci", "--yes", expect=4)
         self.assertIn("[profiles.ci]", (self.project / ".crom.toml").read_text())
 
+    def test_rm_re_reads_liveness_under_the_lock(self):
+        """A `crom up` that starts in the window must not have its browser deleted.
+
+        `up_cmd` holds `profile_lock` across its own check-and-launch, so the launch
+        either precedes this command's lock or follows its delete. What makes that
+        useful is re-reading liveness *inside* the lock: the check before the
+        confirmation prompt cannot speak for the state after it, since the prompt is
+        deliberately not held under the lock.
+
+        The concurrent launch is modelled by answering "not running" once and "running"
+        thereafter — exactly what `rm` observes when a browser starts between the two
+        reads. Without the second read this deletes a live profile and reports success.
+        """
+        self.crom("init")
+        self.crom("add", "ci")
+        profile_dir = Path(json.loads(self.crom("config", "ci", "--json"))["resolved"]["profile_dir"])
+        profile_dir.mkdir(parents=True)
+
+        answers = iter([False, True])
+
+        with mock.patch("crom.cli.chrome.is_running", lambda _profile: next(answers)):
+            self.crom("rm", "ci", "--yes", expect=4)
+
+        self.assertTrue(profile_dir.exists())
+        self.assertIn("[profiles.ci]", (self.project / ".crom.toml").read_text())
+
+    def test_the_size_prompt_counts_only_what_the_delete_reclaims(self):
+        """`_human_size` measures what removing the directory frees, so a symlink's
+        target — which is not deleted — must not be counted, and a dangling link must
+        not raise. A raw OSError from a mid-walk `stat` is not a CromError either, so it
+        would escape the exit-code contract as a traceback from a helper whose only job
+        is to be informative before a destructive act."""
+        directory = self.root / "profile"
+        (directory / "sub").mkdir(parents=True)
+        (directory / "sub" / "real.bin").write_bytes(b"x" * 2048)
+
+        outside = self.root / "huge.bin"
+        outside.write_bytes(b"y" * 100_000)
+        (directory / "link-to-huge").symlink_to(outside)
+        (directory / "dangling").symlink_to(self.root / "gone")
+
+        size = cli._human_size(directory)
+        self.assertEqual(size, "2KB")  # 2048 bytes, and neither link counted
+
     # --- seeding --------------------------------------------------------------------
 
     def test_project_profiles_default_to_a_fresh_seed(self):
@@ -406,6 +473,8 @@ class CliTest(unittest.TestCase):
         profile_dir = json.loads(self.crom("config", "default", "--json"))["resolved"]["profile_dir"]
         self.assertTrue(profile_dir.startswith(str(self.project / ".crom" / "profiles")))
         self.assertFalse(profile_dir.startswith(str(state_home())))
+
+
 
 
 if __name__ == "__main__":

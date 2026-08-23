@@ -13,10 +13,12 @@ exit codes are a contract a script can branch on:
 """
 
 import json
+import os
 import re
 import shlex
 import shutil
 from pathlib import Path
+from stat import S_ISREG
 
 import click
 
@@ -324,8 +326,15 @@ def add_cmd(session: _Session, name: str, seed_text: str, flags: tuple[str, ...]
 def rm_cmd(session: _Session, ref: str, yes: bool, keep_data: bool):
     """Undeclare a profile, release its port, and delete its data."""
     profile = session.profile(ref)
-    if chrome.is_running(profile):
-        raise Conflict(f"{profile.ref} is running. Run: crom down {profile.ref}")
+
+    def refuse_if_running() -> None:
+        if chrome.is_running(profile):
+            raise Conflict(f"{profile.ref} is running. Run: crom down {profile.ref}")
+
+    # Fail before prompting. A running profile is the ordinary reason `rm` is refused,
+    # and asking someone to confirm a deletion crom is about to refuse anyway is worse
+    # than not asking. The authoritative check is the one under the lock below.
+    refuse_if_running()
 
     if not keep_data and profile.profile_dir.exists() and not yes:
         size = _human_size(profile.profile_dir)
@@ -336,16 +345,29 @@ def rm_cmd(session: _Session, ref: str, yes: bool, keep_data: bool):
         )
 
     scope = resolver.scope_for(profile.ref.namespace, session.scope)
-    # Release the reservation before removing the declaration, not after. Both orderings
-    # can be interrupted, but they strand different things: undeclaring first leaves a
-    # port held by a profile no longer nameable, so no command can reach it to retry.
-    # Releasing first leaves a declared profile without a reservation, which the next
-    # resolve heals by assigning one. Between two interruptible steps, take the one whose
-    # failure is recoverable.
-    registry.forget(profile.ref)
-    configwrite.remove_profile(scope.source or user_config_file(), profile.ref.name)
-    if not keep_data and profile.profile_dir.exists():
-        shutil.rmtree(profile.profile_dir)
+    # The liveness check and the delete are one critical section, for the same reason
+    # `up_cmd` holds this lock across its own check-and-launch: a concurrent `crom up`
+    # can seed and launch Chrome in the window between them, and `rm` would then delete
+    # a live browser's user-data-dir out from under it — a process crom can no longer
+    # find or stop, writing into a directory that no longer exists.
+    #
+    # The confirmation deliberately sits *outside* the lock: holding it across an
+    # interactive prompt would block every other crom process for as long as the human
+    # takes to answer. So liveness is re-read here rather than carried over from the
+    # check above. [LAW:no-ambient-temporal-coupling] the guarantee comes from state read
+    # under the lock, not from an earlier check still happening to hold.
+    with seed.profile_lock(profile):
+        refuse_if_running()
+        # Release the reservation before removing the declaration, not after. Both
+        # orderings can be interrupted, but they strand different things: undeclaring
+        # first leaves a port held by a profile no longer nameable, so no command can
+        # reach it to retry. Releasing first leaves a declared profile without a
+        # reservation, which the next resolve heals by assigning one. Between two
+        # interruptible steps, take the one whose failure is recoverable.
+        registry.forget(profile.ref)
+        configwrite.remove_profile(scope.source or user_config_file(), profile.ref.name)
+        if not keep_data and profile.profile_dir.exists():
+            shutil.rmtree(profile.profile_dir)
     click.echo(f"Removed {profile.ref}")
 
 
@@ -468,7 +490,29 @@ def _slug(text: str) -> str:
 
 
 def _human_size(directory: Path) -> str:
-    total = sum(f.stat().st_size for f in directory.rglob("*") if f.is_file())
+    """What deleting this directory would reclaim, for the confirmation prompt.
+
+    `lstat` rather than `stat`: a symlink's target is not deleted with the profile, so
+    counting the target's size would overstate what is about to be lost — and a dangling
+    link would raise rather than measure. Only the profile's own regular files count.
+
+    A file that vanishes mid-walk is skipped. A raw `OSError` here is not a `CromError`,
+    so it would escape the CLI's exit-code contract as a traceback — thrown by a prompt
+    whose only job is to be helpful before a destructive act.
+
+    `os.walk(followlinks=False)` states the no-following guarantee at the call site.
+    `rglob` happens to behave the same way on 3.12, but that is a property of pathlib's
+    recursive selector rather than something this code asks for.
+    """
+    total = 0
+    for dirpath, _dirnames, filenames in os.walk(directory, followlinks=False):
+        for name in filenames:
+            try:
+                info = os.lstat(os.path.join(dirpath, name))
+            except OSError:
+                continue
+            if S_ISREG(info.st_mode):
+                total += info.st_size
     for unit in ("B", "KB", "MB", "GB"):
         if total < 1024 or unit == "GB":
             return f"{total:.0f}{unit}"
