@@ -86,8 +86,8 @@ flags = ["--load-extension=${CROM_CONFIG_DIR}/ext/dist"]
 ```
 
 crom rejects an unknown key, an unknown `${VARIABLE}`, and any attempt to set
-`--user-data-dir` or `--remote-debugging-port` yourself. Those two are how crom knows
-which browser is which.
+`--user-data-dir`, `--remote-debugging-port`, or `--remote-debugging-pipe` yourself.
+Those are how crom knows which browser is which and how to reach it.
 
 Discovery walks up from the working directory and stops at the first hit: `.crom.toml`,
 then `.crom/config.toml`. Ancestor configs are never merged into descendants — one
