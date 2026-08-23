@@ -14,13 +14,15 @@ import tempfile
 from collections.abc import Iterator
 from pathlib import Path
 
+from .locking import exclusive
 from .model import CromError, ResolvedProfile, SeedChrome, SeedFresh, SeedPath
 
-# Where the user's real Chrome keeps its user-data-dir, per platform.
+# Where the user's real Chrome keeps its user-data-dir, per platform. POSIX only, as
+# crom is throughout: `chrome.scan` answers "is this profile running" by shelling out to
+# `ps`, so a Windows entry here would describe a platform no other part of crom reaches.
 _CHROME_USER_DATA: dict[str, Path] = {
     "darwin": Path.home() / "Library" / "Application Support" / "Google" / "Chrome",
     "linux": Path.home() / ".config" / "google-chrome",
-    "win32": Path(os.environ.get("LOCALAPPDATA", "")) / "Google" / "Chrome" / "User Data",
 }
 
 
@@ -34,7 +36,13 @@ def _copy(source: Path, dest: Path, described: str) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     # `dest` is either absent or the freshly-made empty staging directory, never a
     # profile with contents of its own.
-    shutil.copytree(source, dest, dirs_exist_ok=True)
+    #
+    # `symlinks=True` copies a link as a link. The default dereferences it and copies
+    # the *content* it points at, which turns a symlink inside a seed directory into a
+    # way to pull a file the seed never contained — an `~/.ssh/id_rsa` link in a seed
+    # checked into a repo would land as the real key inside a profile whose CDP port is
+    # then open to local tooling. Preserving the link copies the pointer and nothing else.
+    shutil.copytree(source, dest, dirs_exist_ok=True, symlinks=True)
 
 
 @contextlib.contextmanager
@@ -52,11 +60,15 @@ def _staged(destination: Path) -> Iterator[Path]:
     staging = Path(tempfile.mkdtemp(prefix=f".{destination.name}.", dir=destination.parent))
     try:
         yield staging
+        # Rename is the commit: the profile appears at its real path complete or not at
+        # all. It sits *inside* the guarded block because it can fail too — `os.replace`
+        # onto a non-empty directory raises `ENOTEMPTY` — and a commit that failed
+        # outside the guard would leave the staging directory behind forever, which is
+        # precisely the "leave nothing behind" invariant this function exists to keep.
+        os.replace(staging, destination)
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
         raise
-    # Rename is the commit: the profile appears at its real path complete or not at all.
-    os.replace(staging, destination)
 
 
 def materialize(profile: ResolvedProfile) -> bool:
@@ -64,7 +76,18 @@ def materialize(profile: ResolvedProfile) -> bool:
 
     Returns False when the directory already existed, which is the steady state — this
     makes `crom up` safe to call on every invocation without re-copying anything.
+
+    The check and the copy are one critical section. `crom up` advertises itself as
+    idempotent and safe to call concurrently, but unlocked both callers would see no
+    directory, both build a full staging copy, and the loser's `os.replace` would fail
+    on the winner's finished profile. Under the lock the second caller observes the
+    directory and reports False, which is what idempotent was supposed to mean.
     """
+    with exclusive(profile.profile_dir):
+        return _materialize_locked(profile)
+
+
+def _materialize_locked(profile: ResolvedProfile) -> bool:
     if profile.profile_dir.exists():
         return False
 
