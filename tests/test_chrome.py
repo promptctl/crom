@@ -6,9 +6,11 @@ prefixes of one another. Both decide whether `crom up` sees its own browser or l
 a second one on top of it.
 """
 
+import signal
 import socket
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from crom import chrome
 from crom.model import CromError, ProfileRef, ResolvedProfile, SeedFresh
@@ -138,6 +140,47 @@ class RequirePortAvailableTest(unittest.TestCase):
         self.assertIn(str(taken), message)
         self.assertIn("myapp/dev", message)
         self.assertIn("lsof", message)  # the message tells the user how to find it
+
+
+class KillTest(unittest.TestCase):
+    """SIGTERM first, SIGKILL only for what is still there after the grace period.
+
+    Driven against a stubbed process table rather than a real Chrome: the logic under
+    test is the escalation, and getting it wrong in either direction — never force-killing
+    a hung browser, or SIGKILLing one that was shutting down cleanly — is the risk.
+    """
+
+    def setUp(self):
+        self.profile = RequirePortAvailableTest._profile(9300)
+        self.signals: list[tuple[int, int]] = []
+        patcher = mock.patch.object(chrome, "_signal", lambda pid, sig: self.signals.append((pid, sig)))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        # A real 5s wait would make this test the slowest in the suite for no coverage.
+        timeout = mock.patch.object(chrome, "SHUTDOWN_TIMEOUT_SECONDS", 0.2)
+        timeout.start()
+        self.addCleanup(timeout.stop)
+
+    def test_a_process_that_exits_during_the_grace_period_is_never_force_killed(self):
+        scans = [(11, 22), ()]  # alive when we look, gone on the next scan
+        with mock.patch.object(chrome, "find_pids", side_effect=lambda p: scans.pop(0) if scans else ()):
+            killed = chrome.kill(self.profile)
+
+        self.assertEqual(killed, (11, 22))
+        self.assertEqual(self.signals, [(11, signal.SIGTERM), (22, signal.SIGTERM)])
+
+    def test_a_straggler_still_running_after_the_timeout_is_force_killed(self):
+        with mock.patch.object(chrome, "find_pids", return_value=(11,)):
+            killed = chrome.kill(self.profile)
+
+        self.assertEqual(killed, (11,))
+        self.assertEqual(self.signals[0], (11, signal.SIGTERM))
+        self.assertIn((11, signal.SIGKILL), self.signals)
+
+    def test_stopping_a_profile_that_is_not_running_signals_nothing(self):
+        with mock.patch.object(chrome, "find_pids", return_value=()):
+            self.assertEqual(chrome.kill(self.profile), ())
+        self.assertEqual(self.signals, [])
 
 
 if __name__ == "__main__":
