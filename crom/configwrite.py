@@ -90,7 +90,48 @@ def _relative_to(path: Path, base: Path) -> str:
 
 
 def _load(path: Path) -> tomlkit.TOMLDocument:
-    return tomlkit.parse(path.read_text()) if path.exists() else tomlkit.document()
+    """Read a config for editing, or fail naming the file a human has to repair.
+
+    This runs *before* `config.parse` ever sees the file, and on every command:
+    `main` calls `_bootstrap_user_config()` unconditionally, which reaches here through
+    `ensure_profile` → `_declare` before any scope is loaded. So an unparseable
+    `~/.config/crom/config.toml` raised a raw `tomlkit` error from every invocation —
+    including the ones the user would reach for to fix it. [LAW:no-silent-failure] the
+    same guard `config.parse` and `registry._read` already apply to their own files.
+    """
+    if not path.exists():
+        return tomlkit.document()
+    try:
+        return tomlkit.parse(path.read_text())
+    except (tomlkit.exceptions.ParseError, OSError) as e:
+        raise CromError(f"{path}: cannot be read as TOML ({e}).\nRepair the file.") from e
+
+
+def _profiles_table(doc: tomlkit.TOMLDocument, path: Path, *, create: bool = False):
+    """The document's `profiles` table, proven to be one. [LAW:single-enforcer]
+
+    A config with a top-level `profiles = "typo"` is valid TOML, and both readers of this
+    key got it wrong in different ways: `_declare`'s `setdefault` handed the string back
+    and the later item assignment raised a raw `TypeError`, while `declares` fell through
+    to `name in "typo"` — a *substring* test that quietly answers True for a profile
+    nobody declared. One returns a traceback, the other a wrong answer, and neither is a
+    `CromError`.
+
+    That matters more than it looks: `_bootstrap_user_config` reaches both on every
+    command, before `config.parse` would have rejected the file — so the traceback was
+    every command, with none left to repair it. Checking here means neither caller has to
+    remember, and the wrong answer stops being expressible.
+    """
+    if create:
+        profiles = doc.setdefault("profiles", tomlkit.table(is_super_table=True))
+    else:
+        profiles = doc.get("profiles", {})
+    if not isinstance(profiles, dict):
+        raise CromError(
+            f"{path}: `profiles` must be a table, not {type(profiles).__name__}.\n"
+            f"Repair the file."
+        )
+    return profiles
 
 
 def _save(path: Path, doc: tomlkit.TOMLDocument) -> None:
@@ -133,7 +174,7 @@ def declares(path: Path, name: str) -> bool:
     something — `crom add` reserves a port while resolving, and must not do that for a
     profile it is about to refuse.
     """
-    return name in _load(path).get("profiles", {})
+    return name in _profiles_table(_load(path), path)
 
 
 def _declare(path: Path, spec: ProfileSpec, header: str) -> bool:
@@ -168,7 +209,7 @@ def _declare(path: Path, spec: ProfileSpec, header: str) -> bool:
             path.write_text(header)
 
         doc = _load(path)
-        profiles = doc.setdefault("profiles", tomlkit.table(is_super_table=True))
+        profiles = _profiles_table(doc, path, create=True)
         if spec.name in profiles:
             return False
 

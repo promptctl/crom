@@ -41,8 +41,24 @@ def exclusive(path: Path) -> Iterator[None]:
         raise CromError(f"could not take the lock at {lock_path}: {e}") from e
 
     with handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+        except OSError as e:
+            # The guarantee has to cover acquisition, not just creation. Advisory locking
+            # is not universally supported — a network or FUSE mount under a relocated
+            # XDG_STATE_HOME can refuse it, and ENOLCK is reachable under resource
+            # exhaustion — and this primitive sits under nearly every command, so a raw
+            # OSError from here escapes as a traceback exactly as one from `open` did.
+            raise CromError(f"could not take the lock at {lock_path}: {e}") from e
         try:
             yield
         finally:
-            fcntl.flock(handle, fcntl.LOCK_UN)
+            # Deliberately swallowed. Closing the descriptor — which `with handle`
+            # guarantees, on every path out — releases the lock by itself, so this call
+            # is belt-and-braces and its failure changes nothing. Raising here would
+            # replace an exception already travelling out of the body with a less
+            # informative one about the cleanup, losing the failure the caller needs.
+            try:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+            except OSError:
+                pass

@@ -99,6 +99,37 @@ class LockingTest(unittest.TestCase):
             with locking.exclusive(blocker / "child" / "target"):
                 pass
 
+    def test_a_filesystem_that_refuses_locking_is_reported_not_crashed_through(self):
+        """The guarantee has to cover acquiring the lock, not only creating the file.
+
+        Advisory locking is not universal — a network or FUSE mount under a relocated
+        XDG_STATE_HOME can refuse it, and ENOLCK is reachable under resource exhaustion.
+        `exclusive` sits under nearly every command, so a raw OSError from `flock` escapes
+        as a traceback exactly as one from `open` did.
+        """
+        root = Path(tempfile.mkdtemp())
+        with mock.patch("crom.locking.fcntl.flock", side_effect=OSError("ENOLCK")):
+            with self.assertRaisesRegex(CromError, "could not take the lock"):
+                with locking.exclusive(root / "target"):
+                    pass
+
+    def test_a_failure_to_unlock_does_not_replace_the_real_error(self):
+        """Closing the descriptor releases the lock on every path out, so an explicit
+        LOCK_UN that fails changes nothing — while raising from the `finally` would
+        discard whatever exception the body was already raising."""
+        root = Path(tempfile.mkdtemp())
+        import fcntl as real_fcntl
+
+        def flock(handle, operation):
+            if operation == real_fcntl.LOCK_UN:
+                raise OSError("cannot release")
+            return None
+
+        with mock.patch("crom.locking.fcntl.flock", side_effect=flock):
+            with self.assertRaisesRegex(RuntimeError, "the real failure"):
+                with locking.exclusive(root / "target"):
+                    raise RuntimeError("the real failure")
+
 
 class ConcurrentDeclareTest(unittest.TestCase):
     """Two `crom add` calls against one config must not lose each other's profile.
@@ -191,6 +222,46 @@ class HeaderInvariantTest(unittest.TestCase):
         scope = config.parse(self.target.read_text(), self.target)
         self.assertEqual(scope.namespace, "myapp")
         self.assertEqual(sorted(scope.profiles), ["ci"])
+
+
+
+
+class MalformedConfigTest(unittest.TestCase):
+    """A config crom cannot read must produce an error, not a traceback.
+
+    These paths run *before* `config.parse` ever validates the file:
+    `cli.main` calls `_bootstrap_user_config()` on every invocation, which reaches
+    `_declare` → `_load` and `declares` without a scope being loaded. So anything raw
+    escaping here came back on every command, including the ones a user would reach for
+    to repair the file.
+    """
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.target = self.root / "config.toml"
+
+    def test_unparseable_toml_is_reported_against_the_file(self):
+        self.target.write_text("this is not = = valid toml [[[")
+        with self.assertRaisesRegex(CromError, "cannot be read as TOML"):
+            configwrite.declares(self.target, "ci")
+
+    def test_a_profiles_key_that_is_not_a_table_is_refused_when_declaring(self):
+        """`setdefault` returns the existing value, so the later item assignment raised a
+        raw TypeError rather than a CromError."""
+        self.target.write_text('namespace = "myapp"\nprofiles = "typo"\n')
+        with self.assertRaisesRegex(CromError, "`profiles` must be a table"):
+            configwrite.add_profile(self.target, ProfileSpec(name="ci", seed=SeedFresh()))
+
+    def test_a_profiles_key_that_is_not_a_table_cannot_answer_declares(self):
+        """The quieter half of the same defect: `name in "typo"` is a *substring* test.
+
+        It raises nothing and answers True for a profile nobody declared — `declares` is
+        what `add_cmd` uses to decide a name is taken and what its cleanup path uses to
+        decide whether it lost a race, so a wrong answer here is worse than a crash.
+        """
+        self.target.write_text('namespace = "myapp"\nprofiles = "typo"\n')
+        with self.assertRaisesRegex(CromError, "`profiles` must be a table"):
+            configwrite.declares(self.target, "yp")  # a substring of "typo"
 
 
 if __name__ == "__main__":

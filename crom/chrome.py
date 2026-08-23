@@ -87,12 +87,28 @@ def scan() -> dict[str, tuple[int, ...]]:
     # macOS BSD `pgrep` doesn't support -a (print cmdline), so we use `ps` and filter in
     # Python. This is the portable path and gives us the full argv to distinguish the
     # main browser from helper processes.
-    result = subprocess.run(
-        ["ps", "-Ao", "pid=,command="],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
+    # This became the single process-table reader in this design, which concentrates the
+    # benefit and the failure alike: `list`, `up`, `down`, `rm`, `config` and migration
+    # all arrive here, so a raw `CalledProcessError` or a missing `ps` would escape the
+    # exit-code contract from every one of them. [LAW:no-silent-failure]
+    try:
+        result = subprocess.run(
+            ["ps", "-Ao", "pid=,command="],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except FileNotFoundError as e:
+        raise CromError(
+            "could not read the process table: `ps` was not found on PATH.\n"
+            "crom answers 'is this profile running' by reading `ps`, so it cannot work "
+            "without it."
+        ) from e
+    except subprocess.CalledProcessError as e:
+        raise CromError(
+            f"could not read the process table: `ps` exited {e.returncode}"
+            f"{(chr(10) + e.stderr.strip()) if e.stderr else ''}"
+        ) from e
     return _group_by_user_data_dir(result.stdout)
 
 

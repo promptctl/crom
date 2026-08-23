@@ -85,6 +85,29 @@ class CliTest(unittest.TestCase):
         self.assertIn('[profiles.default]', user_config_file().read_text())
         self.assertIn('seed = "chrome"', user_config_file().read_text())
 
+    def test_a_corrupt_user_config_is_an_error_not_a_traceback(self):
+        """`main` runs `_bootstrap_user_config()` before anything else, on every command.
+
+        That path reaches `configwrite._load` — and so `tomlkit.parse` — before
+        `config.parse` would ever have rejected the file. An unguarded parse error there
+        came back from every command, including the ones a user would run to repair it,
+        and as a traceback rather than the documented exit code.
+        """
+        user_config_file().parent.mkdir(parents=True, exist_ok=True)
+        user_config_file().write_text("not = = valid toml [[[")
+
+        for command in (["list"], ["config"], ["port"]):
+            with self.subTest(command=command):
+                output = self.crom(*command, expect=1)
+                self.assertIn("cannot be read as TOML", output)
+
+    def test_a_user_config_with_a_non_table_profiles_key_is_an_error(self):
+        user_config_file().parent.mkdir(parents=True, exist_ok=True)
+        user_config_file().write_text('profiles = "typo"\n')
+
+        output = self.crom("list", expect=1)
+        self.assertIn("`profiles` must be a table", output)
+
     # --- init and namespaces --------------------------------------------------------
 
     def test_init_writes_a_config_named_after_the_directory(self):

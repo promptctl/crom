@@ -72,11 +72,45 @@ def _read(path: Path) -> dict:
             f"Repair or delete the file; crom rebuilds it, but every profile then gets "
             f"a freshly assigned port."
         ) from e
+    if not isinstance(data, dict):
+        raise CromError(f"{path}: the port ledger is a JSON {type(data).__name__}, not an object")
     if data.get("version") != SCHEMA_VERSION:
         raise CromError(
             f"{path}: unsupported registry version {data.get('version')!r} "
             f"(this crom speaks version {SCHEMA_VERSION})"
         )
+    # Shape, not just syntax and version. `reservations`, `_reject_foreign_claim` and
+    # `_allocate` index `entry["port"]`, `namespaces()` indexes `entry["config"]`, and
+    # `port_for` indexes `data["ports"]` — so a hand-edited ledger missing one raised
+    # `KeyError`, which is not a `CromError`. Every command touches this file, so that
+    # traceback was every command.
+    #
+    # Only the keys that are indexed *bare* are required: `pinned` and `source` are read
+    # with `.get(…, default)` and are genuinely optional, so demanding them would reject
+    # ledgers that work. The check is the strongest claim that is actually true, not the
+    # strongest one available. [LAW:parse-dont-validate] verified once here, indexed
+    # freely everywhere after.
+    for key, required in (("ports", "port"), ("namespaces", "config")):
+        table = data.setdefault(key, {})
+        if not isinstance(table, dict):
+            raise CromError(
+                f"{path}: the port ledger's `{key}` is a {type(table).__name__}, not an object"
+            )
+        for name, entry in table.items():
+            if not isinstance(entry, dict) or required not in entry:
+                raise CromError(
+                    f"{path}: the port ledger's `{key}.{name}` must be an object with a "
+                    f"`{required}`.\nRepair or delete the file; crom rebuilds it, but "
+                    f"every profile then gets a freshly assigned port."
+                )
+    for name, entry in data["ports"].items():
+        # A non-integer port would compare unequal to every real port, so it would slip
+        # past the collision checks and then reach `socket.bind` and Chrome's argv.
+        if not isinstance(entry["port"], int) or isinstance(entry["port"], bool):
+            raise CromError(
+                f"{path}: the port ledger's `ports.{name}.port` is "
+                f"{entry['port']!r}, not an integer"
+            )
     return data
 
 

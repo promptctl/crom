@@ -240,5 +240,55 @@ class KillTest(unittest.TestCase):
         self.assertEqual(self.signals, [])
 
 
+class ProcessBoundaryTest(unittest.TestCase):
+    """The two places crom hands work to the operating system.
+
+    Both translate OS failures into CromError, and both are easy to undo in a refactor
+    without any test noticing, because the happy path is unaffected either way.
+    """
+
+    def _profile(self) -> ResolvedProfile:
+        # A real directory: `launch` creates the profile dir before spawning, so a
+        # read-only path would fail this test before it reached the boundary it covers.
+        import tempfile
+
+        profile_dir = Path(tempfile.mkdtemp()) / "myapp" / "dev"
+        return ResolvedProfile(
+            ref=ProfileRef("myapp", "dev"),
+            port=9300,
+            profile_dir=profile_dir,
+            chrome_binary=Path("/chrome"),
+            argv=("/chrome", f"--user-data-dir={profile_dir}"),
+            env={},
+            seed=SeedFresh(),
+            source=None,
+        )
+
+    def test_a_missing_ps_is_reported_not_crashed_through(self):
+        """`scan` is the single process-table reader, so every command that asks about
+        process state arrives here — a raw error is a raw error from all of them."""
+        with mock.patch("crom.chrome.subprocess.run", side_effect=FileNotFoundError("ps")):
+            with self.assertRaisesRegex(CromError, "`ps` was not found"):
+                chrome.scan()
+
+    def test_a_failing_ps_is_reported_not_crashed_through(self):
+        import subprocess
+
+        failure = subprocess.CalledProcessError(1, ["ps"], stderr="ps: bad option")
+        with mock.patch("crom.chrome.subprocess.run", side_effect=failure):
+            with self.assertRaisesRegex(CromError, "`ps` exited 1"):
+                chrome.scan()
+
+    def test_a_browser_that_cannot_be_started_is_reported_with_its_profile(self):
+        """Boundary error translation around `Popen`. Its sibling `_require_port_available`
+        was covered when it was written; this was not."""
+        with mock.patch("crom.chrome.subprocess.Popen", side_effect=OSError("no such file")):
+            with mock.patch("crom.chrome._require_port_available"):
+                with self.assertRaises(CromError) as caught:
+                    chrome.launch(self._profile())
+
+        self.assertIn("myapp/dev", str(caught.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -144,5 +144,55 @@ class AdoptTest(unittest.TestCase):
             registry.adopt(ProfileRef("other", "dev"), 9301, None)
 
 
+
+
+class MalformedLedgerTest(unittest.TestCase):
+    """Every command touches the ledger, so a raw exception here is a raw exception
+    everywhere. Syntax and schema version were already guarded; shape was not, and
+    `entry["port"]` / `entry["config"]` are indexed without a default."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp()).resolve()
+        self.env = mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(self.root / "state")})
+        self.env.start()
+        self.addCleanup(self.env.stop)
+
+    def _write_ledger(self, data: dict) -> None:
+        path = paths.state_home() / "registry.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"version": registry.SCHEMA_VERSION, **data}))
+
+    def test_a_ports_entry_without_a_port_is_reported(self):
+        self._write_ledger({"ports": {"user/default": {"pinned": False}}, "namespaces": {}})
+        with self.assertRaisesRegex(CromError, r"`ports.user/default` must be an object"):
+            registry.reservations()
+
+    def test_a_ports_entry_that_is_not_an_object_is_reported(self):
+        self._write_ledger({"ports": {"user/default": 9222}, "namespaces": {}})
+        with self.assertRaisesRegex(CromError, r"`ports.user/default` must be an object"):
+            registry.reservations()
+
+    def test_a_non_integer_port_is_reported_rather_than_used(self):
+        """A string port compares unequal to every real port, so it would slip past the
+        collision checks and reach `socket.bind` and Chrome's argv."""
+        self._write_ledger({"ports": {"user/default": {"port": "9222"}}, "namespaces": {}})
+        with self.assertRaisesRegex(CromError, "not an integer"):
+            registry.reservations()
+
+    def test_a_namespaces_entry_without_a_config_is_reported(self):
+        self._write_ledger({"ports": {}, "namespaces": {"myapp": {}}})
+        with self.assertRaisesRegex(CromError, r"`namespaces.myapp` must be an object"):
+            registry.namespaces()
+
+    def test_the_optional_keys_are_genuinely_optional(self):
+        """`pinned` and `source` are read with defaults, so requiring them would reject
+        ledgers that work — the check has to be the strongest claim that is *true*."""
+        self._write_ledger({"ports": {"user/default": {"port": 9222}}, "namespaces": {}})
+        held = registry.reservations()
+        self.assertEqual(held["user/default"].port, 9222)
+        self.assertFalse(held["user/default"].pinned)
+        self.assertIsNone(held["user/default"].source)
+
+
 if __name__ == "__main__":
     unittest.main()
