@@ -157,6 +157,44 @@ class MigrateTest(unittest.TestCase):
         self.assertTrue(migrate.legacy_registry_file().exists())
         self.assertEqual(config.load_user_scope().profiles, {})
 
+    def test_a_corrupt_legacy_registry_is_reported_not_crashed_through(self):
+        """A raw JSONDecodeError is not a CromError, so it escapes the exit-code contract
+        — and migration runs before every command until it succeeds, so that traceback
+        would be the only thing crom could do."""
+        migrate.legacy_registry_file().write_text("{ truncated")
+        with mock.patch("crom.chrome.scan", return_value={}):
+            with self.assertRaisesRegex(CromError, "not valid JSON"):
+                migrate.run(log=lambda _: None)
+
+    def test_a_move_that_dies_partway_leaves_the_retry_a_clean_destination(self):
+        """Across filesystems `shutil.move` degrades to copy-then-delete, so a failure
+        mid-copy leaves the destination partly populated *and* the source in place. This
+        module is built so a failed attempt is resumed by the next command, and that
+        retry would re-enter with a non-empty destination.
+        """
+        real_move = migrate.shutil.move
+
+        def fail_on_worker1(source, destination):
+            if "worker1" in str(source):
+                # Populate the staging destination first, the way a partial copy would.
+                Path(destination).mkdir(parents=True, exist_ok=True)
+                (Path(destination) / "half").write_text("x")
+                raise OSError("simulated: no space left on device")
+            return real_move(source, destination)
+
+        with mock.patch("crom.chrome.scan", return_value={}):
+            with mock.patch.object(migrate.shutil, "move", fail_on_worker1):
+                with self.assertRaises(OSError):
+                    migrate.run(log=lambda _: None)
+
+            destination_root = state_home() / "profiles" / "user"
+            self.assertEqual([p.name for p in destination_root.iterdir() if p.is_dir()], ["default"])
+
+            migrate.run(log=lambda _: None)
+
+        self.assertFalse(migrate.needed())
+        self.assertTrue((state_home() / "profiles" / "user" / "worker1" / "Default").is_dir())
+
     def test_migrated_profiles_resolve_to_their_original_ports(self):
         self.run_migration()
         from crom import resolve

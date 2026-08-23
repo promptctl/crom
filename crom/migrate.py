@@ -11,6 +11,7 @@ crom can no longer find, stop, or account for.
 """
 
 import json
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -52,9 +53,27 @@ def run_if_needed(log=lambda message: print(message, file=sys.stderr)) -> None:
         run(log)
 
 
+def _read_legacy(source: Path) -> dict:
+    """Parse the legacy registry, or fail naming the file rather than crashing.
+
+    A raw `JSONDecodeError` is not a `CromError`, so it escapes the CLI's exit-code
+    contract — and because migration runs before every command until it succeeds, that
+    traceback would be the only thing crom could do, with no way out. The same guard
+    `registry._read` already applies to the current ledger.
+    """
+    try:
+        return json.loads(source.read_text()).get("profiles", {})
+    except json.JSONDecodeError as e:
+        raise CromError(
+            f"{source}: the previous crom registry is not valid JSON ({e}).\n"
+            f"Repair it, or move it aside — crom will then start fresh, and your existing "
+            f"profiles will be re-created with new ports."
+        ) from e
+
+
 def run(log) -> None:
     source = legacy_registry_file()
-    legacy = json.loads(source.read_text()).get("profiles", {})
+    legacy = _read_legacy(source)
     old_dirs = {name: state_home() / name for name in legacy}
 
     _require_all_stopped(old_dirs)
@@ -94,7 +113,7 @@ def run(log) -> None:
 
         old_dir = old_dirs[name]
         if old_dir.is_dir():
-            shutil.move(str(old_dir), str(destination_root / name))
+            _move_staged(old_dir, destination_root / name)
         (state_home() / f"{name}.pid").unlink(missing_ok=True)
         log(f"crom:   {name} -> {ref} (port {port})")
 
@@ -103,6 +122,27 @@ def run(log) -> None:
     backup = source.with_suffix(".json.migrated")
     source.rename(backup)
     log(f"crom: done. Previous registry kept at {backup}")
+
+
+def _move_staged(old_dir: Path, destination: Path) -> None:
+    """Move a profile directory so a failure partway leaves the retry a clean slate.
+
+    On one filesystem `shutil.move` is a rename and is already atomic. Across
+    filesystems it degrades to copy-then-delete, and a failure mid-copy leaves the
+    destination partly populated *and* the source still in place. This module is built
+    so a failed attempt is resumed by the next command, and that retry would re-enter
+    with a non-empty destination — turning a recoverable interruption into a permanent
+    one. Staging beside the destination and committing with a rename keeps the retry's
+    precondition true, the same shape `seed._staged` uses.
+    """
+    staging = destination.parent / f".{destination.name}.partial"
+    shutil.rmtree(staging, ignore_errors=True)  # debris from an attempt that died here
+    try:
+        shutil.move(str(old_dir), str(staging))
+        os.replace(staging, destination)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
 
 
 def _require_legal_names(legacy: dict) -> None:
