@@ -12,8 +12,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from crom import config, configwrite
-from crom.model import Conflict, ProfileSpec, SeedChrome, SeedFresh, SeedPath
+from crom import config, configwrite, locking
+from crom.model import Conflict, CromError, ProfileSpec, SeedChrome, SeedFresh, SeedPath
 
 
 class RenderSeedTest(unittest.TestCase):
@@ -49,17 +49,55 @@ class RenderSeedTest(unittest.TestCase):
 
 
 class InitProjectTest(unittest.TestCase):
-    def test_refusing_an_existing_file_is_the_documented_conflict(self):
-        """A bare FileExistsError escaped the CLI's exit-code contract as a traceback.
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.target = self.root / ".crom.toml"
 
-        `crom init`'s own existence check is check-then-act, so this raise is what covers
-        the window where another process wins the race.
-        """
-        root = Path(tempfile.mkdtemp())
-        target = root / ".crom.toml"
-        target.write_text("")
+    def test_refusing_an_existing_file_is_the_documented_conflict(self):
+        """A bare FileExistsError escaped the CLI's exit-code contract as a traceback."""
+        self.target.write_text("")
         with self.assertRaises(Conflict):
-            configwrite.init_project(target, "myapp")
+            configwrite.init_project(self.target, "myapp")
+
+    def test_only_one_of_two_concurrent_inits_writes_the_config(self):
+        """The refusal is the kernel's, via O_CREAT|O_EXCL, not a check of ours.
+
+        An `exists()` test followed by a write is check-then-act: both callers could pass
+        it and the second would clobber the first's config — possibly with a different
+        namespace — while both reported success.
+        """
+        results: list[str] = []
+
+        def go(namespace: str):
+            try:
+                configwrite.init_project(self.target, namespace)
+                results.append("wrote")
+            except Conflict:
+                results.append("refused")
+
+        threads = [threading.Thread(target=go, args=(n,)) for n in ("alpha", "beta")]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(sorted(results), ["refused", "wrote"])
+        # And the file belongs wholly to the winner — not a mix of both templates.
+        written = self.target.read_text()
+        self.assertEqual(written.count("namespace = "), 1)
+
+
+class LockingTest(unittest.TestCase):
+    def test_an_unusable_lock_path_is_reported_not_crashed_through(self):
+        """`exclusive` sits under nearly every command, so a raw OSError here would
+        escape as a traceback from all of them."""
+        root = Path(tempfile.mkdtemp())
+        blocker = root / "file"
+        blocker.write_text("not a directory")
+
+        with self.assertRaisesRegex(CromError, "could not take the lock"):
+            with locking.exclusive(blocker / "child" / "target"):
+                pass
 
 
 class ConcurrentDeclareTest(unittest.TestCase):

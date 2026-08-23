@@ -96,19 +96,25 @@ def _save(path: Path, doc: tomlkit.TOMLDocument) -> None:
 
 
 def init_project(path: Path, namespace: str) -> None:
-    """Write a new project config. Refuses to touch an existing file.
+    """Write a new project config, or refuse if one is already there.
 
-    `Conflict` rather than a bare `FileExistsError`: this is the exit-4 case the CLI
-    contract promises, and raising it here rather than translating at the call site
-    means the narrow window between `crom init`'s own existence check and this write —
-    check-then-act, so not the guarantee it looks like — is covered by construction.
-    [LAW:single-enforcer] a future caller cannot reintroduce the gap by forgetting a
-    wrapper that no longer exists.
+    The refusal is the kernel's, not a check of ours: `O_CREAT | O_EXCL` creates the
+    file only if it does not exist, atomically. An `exists()` test followed by a write
+    is check-then-act, and two `crom init` calls in one directory could both pass it and
+    the second would clobber the first's config — possibly with a different namespace —
+    while both reported success.
+
+    `Conflict` rather than the bare `FileExistsError` the kernel hands back: this is the
+    exit-4 case the CLI contract promises. Raised here rather than translated at the call
+    site so no future caller can reintroduce the gap by forgetting a wrapper.
     """
-    if path.exists():
-        raise Conflict(f"{path} already exists")
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(PROJECT_CONFIG_TEMPLATE.format(namespace=namespace))
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    except FileExistsError as e:
+        raise Conflict(f"{path} already exists") from e
+    with os.fdopen(fd, "w") as handle:
+        handle.write(PROJECT_CONFIG_TEMPLATE.format(namespace=namespace))
 
 
 def declares(path: Path, name: str) -> bool:

@@ -17,6 +17,8 @@ import fcntl
 from collections.abc import Iterator
 from pathlib import Path
 
+from .model import CromError
+
 
 @contextlib.contextmanager
 def exclusive(path: Path) -> Iterator[None]:
@@ -28,9 +30,17 @@ def exclusive(path: Path) -> Iterator[None]:
     creation. Keying on the name means every process derives the same lock file from
     the same target without coordinating.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.parent / f".{path.name}.lock"
-    with open(lock_path, "w") as handle:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(lock_path, "w")
+    except OSError as e:
+        # This primitive sits under nearly every command, so a raw OSError here — an
+        # unwritable parent, a regular file where a directory belongs — would escape as
+        # a traceback from all of them. [LAW:no-silent-failure] name the path instead.
+        raise CromError(f"could not take the lock at {lock_path}: {e}") from e
+
+    with handle:
         fcntl.flock(handle, fcntl.LOCK_EX)
         try:
             yield
