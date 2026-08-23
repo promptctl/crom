@@ -14,6 +14,7 @@ exit codes are a contract a script can branch on:
 
 import json
 import re
+import shlex
 import shutil
 from pathlib import Path
 
@@ -328,7 +329,11 @@ def env_cmd(session: _Session, ref: str):
         "CROM_CDP_URL": profile.cdp_url,
         "CROM_PROFILE_DIR": str(profile.profile_dir),
     }.items():
-        click.echo(f"export {key}={value}")
+        # This output is meant to be `eval`ed, so it is shell source, not text: a profile
+        # directory under a path like `~/My Projects` would otherwise end the assignment
+        # at the space and the rest of the path would be read as a command. `shlex.quote`
+        # leaves ordinary values exactly as they were.
+        click.echo(f"export {key}={shlex.quote(value)}")
 
 
 @main.command("mcp")

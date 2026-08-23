@@ -7,6 +7,7 @@ external system, not an implementation detail of crom.
 
 import json
 import os
+import shlex
 import tempfile
 import unittest
 from pathlib import Path
@@ -146,6 +147,23 @@ class CliTest(unittest.TestCase):
         )
         self.assertEqual(exports["CROM_PROFILE"], "myproj/default")
         self.assertEqual(exports["CROM_CDP_URL"], f"http://127.0.0.1:{exports['CROM_PORT']}")
+
+    def test_env_output_survives_the_eval_the_docs_prescribe(self):
+        # README tells the user to run `eval "$(crom env dev)"`, so this output is shell
+        # source. A profile directory under a path with a space — ordinary on macOS —
+        # would end the assignment early and leave the rest to be read as a command.
+        self.crom("init")
+        path = self.project / ".crom.toml"
+        path.write_text('state_dir = "./My Browsers"\n' + path.read_text())
+
+        # shlex.split is the shell's own parse: `export K='/a b'` -> ['export', 'K=/a b'].
+        exports = dict(
+            shlex.split(line)[1].split("=", 1)
+            for line in self.crom("env").strip().splitlines()
+        )
+
+        self.assertIn("My Browsers", exports["CROM_PROFILE_DIR"])
+        self.assertTrue(Path(exports["CROM_PROFILE_DIR"]).is_absolute())
 
     def test_config_json_reports_the_resolved_command_line(self):
         self.crom("init")
