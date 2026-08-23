@@ -24,7 +24,36 @@ LAUNCH_TIMEOUT_SECONDS = 30.0
 SHUTDOWN_TIMEOUT_SECONDS = 5.0
 
 
-_USER_DATA_DIR_RE = re.compile(r"--user-data-dir=(\S+)")
+# `ps` hands us one flat string per process with no argv boundaries, so the directory
+# has to be delimited by something. It cannot be whitespace: a profile directory under a
+# project path like `~/My Projects/app` contains spaces, and `(\S+)` would silently clip
+# it to `~/My` — crom would then never recognise its own running browser. The switch that
+# follows is the reliable terminator, because crom emits `--user-data-dir` and
+# `--remote-debugging-port` adjacently and last (see `resolve.build_argv`; the pre-
+# namespace launcher did the same, which is what lets migration still find legacy
+# profiles). `ScanTest.test_a_directory_containing_spaces_survives_the_round_trip`
+# pins that adjacency so a reordering of build_argv fails loudly here.
+_USER_DATA_DIR_RE = re.compile(r"--user-data-dir=(.+?) --remote-debugging-port=")
+
+
+def _group_by_user_data_dir(ps_output: str) -> dict[str, tuple[int, ...]]:
+    """Parse `ps` output into main-browser PIDs grouped by their user-data-dir.
+
+    Kept pure and separate from the `ps` call so the parsing — the part with the
+    interesting edge cases — is testable without spawning processes.
+    [LAW:effects-at-boundaries]
+    """
+    found: dict[str, list[int]] = {}
+    for line in ps_output.splitlines():
+        pid_str, _, cmd = line.strip().partition(" ")
+        if not pid_str.isdigit():
+            continue
+        if "--type=" in cmd:  # helper/renderer/gpu — not the main process
+            continue
+        match = _USER_DATA_DIR_RE.search(cmd)
+        if match:
+            found.setdefault(match.group(1), []).append(int(pid_str))
+    return {directory: tuple(pids) for directory, pids in found.items()}
 
 
 def scan() -> dict[str, tuple[int, ...]]:
@@ -43,17 +72,7 @@ def scan() -> dict[str, tuple[int, ...]]:
         text=True,
         check=True,
     )
-    found: dict[str, list[int]] = {}
-    for line in result.stdout.splitlines():
-        pid_str, _, cmd = line.strip().partition(" ")
-        if not pid_str.isdigit():
-            continue
-        if "--type=" in cmd:  # helper/renderer/gpu — not the main process
-            continue
-        match = _USER_DATA_DIR_RE.search(cmd)
-        if match:
-            found.setdefault(match.group(1), []).append(int(pid_str))
-    return {directory: tuple(pids) for directory, pids in found.items()}
+    return _group_by_user_data_dir(result.stdout)
 
 
 def find_pids_for_dir(profile_dir: Path) -> tuple[int, ...]:
