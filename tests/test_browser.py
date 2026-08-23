@@ -5,6 +5,7 @@ Popen", which only holds if a candidate it accepts is actually runnable.
 """
 
 import os
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,7 +17,10 @@ from crom.model import CromError
 
 class ResolveTest(unittest.TestCase):
     def setUp(self):
+        # `setUp` runs per test method, so an unowned `mkdtemp` here leaks one directory
+        # of stub binaries per test rather than one per class.
         self.root = Path(tempfile.mkdtemp()).resolve()
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
 
     def _binary(self, name: str, *, executable: bool) -> Path:
         path = self.root / name

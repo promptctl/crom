@@ -6,6 +6,7 @@ prefixes of one another. Both decide whether `crom up` sees its own browser or l
 a second one on top of it.
 """
 
+import shutil
 import signal
 import socket
 import unittest
@@ -250,9 +251,15 @@ class ProcessBoundaryTest(unittest.TestCase):
     def _profile(self) -> ResolvedProfile:
         # A real directory: `launch` creates the profile dir before spawning, so a
         # read-only path would fail this test before it reached the boundary it covers.
+        # `launch` does that `mkdir` *before* the mocked `Popen` raises, so the tree is
+        # genuinely created — and `mkdtemp`, unlike `TemporaryDirectory`, has no owner by
+        # construction. The cleanup is registered against the mkdtemp root, not the
+        # nested profile dir, so the whole tree goes.
         import tempfile
 
-        profile_dir = Path(tempfile.mkdtemp()) / "myapp" / "dev"
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        profile_dir = root / "myapp" / "dev"
         return ResolvedProfile(
             ref=ProfileRef("myapp", "dev"),
             port=9300,
