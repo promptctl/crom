@@ -314,8 +314,46 @@ class CliTest(unittest.TestCase):
             line.removeprefix("export ").split("=", 1)
             for line in self.crom("env").strip().splitlines()
         )
-        self.assertEqual(exports["CROM_PROFILE"], "myproj/default")
         self.assertEqual(exports["CROM_CDP_URL"], f"http://127.0.0.1:{exports['CROM_PORT']}")
+
+    def test_env_gives_each_name_the_meaning_it_has_in_a_config(self):
+        """`CROM_PROFILE` named two different things depending on where it was read: the
+        full "namespace/name" here, and the bare name inside a config's
+        `${CROM_PROFILE}`. The README presents both as one vocabulary, so a user moving
+        a value between them silently got something else. One name, one meaning — and
+        the joined form keeps a name that means only that."""
+        self.crom("init")
+        exports = dict(
+            line.removeprefix("export ").split("=", 1)
+            for line in self.crom("env").strip().splitlines()
+        )
+        self.assertEqual(exports["CROM_NAMESPACE"], "myproj")
+        self.assertEqual(exports["CROM_PROFILE"], "default")
+        self.assertEqual(exports["CROM_REF"], "myproj/default")
+
+    def test_the_two_vocabularies_agree_on_every_name_they_share(self):
+        """The guarantee is the agreement itself, not either spelling on its own."""
+        from crom import resolve as resolver
+
+        self.crom("init")
+        exports = dict(
+            line.removeprefix("export ").split("=", 1)
+            for line in self.crom("env").strip().splitlines()
+        )
+        # Restore the *original* working directory, not self.root — tearDown deletes
+        # that, and a cwd pointing at a removed directory breaks every later test.
+        previous = Path.cwd()
+        os.chdir(self.project)
+        try:
+            profile = resolver.resolve(cli.parse_ref("default", "myproj"), load_ambient())
+        finally:
+            os.chdir(previous)
+        interpolation = resolver._variables(
+            profile.ref, profile.profile_dir, profile.config_dir, profile.port
+        )
+        for name in set(exports) & set(interpolation):
+            with self.subTest(variable=name):
+                self.assertEqual(exports[name], interpolation[name])
 
     def test_env_output_survives_the_eval_the_docs_prescribe(self):
         # README tells the user to run `eval "$(crom env dev)"`, so this output is shell

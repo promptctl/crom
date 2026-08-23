@@ -103,13 +103,18 @@ overrides discovery entirely.
 either way, so a script can call it unconditionally.
 
 ```bash
-eval "$(crom env dev)"        # CROM_PORT, CROM_CDP_URL, CROM_PROFILE_DIR
+eval "$(crom env dev)"        # see below for what it exports
 crom port dev                 # just the number
 crom up dev --json            # the full record, for anything that parses
 crom mcp dev                  # writes .mcp.json pointing chrome-devtools-mcp at it
 ```
 
-`--json` gives you this, and `list` gives you an array of the same shape:
+`crom env` exports `CROM_NAMESPACE`, `CROM_PROFILE`, `CROM_REF`, `CROM_PORT`,
+`CROM_CDP_URL`, and `CROM_PROFILE_DIR`. The names it shares with the `${VARIABLE}`
+vocabulary above mean the same thing in both places — `CROM_PROFILE` is the profile name
+in a config and in your shell, and `CROM_REF` is the joined `namespace/name`.
+
+`--json` gives you this:
 
 ```json
 {
@@ -125,6 +130,13 @@ crom mcp dev                  # writes .mcp.json pointing chrome-devtools-mcp at
   "pids": [13550]
 }
 ```
+
+`crom list --json` gives an array, but not every element has that shape. A profile that
+could not be resolved appears as `{"namespace", "profile", "ref", "error"}`, and with
+`--all` a namespace whose config file is gone appears as `{"namespace", "error"}`. That
+is deliberate: one broken declaration is reported rather than sinking the whole listing,
+since `crom list` is what you run *because* something is wrong. Check for `error` before
+reading `port` and friends.
 
 Exit codes are a contract: `0` success, `1` failure, `2` bad usage, `3` no such profile
 or namespace, `4` a port or declaration conflict.
@@ -194,7 +206,14 @@ created; after that the profile owns its own state and crom never overwrites it.
 Earlier versions kept ports in `~/.config/crom/profiles.json` and profile directories at
 `~/.local/state/crom/<name>`. crom migrates that automatically on the next run: every
 profile joins the `user` namespace and keeps the exact port it had, so anything already
-pointing at it still works. The old registry is preserved as `profiles.json.migrated`.
+pointing at it still works. A profile you declared but never launched has no port to
+keep — the old registry only recorded one on first launch — so it gets a fresh one.
+The old registry is preserved as `profiles.json.migrated`.
+
+Those two paths are literal. Migration looks for the previous installation where the
+previous crom actually wrote it, which is `~/.config` and `~/.local/state` regardless of
+`XDG_CONFIG_HOME` or `XDG_STATE_HOME` — the version that wrote them did not consult
+either. Everything crom writes *after* migrating honors both, as below.
 
 Quit your crom-managed Chrome windows first. Migration moves profile directories, and
 crom refuses to move one out from under a running browser — it would leave a process it

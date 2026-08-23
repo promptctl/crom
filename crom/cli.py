@@ -436,8 +436,18 @@ def port_cmd(session: _Session, ref: str):
 def env_cmd(session: _Session, ref: str):
     """Print shell exports for a profile: eval "$(crom env dev)"."""
     profile = session.profile(ref)
+    # `CROM_PROFILE` is the profile *name*, matching what the same spelling means inside
+    # a config's `${CROM_PROFILE}` interpolation. It used to be the full "namespace/name"
+    # here and the bare name there, so one identifier named two different things
+    # depending on where it was read — and the README presents both as one vocabulary,
+    # which is what made the collision misleading rather than merely inconsistent.
+    # [LAW:one-source-of-truth] The interpolation vocabulary already decomposes a ref
+    # into namespace and name, so that is the meaning that composes; `CROM_REF` carries
+    # the joined form under a name that means only that.
     for key, value in {
-        "CROM_PROFILE": str(profile.ref),
+        "CROM_NAMESPACE": profile.ref.namespace,
+        "CROM_PROFILE": profile.ref.name,
+        "CROM_REF": str(profile.ref),
         "CROM_PORT": str(profile.port),
         "CROM_CDP_URL": profile.cdp_url,
         "CROM_PROFILE_DIR": str(profile.profile_dir),
