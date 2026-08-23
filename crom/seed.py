@@ -30,11 +30,14 @@ def chrome_user_data_dir() -> Path:
     return _CHROME_USER_DATA.get(sys.platform, _CHROME_USER_DATA["linux"])
 
 
-def _reject_escaping_symlinks(source: Path, described: str) -> None:
-    """Refuse a seed containing a link that points outside itself.
+def _link_guard(source: Path, described: str):
+    """Build the `copytree(ignore=...)` hook that refuses a symlink crom cannot copy safely.
 
-    Neither way of handling such a link is safe, which is why this rejects rather than
-    choosing one. Dereferencing copies the *content* of whatever the link names, so a
+    A seed's links must satisfy one rule: **relative, and resolving inside the seed.**
+    Both halves are load-bearing, and each rules out a different way the copy goes wrong.
+
+    *Escaping* is unsafe whichever way it is handled, which is why it is refused rather
+    than resolved. Dereferencing copies the *content* of whatever the link names, so a
     seed could pull in `~/.ssh/id_rsa` and land the real key inside a profile whose CDP
     port is reachable by local tooling. Preserving the link is worse in the other
     direction: `profile_dir` becomes Chrome's live user-data-dir, and Chrome writes
@@ -42,22 +45,44 @@ def _reject_escaping_symlinks(source: Path, described: str) -> None:
     symlinks — so a planted link is a write primitive aimed at any file the invoking
     user can modify.
 
-    Links that stay inside the tree are kept as links: they resolve within the finished
-    profile, and they are how a real Chrome user-data-dir's own internal links survive
-    the copy.
+    *Absolute* is unsafe even when the target is inside the seed, because `copytree`
+    recreates a link as `os.symlink(os.readlink(src), dst)` — the raw target string,
+    never rewritten for the new root. An absolute in-tree link therefore survives the
+    copy still pointing at the *original* seed, so the finished profile stays live-linked
+    back to the directory it was supposed to be an isolated copy of, and Chrome writes
+    through it into the real thing. A relative link has no such problem: it is
+    interpreted against wherever it now sits, which is exactly the corresponding place
+    in the new profile.
 
-    `os.walk(followlinks=False)` rather than `rglob`: a symlinked directory still needs
-    checking, but must not be recursed into — a link cycle would otherwise hang here.
+    Empirically this costs nothing. A real Chrome user-data-dir carries four links —
+    `RunningChromeVersion`, `SingletonCookie` and `SingletonLock` are relative, and
+    `SingletonSocket` is absolute but points into `/var/folders`, so it is refused by
+    the escape rule regardless.
+
+    Running as `copytree`'s own `ignore` hook, rather than as a walk of its own, is what
+    closes the gap between checking and copying. The hook is handed the very listing
+    `copytree` is about to act on, so there is one traversal and one notion of what the
+    tree contains — where two independent walks left a window for an entry to be swapped
+    after passing validation (CWE-367). The residual window is now the sub-millisecond
+    gap between this hook and the individual `os.symlink`, rather than a whole tree walk.
     """
     root = source.resolve()
-    for dirpath, dirnames, filenames in os.walk(source, followlinks=False):
-        for name in (*dirnames, *filenames):
+
+    def guard(dirpath: str, names: list[str]) -> set[str]:
+        for name in names:
             entry = Path(dirpath) / name
             if not entry.is_symlink():
                 continue
-            # An absolute target discards the left side of the join, so this handles
-            # relative and absolute links alike.
-            target = (entry.parent / entry.readlink()).resolve()
+            raw = entry.readlink()
+            if raw.is_absolute():
+                raise CromError(
+                    f"seed {described} contains an absolute symlink:\n"
+                    f"  {entry.relative_to(source)} -> {raw}\n"
+                    f"crom copies links verbatim, so an absolute link would still point "
+                    f"at the original seed from inside the finished profile — and Chrome "
+                    f"would write through it into the seed. Make it relative."
+                )
+            target = (entry.parent / raw).resolve()
             if target == root or root in target.parents:
                 continue
             raise CromError(
@@ -67,20 +92,25 @@ def _reject_escaping_symlinks(source: Path, described: str) -> None:
                 f"the profile, and keeping it would let Chrome write through it. Remove "
                 f"the link, or point it inside the seed."
             )
+        return set()
+
+    return guard
 
 
 def _copy(source: Path, dest: Path, described: str) -> None:
     if not source.is_dir():
         raise CromError(f"seed {described} does not exist: {source}")
-    _reject_escaping_symlinks(source, described)
     dest.parent.mkdir(parents=True, exist_ok=True)
     # `dest` is either absent or the freshly-made empty staging directory, never a
     # profile with contents of its own.
     #
-    # `symlinks=True` copies a link as a link rather than dereferencing it. Every link
-    # that survives the check above resolves inside the tree, so the copy reproduces the
-    # seed's internal structure without reaching outside it in either direction.
-    shutil.copytree(source, dest, dirs_exist_ok=True, symlinks=True)
+    # `symlinks=True` copies a link as a link rather than dereferencing it; `_link_guard`
+    # vets each directory's entries as `copytree` reaches them, so every link that gets
+    # recreated is relative and resolves inside the tree.
+    shutil.copytree(
+        source, dest, dirs_exist_ok=True, symlinks=True,
+        ignore=_link_guard(source, described),
+    )
 
 
 @contextlib.contextmanager

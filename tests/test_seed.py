@@ -154,7 +154,10 @@ class MaterializeTest(unittest.TestCase):
         secret = self.root / "secret.txt"
         secret.write_text("private key")
         (source / "Default").mkdir()
-        (source / "Default" / "Preferences").symlink_to(secret)
+        # Relative, so this exercises the escape rule specifically. An absolute link
+        # would be refused by the absolute-link rule first, and this test would pass
+        # without ever proving that escaping is caught.
+        (source / "Default" / "Preferences").symlink_to(Path("..") / ".." / "secret.txt")
 
         with self.assertRaisesRegex(CromError, "points outside it"):
             seed.materialize(profile(self.dest, SeedPath(source)))
@@ -162,19 +165,41 @@ class MaterializeTest(unittest.TestCase):
         self.assertFalse(self.dest.exists())
         self.assertEqual(secret.read_text(), "private key")  # untouched
 
-    def test_a_link_that_stays_inside_the_seed_is_kept_as_a_link(self):
-        """Internal links resolve within the finished profile, so they are safe —
-        and preserving them is how a real Chrome user-data-dir survives the copy."""
+    def test_a_relative_link_inside_the_seed_resolves_inside_the_profile(self):
+        """Preserving a link is only correct if it still means the same thing afterwards.
+
+        `.is_symlink()` cannot establish that: it is true whether the link resolves into
+        the finished profile or back at the original seed, so an assertion built on it
+        alone passes in the correct world and the broken one alike. Where the link
+        *points* is the actual claim, so that is what this asserts.
+        """
         source = self._source()
-        (source / "inner").symlink_to(source / "sub" / "a.txt")
+        (source / "inner").symlink_to(Path("sub") / "a.txt")
 
         self.assertTrue(seed.materialize(profile(self.dest, SeedPath(source))))
-        self.assertTrue((self.dest / "inner").is_symlink())
+        link = self.dest / "inner"
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(link.resolve(), (self.dest / "sub" / "a.txt").resolve())
+
+    def test_an_absolute_link_inside_the_seed_is_refused(self):
+        """`copytree` recreates a link from its raw target and never rewrites it for the
+        new root, so an absolute link survives the copy still naming the original seed.
+        The finished profile would then be live-linked back to the directory it was
+        supposed to be an isolated copy of, and Chrome would write through it into the
+        real one — the same write-through hazard an escaping link carries, reached by a
+        link that points *inside* the seed."""
+        source = self._source()
+        (source / "inner").symlink_to(source / "sub" / "a.txt")  # absolute by construction
+
+        with self.assertRaisesRegex(CromError, "absolute symlink"):
+            seed.materialize(profile(self.dest, SeedPath(source)))
+
+        self.assertFalse(self.dest.exists())
 
     def test_a_symlinked_directory_cycle_does_not_hang_the_check(self):
         """The walk must not follow links, or a cycle spins forever."""
         source = self._source()
-        (source / "loop").symlink_to(source)
+        (source / "loop").symlink_to(Path("."))
 
         # `loop` resolves to the seed root itself, which counts as inside.
         self.assertTrue(seed.materialize(profile(self.dest, SeedPath(source))))
