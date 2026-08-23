@@ -123,6 +123,40 @@ class MigrateTest(unittest.TestCase):
         scope = config.load_user_scope()
         self.assertEqual(sorted(scope.profiles), ["default", "worker1"])
 
+    def _rewrite_legacy(self, profiles: dict) -> None:
+        migrate.legacy_registry_file().write_text(json.dumps({"profiles": profiles}))
+
+    def test_a_profile_that_was_never_launched_gets_a_port_instead_of_crashing(self):
+        """The old registry created entries as `{}` and added "port" only on first
+        launch, so `crom add ci` without ever bringing it up left a portless entry.
+        Indexing it raised KeyError — not a CromError — and since migration reruns at the
+        top of every command, that bricked the CLI with no way back."""
+        self._rewrite_legacy({"default": {"port": 4222}, "ci": {}})
+        (state_home() / "ci").mkdir(parents=True, exist_ok=True)
+
+        self.run_migration()
+
+        ports = registry.reservations()
+        self.assertEqual(ports["user/default"].port, 4222)
+        self.assertIn("user/ci", ports)  # assigned now, since there was nothing to keep
+        self.assertGreater(ports["user/ci"].port, 0)
+
+    def test_an_illegal_legacy_name_is_refused_before_anything_is_written(self):
+        """The old scheme never validated names, so `QA env` or `Default` were possible;
+        the new parser rejects them. Writing one into the generated TOML would make every
+        later command fail to load it — and a successful run retires the legacy registry,
+        so there would be no retry path."""
+        self._rewrite_legacy({"default": {"port": 4222}, "QA env": {"port": 4223}})
+
+        with mock.patch("crom.chrome.scan", return_value={}):
+            with self.assertRaisesRegex(CromError, "QA env"):
+                migrate.run(log=lambda _: None)
+
+        # Refused before the first write: the legacy file is intact, so the user can
+        # rename and try again.
+        self.assertTrue(migrate.legacy_registry_file().exists())
+        self.assertEqual(config.load_user_scope().profiles, {})
+
     def test_migrated_profiles_resolve_to_their_original_ports(self):
         self.run_migration()
         from crom import resolve

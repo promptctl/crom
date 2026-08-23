@@ -16,7 +16,8 @@ import sys
 from pathlib import Path
 
 from . import chrome, configwrite, registry
-from .model import CromError, ProfileRef, ProfileSpec, SeedChrome
+from .locking import exclusive
+from .model import CromError, ProfileRef, ProfileSpec, SeedChrome, validate_name
 from .paths import (
     USER_NAMESPACE,
     config_home,
@@ -39,7 +40,16 @@ def needed() -> bool:
 def run_if_needed(log=lambda message: print(message, file=sys.stderr)) -> None:
     if not needed():
         return
-    run(log)
+    # Migration runs at the top of every command, so two crom processes started moments
+    # apart after an upgrade both see `needed()` here. The lock makes one of them the
+    # migrator; the re-check inside it makes the other a no-op rather than a second
+    # migration racing the first onto the same config file and the same final rename.
+    # [LAW:no-ambient-temporal-coupling] "has this happened yet" becomes state read
+    # under the lock, not a guess made before acquiring it.
+    with exclusive(legacy_registry_file()):
+        if not needed():
+            return
+        run(log)
 
 
 def run(log) -> None:
@@ -48,6 +58,7 @@ def run(log) -> None:
     old_dirs = {name: state_home() / name for name in legacy}
 
     _require_all_stopped(old_dirs)
+    _require_legal_names(legacy)
 
     log(f"crom: migrating {len(legacy)} profile(s) into the '{USER_NAMESPACE}' namespace")
     destination_root = default_profiles_root() / USER_NAMESPACE
@@ -69,19 +80,59 @@ def run(log) -> None:
             ProfileSpec(name=name, seed=SeedChrome()),
             header=configwrite.USER_CONFIG_HEADER,
         )
-        registry.adopt(ref, entry["port"], user_config_file())
+        # The legacy registry created entries as `{}` and only added "port" the first
+        # time a profile was actually launched, so a profile the user declared but never
+        # brought up has no port to preserve. `adopt` exists to keep a number the world
+        # already points at; with no such number there is nothing to keep, and the
+        # profile simply gets one assigned now.
+        legacy_port = entry.get("port")
+        if legacy_port is None:
+            port = registry.port_for(ref, pinned=None, source=user_config_file())
+        else:
+            port = legacy_port
+            registry.adopt(ref, port, user_config_file())
 
         old_dir = old_dirs[name]
         if old_dir.is_dir():
             shutil.move(str(old_dir), str(destination_root / name))
         (state_home() / f"{name}.pid").unlink(missing_ok=True)
-        log(f"crom:   {name} -> {ref} (port {entry['port']})")
+        log(f"crom:   {name} -> {ref} (port {port})")
 
     # Keep the old file rather than deleting it: it is the only record of the previous
     # assignment, and it costs nothing to leave behind.
     backup = source.with_suffix(".json.migrated")
     source.rename(backup)
     log(f"crom: done. Previous registry kept at {backup}")
+
+
+def _require_legal_names(legacy: dict) -> None:
+    """Refuse the whole migration if any legacy name is illegal under the new rules.
+
+    The old registry never validated names, so `Default`, `Work`, or `QA env` were all
+    possible; `config.parse` now rejects them. Writing one into the generated TOML would
+    make every later command fail to load the file — and because a successful run
+    retires the legacy registry, `needed()` would be false and there would be no way
+    back. So this refuses *before* the first write, while the legacy file is still
+    intact and the user can rename.
+
+    [LAW:no-silent-failure] Deliberately not slugified: a profile directory the user's
+    own tooling and `.mcp.json` files point at must not be renamed behind their back.
+    """
+    illegal = []
+    for name in legacy:
+        try:
+            validate_name("profile name", name)
+        except CromError as e:
+            illegal.append(f"{name!r}: {e}")
+    if not illegal:
+        return
+    listing = "\n  ".join(illegal)
+    raise CromError(
+        "crom cannot migrate these profiles — their names are not legal under the "
+        f"namespaced layout:\n  {listing}\n"
+        f"Rename them in {legacy_registry_file()} (and rename the matching directory "
+        f"under {state_home()}), then run crom again."
+    )
 
 
 def _require_all_stopped(old_dirs: dict[str, Path]) -> None:
