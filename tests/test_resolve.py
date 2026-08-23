@@ -23,6 +23,16 @@ class ParseRefTest(unittest.TestCase):
         with self.assertRaisesRegex(CromError, "invalid profile reference"):
             parse_ref("a/b/c", "myapp")
 
+    def test_the_reference_type_validates_its_own_fields(self):
+        """The module docstring promises names are "checked once, where they enter, and
+        never again" — which is a property of the type, not of caller discipline. A
+        caller that never went through `parse_ref` gets the same guarantee, so
+        `resolve_spec` can compose a path from these fields without wondering."""
+        with self.assertRaisesRegex(CromError, "invalid namespace"):
+            ProfileRef("../escape", "dev")
+        with self.assertRaisesRegex(CromError, "invalid profile name"):
+            ProfileRef("myapp", "Not A Name")
+
     def test_path_traversal_cannot_reach_the_name_type(self):
         # Names become directory components, so `.` and `..` must be unrepresentable.
         # Both segments are checked; whichever is illegal is the one that reports.
@@ -178,6 +188,25 @@ class ResolveTest(unittest.TestCase):
         scope = self.scope(MINIMAL + "[profiles.dev]\n")
         with self.assertRaisesRegex(CromError, "unknown namespace 'ghost'"):
             resolve.resolve(ProfileRef("ghost", "dev"), scope)
+
+    def test_a_renamed_namespace_is_reported_stale_not_silently_resolved(self):
+        """`remember_namespace` is additive, so renaming a namespace in place leaves the
+        old name pointing at the same file. Loading it would return a Scope whose real
+        namespace differs from the one asked for, and `resolve_spec` would then build a
+        profile directory and port under the requested name — a plausible-looking profile
+        belonging to nothing.
+        """
+        other_source = self.root / "other" / ".crom.toml"
+        other_source.parent.mkdir()
+        other_source.write_text('namespace = "other"\n[profiles.dev]\n')
+        registry.remember_namespace("other", other_source)
+
+        # The project renames itself; the ledger still maps the old name to this file.
+        other_source.write_text('namespace = "other2"\n[profiles.dev]\n')
+
+        here = self.scope(MINIMAL + "[profiles.dev]\n")
+        with self.assertRaisesRegex(CromError, "stale"):
+            resolve.resolve(ProfileRef("other", "dev"), here)
 
     def test_a_remembered_namespace_resolves_from_a_foreign_scope(self):
         other_source = self.root / "other" / ".crom.toml"

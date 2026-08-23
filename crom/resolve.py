@@ -114,7 +114,20 @@ def scope_for(namespace: str, ambient: Scope) -> Scope:
             f"namespace '{namespace}' was declared in {source}, which no longer exists. "
             f"Run `crom forget {namespace}` to drop it."
         )
-    return load_file(source)
+
+    scope = load_file(source)
+    if scope.namespace != namespace:
+        # `remember_namespace` is additive: it refuses a *different* file claiming a name
+        # someone else owns, but nothing removes the old entry when a config renames its
+        # own namespace in place. Without this the ledger's stale mapping would load
+        # happily and `resolve_spec` would build a profile directory and port under the
+        # name that was asked for — a plausible-looking profile belonging to nothing.
+        # [LAW:no-silent-failure]
+        raise NotFound(
+            f"namespace '{namespace}' is stale: {source} now declares "
+            f"'{scope.namespace}'. Run `crom forget {namespace}` to drop the old name."
+        )
+    return scope
 
 
 def spec_for(ref: ProfileRef, scope: Scope) -> ProfileSpec:

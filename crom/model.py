@@ -24,7 +24,11 @@ from .paths import USER_NAMESPACE
 # `\Z`, not `$`: Python's `$` also matches immediately before a trailing newline, so `$`
 # would accept "dev\n" — a directory component carrying a newline, which then splits the
 # process's line in two when `chrome.scan` reads `ps` output. `\Z` is the true end.
-_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}\Z")
+#
+# The length cap is named rather than spelled into the pattern, because `cli._slug`
+# truncates to it — two hand-matched numbers would drift the first time either moved.
+NAME_LIMIT = 64
+_NAME_RE = re.compile(rf"^[a-z0-9][a-z0-9._-]{{0,{NAME_LIMIT - 1}}}\Z")
 
 
 class CromError(Exception):
@@ -82,10 +86,22 @@ Seed = SeedFresh | SeedChrome | SeedPath
 
 @dataclass(frozen=True)
 class ProfileRef:
-    """A profile's global identity: which namespace, and which profile within it."""
+    """A profile's global identity: which namespace, and which profile within it.
+
+    Both fields are validated here, so the module docstring's "checked once, where they
+    enter, and never again" is a property of the type rather than of caller discipline.
+    [LAW:parse-dont-validate] the constructor is the checkpoint: a `ProfileRef` that
+    exists names two legal components, and `resolve_spec` can compose
+    `profiles_root / ref.namespace / ref.name` without wondering whether either could
+    carry a `..` or a separator.
+    """
 
     namespace: str
     name: str
+
+    def __post_init__(self) -> None:
+        validate_name("namespace", self.namespace)
+        validate_name("profile name", self.name)
 
     def __str__(self) -> str:
         return f"{self.namespace}/{self.name}"
@@ -228,7 +244,6 @@ def parse_ref(text: str, ambient: str) -> ProfileRef:
         namespace, name = parts
     else:
         raise CromError(f"invalid profile reference {text!r}: expected 'name' or 'namespace/name'")
-    return ProfileRef(
-        validate_name("namespace", namespace),
-        validate_name("profile name", name),
-    )
+    # No validation here: splitting is this function's job, and `ProfileRef` validates
+    # its own fields. [LAW:single-enforcer] one place decides what a legal name is.
+    return ProfileRef(namespace, name)

@@ -222,7 +222,10 @@ def port_for(ref: ProfileRef, *, pinned: int | None, source: Path | None) -> int
         return port
 
 
-_DEFAULT_REF = f"{USER_NAMESPACE}/default"
+# Built through ProfileRef rather than spelled out, so the "namespace/name" format has
+# one owner — `ProfileRef.__str__` — and this cannot drift from the keys the ledger is
+# actually written with. [LAW:one-source-of-truth]
+_DEFAULT_REF = str(ProfileRef(USER_NAMESPACE, "default"))
 
 
 def _reject_base_port_pin(key: str, pinned: int | None) -> None:
