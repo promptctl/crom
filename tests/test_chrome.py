@@ -70,12 +70,26 @@ class GroupByUserDataDirTest(unittest.TestCase):
 
         self.assertEqual(chrome._group_by_user_data_dir(output), {str(profile_dir): (7, 9)})
 
-    def test_a_browser_crom_did_not_launch_is_not_a_crom_profile(self):
-        # The user's own Chrome carries a --user-data-dir but no CDP port; it is not a
-        # profile crom manages and must not be reported as one.
-        output = ps_line(99, ("/chrome", "--user-data-dir=/Users/bmf/Library/Application Support/Google/Chrome"))
+    def test_a_browser_crom_did_not_launch_is_not_mistaken_for_a_profile(self):
+        """The claim that matters is that a foreign Chrome is never reported *as a crom
+        profile* — which is a fact about the lookup, not about the parse.
 
-        self.assertEqual(chrome._group_by_user_data_dir(output), {})
+        This used to assert that the user's own Chrome produced no entry at all, but that
+        was an artifact of a pattern that only matched crom's own argv ordering, and
+        keeping it would mean keeping the bug where a browser that restarted itself
+        vanished from the scan. `scan()` says it reports every running main Chrome, so
+        listing one is correct; what must never happen is a crom profile resolving to a
+        PID that is not its browser. The directory is the discriminator, and no crom
+        profile lives under the real Chrome's user-data-dir.
+        """
+        foreign = "/Users/bmf/Library/Application Support/Google/Chrome"
+        output = ps_line(99, ("/chrome", f"--user-data-dir={foreign}"))
+
+        found = chrome._group_by_user_data_dir(output)
+
+        self.assertEqual(found, {foreign: (99,)})
+        # The part crom acts on: this profile is not running, foreign browser or not.
+        self.assertEqual(found.get("/state/profiles/myapp/dev", ()), ())
 
     def test_ps_header_and_blank_lines_are_not_processes(self):
         self.assertEqual(chrome._group_by_user_data_dir("  PID COMMAND\n\n   \n"), {})
@@ -92,16 +106,59 @@ class GroupByUserDataDirTest(unittest.TestCase):
 
         self.assertEqual(found, {str(profile_dir): (4242,)})
 
-    def test_a_profile_path_containing_the_terminator_text_is_not_truncated(self):
-        """`state_dir` is an unrestricted string, so a profile path can contain the very
-        text used as the terminator. The non-greedy capture stopped at the embedded copy
-        until the pattern was anchored to a real port at the end of the line."""
+    def test_a_browser_that_restarted_itself_is_still_found(self):
+        """Chrome re-execs itself and rewrites its argv when it does.
+
+        This is the real `ps` line from a browser that displayed "relaunch the browser to
+        load your profile data" and restarted — note `--user-data-dir` is no longer last,
+        and no longer adjacent to `--remote-debugging-port`. A pattern anchored to the
+        order `build_argv` emits stops matching here, and then every command that asks
+        "is this running" is told no about a browser that is: `up` starts a second Chrome
+        on the same directory, `down` cannot find it, `list` says stopped, and `rm`
+        deletes a live browser's profile. Observed, not hypothesised.
+        """
+        directory = "/state/profiles/smoketest/dev"
+        restarted = (
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome "
+            "--disable-background-networking --disable-sync --no-first-run "
+            f"--remote-debugging-port=9223 --restart --user-data-dir={directory} --restart"
+        )
+
+        found = chrome._group_by_user_data_dir(f"74546 {restarted}")
+
+        self.assertEqual(found, {directory: (74546,)})
+
+    def test_a_restarted_browser_under_a_path_with_spaces_is_still_found(self):
+        """The two hard cases together: argv reordered *and* a directory with spaces."""
+        directory = "/Users/you/My Projects/app/.crom/profiles/myapp/dev"
+        restarted = (
+            f"/chrome --remote-debugging-port=9300 --restart --user-data-dir={directory} --restart"
+        )
+
+        found = chrome._group_by_user_data_dir(f"4242 {restarted}")
+
+        self.assertEqual(found, {directory: (4242,)})
+
+    def test_a_directory_containing_switch_like_text_is_not_recognised(self):
+        """The documented limit of parsing flattened `ps` output, pinned deliberately.
+
+        `state_dir` is an unrestricted string, so a profile path *can* contain something
+        shaped like a switch — and there is no way to tell it from a real one once argv
+        has been joined with spaces. The previous pattern supported this by requiring
+        `--user-data-dir` to sit last and adjacent to `--remote-debugging-port`, which
+        cost it every browser that restarted itself. That trade was backwards: it
+        defended a directory nobody has against a restart everybody gets.
+
+        Names cannot introduce this — `validate_name` allows only `[a-z0-9._-]` — so it
+        takes a deliberately hostile `state_dir` to reach. This test exists so the
+        narrowing is a recorded decision rather than an undiscovered regression.
+        """
         profile_dir = Path("/state/x --remote-debugging-port=oops/myapp/dev")
         argv = build_argv(Path("/chrome"), profile_dir, 9300, ())
 
         found = chrome._group_by_user_data_dir(ps_line(4242, argv))
 
-        self.assertEqual(found, {str(profile_dir): (4242,)})
+        self.assertEqual(found, {"/state/x": (4242,)})  # truncated, and knowably so
 
 
 class RequirePortAvailableTest(unittest.TestCase):

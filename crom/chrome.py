@@ -27,20 +27,34 @@ SHUTDOWN_TIMEOUT_SECONDS = 5.0
 # `ps` hands us one flat string per process with no argv boundaries, so the directory
 # has to be delimited by something. It cannot be whitespace: a profile directory under a
 # project path like `~/My Projects/app` contains spaces, and `(\S+)` would silently clip
-# it to `~/My` — crom would then never recognise its own running browser. The switch that
-# follows is the reliable terminator, because crom emits `--user-data-dir` and
-# `--remote-debugging-port` adjacently and last (see `resolve.build_argv`; the pre-
-# namespace launcher did the same, which is what lets migration still find legacy
-# profiles). `GroupByUserDataDirTest.test_a_directory_containing_spaces_survives_the_
-# round_trip` pins that adjacency so a reordering of build_argv fails loudly here.
+# it to `~/My` — crom would then never recognise its own running browser. So the capture
+# runs to the next ` --switch`, or to the end of the line.
 #
-# The pattern spells out the "adjacent and *last*" half rather than assuming it. The
-# leading greedy `.*` forces the final `--user-data-dir=`, so a configured flag whose
-# *value* contains that literal text cannot shadow the real one (`parse_flags` inspects
-# only the switch name before `=`, so such a value is not rejected). The trailing
-# `\d+\s*\Z` requires the true end of the command line, so a profile path that itself
-# contains ` --remote-debugging-port=` cannot truncate the capture early.
-_USER_DATA_DIR_RE = re.compile(r".*--user-data-dir=(.+?) --remote-debugging-port=\d+\s*\Z")
+# It deliberately does *not* depend on where `--user-data-dir` sits. An earlier version
+# required it to be immediately followed by `--remote-debugging-port` at the very end —
+# the shape `resolve.build_argv` emits — which made crom's own launch ordering a
+# load-bearing assumption about a string that Chrome owns. Chrome re-execs itself
+# (`--restart`) after something as ordinary as "relaunch the browser to load your profile
+# data", and rewrites its argv when it does:
+#
+#     ... --remote-debugging-port=9223 --restart --user-data-dir=/…/dev --restart
+#
+# The anchored pattern does not match that. `scan()` then returns nothing, and every
+# command that asks "is this profile running" is told no about a browser that is running:
+# `up` starts a second Chrome on the same directory, `down` cannot find it, `list` reports
+# it stopped, and `rm` deletes a live browser's user-data-dir. Observed against a real
+# Chrome, not hypothesised. [FRAMING:representation] this pattern is a map of Chrome's
+# *current* command line, not of how crom launched it; only the first is the territory.
+#
+# The cost of the looser terminator is that a directory containing a literal ` --word` is
+# not recognisable. Flattened `ps` output genuinely cannot distinguish that from a switch,
+# so no pattern over this input can. The old anchor made the same trade in reverse and had
+# it backwards: it defended a path nobody has at the price of a restart everybody gets.
+#
+# The leading greedy `.*` still forces the *last* `--user-data-dir=`, so a configured flag
+# whose value contains that literal text cannot shadow the real one (`parse_flags`
+# inspects only the switch name before `=`, so such a value is not rejected).
+_USER_DATA_DIR_RE = re.compile(r".*--user-data-dir=(.+?)(?=\s+--[A-Za-z0-9-]+|\s*\Z)")
 
 
 def _group_by_user_data_dir(ps_output: str) -> dict[str, tuple[int, ...]]:
