@@ -20,7 +20,11 @@ from .paths import USER_NAMESPACE
 # Namespaces and profile names become both directory components and CLI tokens, so the
 # legal set is the intersection of what is safe in each. [LAW:parse-dont-validate] this
 # is checked once, where names enter, and never again.
-_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+#
+# `\Z`, not `$`: Python's `$` also matches immediately before a trailing newline, so `$`
+# would accept "dev\n" — a directory component carrying a newline, which then splits the
+# process's line in two when `chrome.scan` reads `ps` output. `\Z` is the true end.
+_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}\Z")
 
 
 class CromError(Exception):

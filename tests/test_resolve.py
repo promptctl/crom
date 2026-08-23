@@ -33,6 +33,15 @@ class ParseRefTest(unittest.TestCase):
         with self.assertRaisesRegex(CromError, "invalid profile reference"):
             parse_ref("/etc/passwd", "myapp")
 
+    def test_a_trailing_newline_is_not_part_of_a_name(self):
+        # Python's `$` matches before a trailing newline, so an anchor of `$` would let
+        # "dev\n" through — a directory component with a newline in it, which then
+        # splits that process into two lines when chrome.scan reads `ps` output.
+        with self.assertRaisesRegex(CromError, "invalid profile name"):
+            parse_ref("dev\n", "myapp")
+        with self.assertRaisesRegex(CromError, "invalid namespace"):
+            parse_ref("myapp\n/dev", "myapp")
+
 
 class ArgvTest(unittest.TestCase):
     def test_crom_owned_switches_come_last_so_config_cannot_displace_them(self):
