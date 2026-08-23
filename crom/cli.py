@@ -23,6 +23,7 @@ import click
 from . import chrome, config, configwrite, mcp, migrate, registry, resolve as resolver, seed
 from .config import discover, load_ambient, load_user_scope, parse_flags, parse_port, parse_seed
 from .model import (
+    NAME_LIMIT,
     Conflict,
     CromError,
     FailedProfile,
@@ -99,9 +100,12 @@ def _bootstrap_user_config() -> None:
     Written explicitly into the file rather than defaulted in code, so `user/default`
     cloning your real Chrome profile is a visible, editable decision and not folklore.
     """
-    if user_config_file().exists():
-        return
-    configwrite.add_profile(
+    # `ensure_profile`, not `add_profile`: the goal is that the declaration *exist*, not
+    # that this process be the one to write it. On a fresh machine two crom invocations
+    # both find no user config and both try; `add_profile` raises FileExistsError at the
+    # loser, which is not a CromError and so escapes the CLI's exit-code contract as a
+    # traceback. Converging makes the race a no-op instead of an error to catch.
+    configwrite.ensure_profile(
         user_config_file(),
         ProfileSpec(name="default", seed=SeedChrome()),
         header=configwrite.USER_CONFIG_HEADER,
@@ -126,17 +130,25 @@ def main(ctx):
 def up_cmd(session: _Session, ref: str, as_json: bool):
     """Launch a profile, or report the running one. Idempotent."""
     profile = session.profile(ref)
-    if not profile.profile_dir.exists():
-        # Say so before the copy, not after: a `chrome` seed moves hundreds of megabytes
-        # and an unexplained pause looks like a hang.
-        rendered = configwrite.render_seed(profile.seed, profile.config_dir)
-        click.echo(f"Creating {profile.ref} from seed '{rendered}' …", err=True)
-    seed.materialize(profile)
+    # Seeding, the liveness check, and the launch are one critical section. Split, two
+    # concurrent `crom up` calls both see no running Chrome and both launch against the
+    # same profile directory and port — and because Chrome binds the CDP port well before
+    # it answers on it, the loser's `_require_port_available` reports the port as held by
+    # "another process" when that process is the browser it was asking for. Serialized,
+    # the second caller finds the first's Chrome and reports it, which is what `up` has
+    # always claimed to do.
+    with seed.profile_lock(profile):
+        if not profile.profile_dir.exists():
+            # Say so before the copy, not after: a `chrome` seed moves hundreds of
+            # megabytes and an unexplained pause looks like a hang.
+            rendered = configwrite.render_seed(profile.seed, profile.config_dir)
+            click.echo(f"Creating {profile.ref} from seed '{rendered}' …", err=True)
+        seed.materialize_under_lock(profile)
 
-    pids = chrome.find_pids(profile)
-    started = not pids
-    if started:
-        pids = chrome.launch(profile)
+        pids = chrome.find_pids(profile)
+        started = not pids
+        if started:
+            pids = chrome.launch(profile)
 
     verb = "Started" if started else "Already running"
     _emit(
@@ -261,6 +273,19 @@ def add_cmd(session: _Session, name: str, seed_text: str, flags: tuple[str, ...]
     # to be refused: resolution reserves one, so `crom add ci --port 9500` against an
     # existing `ci` would move the real `ci` onto 9500 and break whatever already points
     # at its old port — a failed command silently repointing a live profile.
+    # `_declare` creates the file when it is missing, and the header it would write is
+    # the *user* scope's — which carries no `namespace` key, because only `init_project`'s
+    # template does. So recreating a vanished project config from it produces a file the
+    # parser rejects wholesale. The scope was read at discovery time and the file can be
+    # gone by now (a `git clean`, another agent resetting the workspace), so say so
+    # instead of writing a config crom cannot read back.
+    header = configwrite.USER_CONFIG_HEADER if target == user_config_file() else ""
+    if target != user_config_file() and not target.exists():
+        raise NotFound(
+            f"{target} no longer exists — the project config crom discovered has been "
+            f"removed. Run `crom init` to recreate it."
+        )
+
     if configwrite.declares(target, name):
         raise Conflict(f"{target}: profile '{name}' is already declared")
     config.reject_duplicate_ports({**scope.profiles, name: spec}, target)
@@ -272,12 +297,19 @@ def add_cmd(session: _Session, name: str, seed_text: str, flags: tuple[str, ...]
     # later via `_reject_foreign_claim`. Any failure releases it, not only the
     # anticipated one: a permission error or a full disk strands it exactly the same way.
     try:
-        configwrite.add_profile(target, spec, header=configwrite.USER_CONFIG_HEADER)
+        configwrite.add_profile(target, spec, header=header)
     except FileExistsError as e:
-        registry.forget(profile.ref)
+        # Deliberately no cleanup. `profile.ref` is the profile's shared identity, not
+        # this attempt's, and FileExistsError means a declaration for that name now
+        # exists — written by whichever concurrent `crom add` won. That declaration owns
+        # the reservation, so releasing it here would strip a live profile of its port
+        # and silently move it on the next resolve.
         raise Conflict(str(e)) from e
     except BaseException:
-        registry.forget(profile.ref)
+        # The write failed for some other reason, so no declaration of ours landed. Only
+        # release the port if nothing else claimed the name in the meantime.
+        if not configwrite.declares(target, name):
+            registry.forget(profile.ref)
         raise
 
     click.echo(f"Declared {profile.ref} in {target}")
@@ -426,8 +458,14 @@ def _slug(text: str) -> str:
     `_internal` used to slugify unchanged and then fail name validation — a confusing
     error from a command whose whole promise is that it works in any directory. Stripping
     them also lets an all-punctuation name fall through to the `project` fallback.
+
+    Truncated to the same 64 characters `validate_name` allows, and re-stripped
+    afterwards so the cut cannot leave a trailing separator that fails on its own. A
+    deeply nested build directory or a long branch checkout is a name crom can handle,
+    not a reason to make the user pick one by hand.
     """
-    return re.sub(r"[^a-z0-9._-]+", "-", text.lower()).strip("._-") or "project"
+    slug = re.sub(r"[^a-z0-9._-]+", "-", text.lower()).strip("._-")
+    return slug[:NAME_LIMIT].strip("._-") or "project"
 
 
 def _human_size(directory: Path) -> str:

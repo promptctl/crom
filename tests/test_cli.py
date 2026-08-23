@@ -16,6 +16,7 @@ from unittest import mock
 from click.testing import CliRunner
 
 from crom import cli
+from crom.config import load_ambient
 from crom.paths import state_home, user_config_file
 
 
@@ -164,6 +165,54 @@ class CliTest(unittest.TestCase):
         self.assertNotIn("ci", target.read_text())
         reserved = json.loads((state_home() / "registry.json").read_text())["ports"]
         self.assertNotIn("myproj/ci", reserved)
+
+    def test_losing_a_concurrent_add_leaves_the_winners_port_alone(self):
+        """`profile.ref` is the profile's shared identity, not one attempt's.
+
+        Two `crom add ci` calls resolve the same ref and the same reserved port. When the
+        loser's write raises FileExistsError, the declaration that now exists is the
+        *winner's* and it owns that reservation — releasing it here silently moved a live
+        profile to a new port on its next resolve.
+
+        The race is reproduced deterministically: `declares` is stubbed False so the
+        pre-check passes as it would for the loser, and `add_profile` then raises for
+        real because the name is genuinely already declared.
+        """
+        self.crom("init")
+        self.crom("add", "ci")
+        winners_port = self.crom("port", "ci")
+
+        with mock.patch("crom.configwrite.declares", return_value=False):
+            self.crom("add", "ci", expect=4)
+
+        self.assertEqual(self.crom("port", "ci"), winners_port)
+
+    def test_add_refuses_when_the_project_config_vanished_after_discovery(self):
+        """`_declare` creates a missing file, and the header it would use carries no
+        `namespace` key — so recreating a deleted project config yields a file the parser
+        rejects wholesale, breaking every command in the project.
+
+        The window is within one invocation: the scope is read at discovery and the file
+        removed before the write (a `git clean`, another agent resetting the workspace).
+        A fresh `crom` would simply re-discover and fall back to the user scope, so the
+        scope is stubbed to hold a source that no longer exists — which is exactly the
+        state `_Session.scope` would be caching.
+        """
+        self.crom("init")
+        scope = load_ambient(self.project)
+        (self.project / ".crom.toml").unlink()
+
+        with mock.patch("crom.cli.load_ambient", return_value=scope):
+            self.crom("add", "two", expect=3)
+
+        self.assertFalse((self.project / ".crom.toml").exists())
+
+    def test_init_shortens_a_directory_name_too_long_to_be_a_namespace(self):
+        long_name = "a" * 200
+        here = self.root / long_name
+        here.mkdir()
+        self.crom("init", cwd=here)
+        self.assertIn(f'namespace = "{"a" * 64}"', (here / ".crom.toml").read_text())
 
     def test_forget_refuses_the_reserved_user_namespace(self):
         """`crom forget user` would release the ports personal profiles are using; they
