@@ -112,6 +112,18 @@ class CliTest(unittest.TestCase):
         self.assertNotIn("beta", before)
         self.assertIn("alpha", self.crom("list"))
 
+    def test_a_refused_duplicate_name_does_not_move_the_existing_profile(self):
+        # Resolving reserves a port, so resolving before noticing the name is taken would
+        # repoint the real `ci` at 9500 — while the config still declares no pin, and
+        # whatever already points at its old port (a checked-in .mcp.json) breaks.
+        self.crom("init")
+        self.crom("add", "ci")
+        before = self.crom("port", "ci")
+
+        self.crom("add", "ci", "--port", "9500", expect=4)
+
+        self.assertEqual(self.crom("port", "ci"), before)
+
     def test_a_pinned_port_already_taken_is_a_conflict_not_a_bare_failure(self):
         self.crom("init")
         self.crom("add", "alpha", "--port", "9500")

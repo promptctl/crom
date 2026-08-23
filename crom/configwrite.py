@@ -78,6 +78,16 @@ def init_project(path: Path, namespace: str) -> None:
     path.write_text(PROJECT_CONFIG_TEMPLATE.format(namespace=namespace))
 
 
+def declares(path: Path, name: str) -> bool:
+    """Whether `path` already declares a profile called `name`.
+
+    Lets a caller find out that a name is taken *before* doing work that persists
+    something — `crom add` reserves a port while resolving, and must not do that for a
+    profile it is about to refuse.
+    """
+    return name in _load(path).get("profiles", {})
+
+
 def _declare(path: Path, spec: ProfileSpec, header: str) -> bool:
     """Append a `[profiles.<name>]` table for `spec`; report whether it was written.
 

@@ -212,12 +212,21 @@ def add_cmd(session: _Session, name: str, seed_text: str, flags: tuple[str, ...]
         seed=parse_seed(seed_text, f"[profiles.{name}]", target, scope.config_dir),
         port=port,
     )
-    # Everything that can refuse this profile runs before anything is written. Declaring
-    # first and resolving second would leave a rejected profile sitting in the file: a
-    # pinned port that collides is refused *here*, but the declaration carrying it would
-    # already be on disk, and the config parser rejects that file wholesale on the next
-    # load — every command in the project, `crom rm` included, would then fail to read
-    # the very file the user would need crom to fix.
+    # Every reason to refuse this profile is checked before anything is persisted, and
+    # the two orderings that look equivalent are not:
+    #
+    # Writing before resolving would leave a refused profile in the file — a colliding
+    # pinned port is rejected during resolution, but its declaration would already be on
+    # disk, and the parser rejects such a file wholesale on the next load. Every command
+    # in the project, `crom rm` included, would then fail on the file the user needs crom
+    # to repair.
+    #
+    # Resolving before checking the name would persist a port for a profile that is about
+    # to be refused: resolution reserves one, so `crom add ci --port 9500` against an
+    # existing `ci` would move the real `ci` onto 9500 and break whatever already points
+    # at its old port — a failed command silently repointing a live profile.
+    if configwrite.declares(target, name):
+        raise Conflict(f"{target}: profile '{name}' is already declared")
     config.reject_duplicate_ports({**scope.profiles, name: spec}, target)
     profile = resolver.resolve_spec(ProfileRef(scope.namespace, name), scope, spec)
 
