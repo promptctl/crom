@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -285,6 +286,98 @@ class MigrateTest(unittest.TestCase):
         profile = resolve.resolve(ProfileRef("user", "default"), scope)
         self.assertEqual(profile.port, 4222)
         self.assertEqual(profile.profile_dir, state_home() / "profiles" / "user" / "default")
+
+
+    def test_a_commit_interrupted_after_the_move_is_finished_by_the_next_run(self):
+        """The window between `shutil.move` completing and `os.replace` committing.
+
+        On one filesystem the move is a rename, so a kill here leaves the data whole in
+        staging with `old_dir` already gone. The retry saw no `old_dir`, decided there
+        was nothing to do, and left a complete profile in a hidden directory nothing ever
+        looked at again — and since these profiles are declared `seed = "chrome"`, the
+        next `crom up` rebuilt them from the real Chrome profile instead of the user's
+        data. Silent substitution of someone else's browser state for your own.
+
+        Rather than simulate the kill, this constructs exactly the state one leaves.
+        """
+        destination_root = state_home() / "profiles" / "user"
+        destination_root.mkdir(parents=True)
+        staging = destination_root / ".worker1.partial"
+        shutil.move(str(migrate._legacy_state_dir() / "worker1"), str(staging))
+        (staging / "Default" / "marker").write_text("the user's real data")
+
+        self.run_migration()
+
+        moved = destination_root / "worker1" / "Default" / "marker"
+        self.assertTrue(moved.is_file(), "the staged profile was never committed")
+        self.assertEqual(moved.read_text(), "the user's real data")
+        self.assertFalse(staging.exists())
+
+    def test_staging_beside_a_committed_destination_is_discarded(self):
+        """The other reading of the same directory: once `destination` exists the move is
+        done — `os.replace` is atomic and is the only thing that creates it — so staging
+        really is debris and must not be mistaken for work outstanding."""
+        destination_root = state_home() / "profiles" / "user"
+        (destination_root / "worker1" / "Default").mkdir(parents=True)
+        (destination_root / "worker1" / "Default" / "marker").write_text("committed")
+        staging = destination_root / ".worker1.partial"
+        (staging / "Default").mkdir(parents=True)
+        (staging / "Default" / "marker").write_text("stale debris")
+
+        self.run_migration()
+
+        keeper = destination_root / "worker1" / "Default" / "marker"
+        self.assertEqual(keeper.read_text(), "committed")
+        self.assertFalse(staging.exists())
+
+    def test_two_legacy_profiles_claiming_one_port_are_refused_before_any_write(self):
+        """`adopt` refuses the second claimant, but from inside the loop — after earlier
+        profiles are declared and adopted, at the same point on every retry."""
+        self._rewrite_legacy({"default": {"port": 4222}, "worker1": {"port": 4222}})
+
+        with mock.patch("crom.chrome.scan", return_value={}):
+            with self.assertRaisesRegex(CromError, "both claim port 4222"):
+                migrate.run(log=lambda _: None)
+
+        self.assertTrue(migrate.legacy_registry_file().exists())
+        self.assertEqual(config.load_user_scope().profiles, {})
+        self.assertEqual(registry.reservations(), {})
+
+    def test_a_malformed_legacy_port_is_refused_before_any_write(self):
+        """`adopt` checks who may hold a number, not whether it is one. An unvalidated
+        value reached the new ledger and surfaced much later, from `socket.bind`."""
+        for bad in ("9222", 0, -1, 99999, 3.5, True):
+            with self.subTest(port=bad):
+                self._rewrite_legacy({"default": {"port": 4222}, "ci": {"port": bad}})
+                with mock.patch("crom.chrome.scan", return_value={}):
+                    with self.assertRaisesRegex(CromError, "bad port for 'ci'"):
+                        migrate.run(log=lambda _: None)
+                self.assertTrue(migrate.legacy_registry_file().exists())
+
+    def test_a_legacy_profile_named_for_the_profiles_root_is_refused(self):
+        """With XDG_STATE_HOME unset — the ordinary case — the legacy state directory and
+        the new one are the same, which is deliberate and harmless for every name but
+        this one. A profile called `profiles` sat exactly where the namespaced layout
+        keeps all profiles, so the move became "put this directory inside itself" and
+        `shutil` raised a bare `shutil.Error` partway through the loop.
+        """
+        self.env.stop()  # the collision needs HOME and XDG_STATE_HOME to coincide
+        home = Path(self.tmp.name).resolve() / "collide"
+        env = mock.patch.dict(os.environ, {"HOME": str(home)})
+        for key in ("XDG_STATE_HOME", "XDG_CONFIG_HOME"):
+            os.environ.pop(key, None)
+        env.start()
+        self.addCleanup(env.stop)
+
+        migrate.legacy_registry_file().parent.mkdir(parents=True)
+        self._rewrite_legacy({"profiles": {"port": 4222}})
+        (migrate._legacy_state_dir() / "profiles" / "Default").mkdir(parents=True)
+
+        with mock.patch("crom.chrome.scan", return_value={}):
+            with self.assertRaisesRegex(CromError, "inside itself"):
+                migrate.run(log=lambda _: None)
+
+        self.assertTrue(migrate.legacy_registry_file().exists())
 
 
 if __name__ == "__main__":

@@ -17,6 +17,7 @@ import sys
 from pathlib import Path
 
 from . import chrome, configwrite, registry
+from .config import parse_port
 from .locking import exclusive
 from .model import CromError, ProfileRef, ProfileSpec, SeedChrome, validate_name
 from .paths import (
@@ -108,6 +109,16 @@ def _read_legacy(source: Path) -> dict[str, dict]:
     for name, entry in profiles.items():
         if not isinstance(entry, dict):
             raise refuse(f"entry for '{name}' is a {type(entry).__name__}, not an object")
+        # The port is indexed straight into `registry.adopt`, which checks who may hold a
+        # number but not whether it is one. An unvalidated value is persisted into the new
+        # ledger and surfaces later as a TypeError from `socket.bind` or inside Chrome's
+        # argv — far from the file that caused it. [LAW:single-enforcer] the 1..65535 rule
+        # has one home in `parse_port`; this reuses it rather than restating it.
+        if "port" in entry:
+            try:
+                parse_port(entry["port"], f"profile '{name}'", source)
+            except CromError as e:
+                raise refuse(f"has a bad port for '{name}' ({e})") from e
     return profiles
 
 
@@ -116,11 +127,18 @@ def run(log) -> None:
     legacy = _read_legacy(source)
     old_dirs = {name: _legacy_state_dir() / name for name in legacy}
 
+    destination_root = default_profiles_root() / USER_NAMESPACE
+
+    # Everything that can refuse this migration runs before the first write. A refusal
+    # partway through is far worse here than elsewhere: the legacy registry is only
+    # retired after the whole loop, so a retry re-enters and fails at the identical
+    # point, leaving the user with a half-migrated installation and no way forward.
     _require_all_stopped(old_dirs)
     _require_legal_names(legacy)
+    _require_distinct_ports(legacy, source)
+    _require_no_destination_collision(old_dirs, destination_root)
 
     log(f"crom: migrating {len(legacy)} profile(s) into the '{USER_NAMESPACE}' namespace")
-    destination_root = default_profiles_root() / USER_NAMESPACE
     destination_root.mkdir(parents=True, exist_ok=True)
 
     for name, entry in legacy.items():
@@ -151,9 +169,11 @@ def run(log) -> None:
             port = legacy_port
             registry.adopt(ref, port, user_config_file())
 
-        old_dir = old_dirs[name]
-        if old_dir.is_dir():
-            _move_staged(old_dir, destination_root / name)
+        # Unconditionally: `_move_staged` decides what is left to do by reading the
+        # destination and the staging directory, and an interrupted commit is a state
+        # only it can see — a caller-side `old_dir.is_dir()` guard would skip exactly
+        # the case that needs finishing.
+        _move_staged(old_dirs[name], destination_root / name)
         (_legacy_state_dir() / f"{name}.pid").unlink(missing_ok=True)
         log(f"crom:   {name} -> {ref} (port {port})")
 
@@ -165,7 +185,7 @@ def run(log) -> None:
 
 
 def _move_staged(old_dir: Path, destination: Path) -> None:
-    """Move a profile directory so a failure partway leaves the retry a clean slate.
+    """Move a profile directory so an interrupted attempt is finished by the next one.
 
     On one filesystem `shutil.move` is a rename and is already atomic. Across
     filesystems it degrades to copy-then-delete, and a failure mid-copy leaves the
@@ -174,15 +194,98 @@ def _move_staged(old_dir: Path, destination: Path) -> None:
     with a non-empty destination — turning a recoverable interruption into a permanent
     one. Staging beside the destination and committing with a rename keeps the retry's
     precondition true, the same shape `seed._staged` uses.
+
+    How far the previous attempt got is **three** states, not two, and reading only
+    `old_dir` conflated the last two. A same-filesystem `shutil.move` is a rename, so an
+    interruption between it and the commit leaves the data whole in staging with
+    `old_dir` already gone. The retry then saw no `old_dir`, concluded there was nothing
+    to do, and left a complete profile stranded in a hidden directory that no code path
+    ever looked at again — and because migration declares these profiles `seed = "chrome"`,
+    the next `crom up` silently rebuilt the profile from the real Chrome profile instead
+    of the user's actual data. Worse, had this function been re-entered, its first act
+    was to delete that staging directory as debris.
+
+    [LAW:no-ambient-temporal-coupling] the progress of the last attempt is state on
+    disk, read here, rather than inferred from which of two paths happens to exist.
     """
     staging = destination.parent / f".{destination.name}.partial"
-    shutil.rmtree(staging, ignore_errors=True)  # debris from an attempt that died here
+
+    if destination.exists():
+        # Committed on an earlier attempt. `os.replace` is the only thing that creates
+        # `destination` and it is atomic, so its presence means done — and any staging
+        # beside it really is debris.
+        shutil.rmtree(staging, ignore_errors=True)
+        return
+    if staging.exists():
+        # Moved but not committed. Finish the commit rather than starting over; the data
+        # is already here and `old_dir` is already gone.
+        os.replace(staging, destination)
+        return
+    if not old_dir.is_dir():
+        return
+
     try:
         shutil.move(str(old_dir), str(staging))
         os.replace(staging, destination)
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
         raise
+
+
+def _require_distinct_ports(legacy: dict, source: Path) -> None:
+    """Refuse before the first write if two legacy profiles claim one port.
+
+    `registry.adopt` already refuses the second claimant — but it does so from inside the
+    loop, after earlier profiles have been declared and adopted. The legacy registry is
+    retired only when the whole loop succeeds, so the retry re-enters and raises at the
+    identical point, forever: a half-migrated installation with no way forward and no way
+    back. The same reasoning `_require_legal_names` is built on, applied to the other
+    thing a hand-edited registry can get wrong.
+    """
+    seen: dict[int, str] = {}
+    for name, entry in legacy.items():
+        port = entry.get("port")
+        if port is None:
+            continue
+        if port in seen:
+            raise CromError(
+                f"{source}: '{name}' and '{seen[port]}' both claim port {port}.\n"
+                f"crom cannot give one port to two profiles. Edit that file to give them "
+                f"different ports (or remove one `port`, and crom will assign a fresh "
+                f"one), then run crom again."
+            )
+        seen[port] = name
+
+
+def _require_no_destination_collision(old_dirs: dict[str, Path], destination_root: Path) -> None:
+    """Refuse if a legacy profile directory contains the place its data must move into.
+
+    With `XDG_STATE_HOME` unset — the ordinary case — `state_home()` and
+    `_legacy_state_dir()` are the same directory, which is deliberate: the two layouts do
+    not collide because new profiles live under `<state>/profiles/<ns>/<name>` while
+    legacy ones sat directly at `<state>/<name>`. That holds for every legacy name except
+    one. A profile named `profiles` sat at `<state>/profiles`, which is exactly the root
+    every migrated profile is moving into — so the move becomes "put this directory
+    inside itself", which `shutil` refuses with a raw `shutil.Error`, escaping the
+    exit-code contract partway through the loop.
+
+    `_NAME_RE` accepts `profiles`, and the old scheme validated nothing, so this is
+    reachable by a user who once ran `crom add profiles`.
+
+    Refusing beats renaming the profiles root: that path is documented, and it is where
+    every already-migrated installation's data now lives — changing it to dodge one name
+    would strand data for every existing user. Stated as a relationship between paths
+    rather than as the literal name `profiles`, so it still holds if that layout changes.
+    """
+    for name, old_dir in old_dirs.items():
+        if old_dir == destination_root or old_dir in destination_root.parents:
+            raise CromError(
+                f"crom cannot migrate the profile '{name}': its directory ({old_dir}) is "
+                f"where the namespaced layout keeps every profile ({destination_root}), "
+                f"so moving it would put it inside itself.\n"
+                f"Rename it in {legacy_registry_file()} (and rename the directory to "
+                f"match), then run crom again."
+            )
 
 
 def _require_legal_names(legacy: dict) -> None:
