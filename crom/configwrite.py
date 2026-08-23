@@ -11,7 +11,8 @@ from pathlib import Path
 
 import tomlkit
 
-from .model import NotFound, ProfileSpec, Seed, SeedChrome, SeedFresh, SeedPath
+from .locking import exclusive
+from .model import Conflict, NotFound, ProfileSpec, Seed, SeedChrome, SeedFresh, SeedPath
 
 USER_CONFIG_HEADER = """\
 # crom — your personal Chrome profiles (the `user` namespace).
@@ -42,8 +43,19 @@ flags = []
 """
 
 
-def render_seed(seed: Seed) -> str:
-    """The config spelling of a seed — the inverse of `config._parse_seed`."""
+def render_seed(seed: Seed, base: Path) -> str:
+    """The config spelling of a seed — the inverse of `config.parse_seed`.
+
+    `base` is the directory the config file lives in, and a path under it is written
+    back relative to it. `config.parse_seed` absolutizes every path seed against that
+    same directory, so rendering the resolved path verbatim would bake this machine's
+    layout into a file the README expects to be committed and shared: `--seed
+    ./local-seed` would land in the file as `/home/you/project/local-seed`, which is
+    correct on exactly one machine.
+
+    A path outside `base` has no portable spelling and is written absolute — `..`
+    chains out of the project would be portable in form and wrong in meaning.
+    """
     match seed:
         case SeedFresh():
             return "fresh"
@@ -52,7 +64,20 @@ def render_seed(seed: Seed) -> str:
         case SeedChrome(profile=which):
             return f"chrome:{which}"
         case SeedPath(path=path):
-            return str(path)
+            return _relative_to(path, base)
+
+
+def _relative_to(path: Path, base: Path) -> str:
+    """`./x` when `path` sits under `base`, else the absolute path.
+
+    The `./` prefix is load-bearing rather than decoration: `config.parse_seed` only
+    treats a value as a path when it starts with `.`, `/`, or `~`, so a bare `local-seed`
+    would come back as an unrecognised keyword.
+    """
+    try:
+        return f"./{path.relative_to(base)}"
+    except ValueError:
+        return str(path)
 
 
 def _load(path: Path) -> tomlkit.TOMLDocument:
@@ -71,9 +96,17 @@ def _save(path: Path, doc: tomlkit.TOMLDocument) -> None:
 
 
 def init_project(path: Path, namespace: str) -> None:
-    """Write a new project config. Refuses to touch an existing file."""
+    """Write a new project config. Refuses to touch an existing file.
+
+    `Conflict` rather than a bare `FileExistsError`: this is the exit-4 case the CLI
+    contract promises, and raising it here rather than translating at the call site
+    means the narrow window between `crom init`'s own existence check and this write —
+    check-then-act, so not the guarantee it looks like — is covered by construction.
+    [LAW:single-enforcer] a future caller cannot reintroduce the gap by forgetting a
+    wrapper that no longer exists.
+    """
     if path.exists():
-        raise FileExistsError(f"{path} already exists")
+        raise Conflict(f"{path} already exists")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(PROJECT_CONFIG_TEMPLATE.format(namespace=namespace))
 
@@ -94,26 +127,32 @@ def _declare(path: Path, spec: ProfileSpec, header: str) -> bool:
     Returns False, having changed nothing, when the name is already declared — leaving
     each caller to say what that means for it. `header` is written only when the file is
     being created, so an existing file's own preamble is never duplicated or displaced.
+
+    The whole load-mutate-save runs under an exclusive lock: two `crom add` calls
+    against one config would otherwise both read the document before either wrote, and
+    the later `_save` would drop the earlier profile while its process still reported
+    success. Same hazard the port ledger takes a lock for, same lock.
     """
-    if not path.exists() and header:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(header)
+    with exclusive(path):
+        if not path.exists() and header:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(header)
 
-    doc = _load(path)
-    profiles = doc.setdefault("profiles", tomlkit.table(is_super_table=True))
-    if spec.name in profiles:
-        return False
+        doc = _load(path)
+        profiles = doc.setdefault("profiles", tomlkit.table(is_super_table=True))
+        if spec.name in profiles:
+            return False
 
-    table = tomlkit.table()
-    table["seed"] = render_seed(spec.seed or SeedFresh())
-    table["flags"] = list(spec.flags)
-    if spec.port is not None:
-        table["port"] = spec.port
-    if spec.env:
-        table["env"] = dict(spec.env)
-    profiles[spec.name] = table
-    _save(path, doc)
-    return True
+        table = tomlkit.table()
+        table["seed"] = render_seed(spec.seed or SeedFresh(), path.parent)
+        table["flags"] = list(spec.flags)
+        if spec.port is not None:
+            table["port"] = spec.port
+        if spec.env:
+            table["env"] = dict(spec.env)
+        profiles[spec.name] = table
+        _save(path, doc)
+        return True
 
 
 def add_profile(path: Path, spec: ProfileSpec, *, header: str = "") -> None:
@@ -134,9 +173,11 @@ def ensure_profile(path: Path, spec: ProfileSpec, *, header: str = "") -> bool:
 
 
 def remove_profile(path: Path, name: str) -> None:
-    doc = _load(path)
-    profiles = doc.get("profiles")
-    if not profiles or name not in profiles:
-        raise NotFound(f"{path}: profile '{name}' is not declared here")
-    del profiles[name]
-    _save(path, doc)
+    """Delete a profile's declaration, under the same lock `_declare` writes beneath."""
+    with exclusive(path):
+        doc = _load(path)
+        profiles = doc.get("profiles")
+        if not profiles or name not in profiles:
+            raise NotFound(f"{path}: profile '{name}' is not declared here")
+        del profiles[name]
+        _save(path, doc)
