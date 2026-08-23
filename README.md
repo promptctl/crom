@@ -147,8 +147,9 @@ crom forget NAMESPACE   drop a namespace whose config is gone
 ```
 
 `REF` is `name` (resolved in the ambient namespace) or `namespace/name`. It defaults to
-`default` — except for `crom config`, where omitting it reports the ambient scope alone
-(which config is in effect, and what it declares) without resolving any one profile.
+`default`, with two exceptions: `crom config` without a REF reports the ambient scope
+alone (which config is in effect, and what it declares) rather than resolving a profile,
+and `crom rm` requires a REF — it will not guess which profile you meant to delete.
 
 ## How collisions are avoided
 
