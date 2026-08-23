@@ -30,8 +30,30 @@ from .paths import (
 LEGACY_REGISTRY = "profiles.json"
 
 
+# Where the pre-namespace crom actually put its data.
+#
+# [LAW:no-silent-failure] These are deliberately *not* `config_home()`/`state_home()`,
+# and must not be "tidied up" into them. Those helpers are new in the namespaced layout
+# and honor `XDG_CONFIG_HOME`/`XDG_STATE_HOME`; the removed `crom/profiles.py` that
+# wrote the data being migrated never consulted either variable and hardcoded these
+# paths unconditionally. Looking through the XDG-aware helpers would therefore search
+# where the legacy data was never written: for a user who has those variables set,
+# `needed()` returns False, crom bootstraps as if fresh, and their profiles are
+# abandoned with new ports assigned and no warning. Migration reads a historical
+# artifact, so it has to look where that artifact was actually put.
+#
+# Functions rather than constants so the lookup happens at call time and honors `HOME`,
+# which is what `Path.home()` reads and what the legacy module resolved against too.
+def _legacy_config_dir() -> Path:
+    return Path.home() / ".config" / "crom"
+
+
+def _legacy_state_dir() -> Path:
+    return Path.home() / ".local" / "state" / "crom"
+
+
 def legacy_registry_file() -> Path:
-    return config_home() / LEGACY_REGISTRY
+    return _legacy_config_dir() / LEGACY_REGISTRY
 
 
 def needed() -> bool:
@@ -53,28 +75,48 @@ def run_if_needed(log=lambda message: print(message, file=sys.stderr)) -> None:
         run(log)
 
 
-def _read_legacy(source: Path) -> dict:
-    """Parse the legacy registry, or fail naming the file rather than crashing.
+def _read_legacy(source: Path) -> dict[str, dict]:
+    """Parse the legacy registry into a shape the rest of this module can trust.
 
-    A raw `JSONDecodeError` is not a `CromError`, so it escapes the CLI's exit-code
-    contract — and because migration runs before every command until it succeeds, that
-    traceback would be the only thing crom could do, with no way out. The same guard
-    `registry._read` already applies to the current ledger.
+    Everything downstream indexes this document — `entry.get("port")`, iteration over
+    names — so its shape is checked once here rather than at each use.
+    [LAW:parse-dont-validate] the return type is the guarantee: a mapping of name to
+    entry-dict, or no return at all.
+
+    Any failure to hold that shape is a `CromError`, never a raw exception. A
+    `JSONDecodeError` or an `AttributeError` from a hand-edited file is not a
+    `CromError`, so it escapes the CLI's exit-code contract — and because migration runs
+    before every command until it succeeds, that traceback would be the only thing crom
+    could do, with no way out. The same guard `registry._read` applies to the current
+    ledger.
     """
-    try:
-        return json.loads(source.read_text()).get("profiles", {})
-    except json.JSONDecodeError as e:
-        raise CromError(
-            f"{source}: the previous crom registry is not valid JSON ({e}).\n"
+    def refuse(problem: str) -> CromError:
+        return CromError(
+            f"{source}: the previous crom registry {problem}.\n"
             f"Repair it, or move it aside — crom will then start fresh, and your existing "
             f"profiles will be re-created with new ports."
-        ) from e
+        )
+
+    try:
+        document = json.loads(source.read_text())
+    except json.JSONDecodeError as e:
+        raise refuse(f"is not valid JSON ({e})") from e
+
+    if not isinstance(document, dict):
+        raise refuse(f"is a JSON {type(document).__name__}, not an object")
+    profiles = document.get("profiles", {})
+    if not isinstance(profiles, dict):
+        raise refuse(f"has a 'profiles' key that is a {type(profiles).__name__}, not an object")
+    for name, entry in profiles.items():
+        if not isinstance(entry, dict):
+            raise refuse(f"entry for '{name}' is a {type(entry).__name__}, not an object")
+    return profiles
 
 
 def run(log) -> None:
     source = legacy_registry_file()
     legacy = _read_legacy(source)
-    old_dirs = {name: state_home() / name for name in legacy}
+    old_dirs = {name: _legacy_state_dir() / name for name in legacy}
 
     _require_all_stopped(old_dirs)
     _require_legal_names(legacy)
@@ -114,7 +156,7 @@ def run(log) -> None:
         old_dir = old_dirs[name]
         if old_dir.is_dir():
             _move_staged(old_dir, destination_root / name)
-        (state_home() / f"{name}.pid").unlink(missing_ok=True)
+        (_legacy_state_dir() / f"{name}.pid").unlink(missing_ok=True)
         log(f"crom:   {name} -> {ref} (port {port})")
 
     # Keep the old file rather than deleting it: it is the only record of the previous
@@ -176,10 +218,16 @@ def _require_legal_names(legacy: dict) -> None:
 
 
 def _require_all_stopped(old_dirs: dict[str, Path]) -> None:
+    # One `ps` for the whole set, not one per profile. `find_pids_for_dir` re-runs
+    # `scan()` on every call and `scan()` spawns a subprocess, so asking it per profile
+    # would cost N processes to answer a question `scan` is built to answer for all of
+    # them at once. [LAW:dataflow-not-control-flow] read the table once, then look each
+    # directory up in the value — the same shape `cli.list_cmd` uses.
+    live = chrome.scan()
     running = {
         name: pids
         for name, directory in old_dirs.items()
-        if (pids := chrome.find_pids_for_dir(directory))
+        if (pids := live.get(str(directory)))
     }
     if not running:
         return
