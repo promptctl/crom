@@ -14,6 +14,11 @@ from .model import CromError
 # Checked in order. macOS installs to a fixed app-bundle path; Linux distributions vary,
 # so we ask PATH. [LAW:dataflow-not-control-flow] platform differences are data in this
 # table, not branches in the search.
+#
+# POSIX only, deliberately. crom decides what is running by shelling out to `ps` in
+# `chrome.scan` and serializes its ledger with `fcntl` in `locking`, so Windows is not a
+# platform crom runs on. A `win32` row here would be a map claiming territory the rest
+# of the tool cannot reach — it would find chrome.exe and then fail at the next step.
 _CANDIDATES: dict[str, tuple[str, ...]] = {
     "darwin": (
         "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -24,10 +29,6 @@ _CANDIDATES: dict[str, tuple[str, ...]] = {
         "google-chrome-stable",
         "chromium",
         "chromium-browser",
-    ),
-    "win32": (
-        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
     ),
 }
 

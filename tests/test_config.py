@@ -58,6 +58,67 @@ class ProfileTest(unittest.TestCase):
             parse(MINIMAL + "[profiles.dev]\nport = 99999\n")
 
 
+class ChromeSeedNameTest(unittest.TestCase):
+    """`chrome:<name>` must name one directory inside Chrome's user-data-dir.
+
+    `seed.materialize` builds the copy source as `chrome_user_data_dir() / which`, and
+    `Path.__truediv__` throws away its left side when the right is absolute — so without
+    this checkpoint a config could name any readable directory and have it copied into a
+    profile reachable over CDP.
+    """
+
+    def test_an_absolute_path_cannot_masquerade_as_a_profile_name(self):
+        with self.assertRaisesRegex(CromError, "not a profile name"):
+            parse(MINIMAL + '[profiles.dev]\nseed = "chrome:/etc"\n')
+
+    def test_a_traversal_cannot_masquerade_as_a_profile_name(self):
+        for which in ("../../../etc", "..", ".", "sub/dir", "~/secrets"):
+            with self.subTest(which=which), self.assertRaisesRegex(CromError, "not a profile name"):
+                parse(MINIMAL + f'[profiles.dev]\nseed = "chrome:{which}"\n')
+
+    def test_an_empty_profile_name_is_refused_rather_than_copying_everything(self):
+        # `Path('/a') / ''` is `Path('/a')`, so this would seed from the user's entire
+        # Chrome directory — every profile and every cookie — instead of one profile.
+        with self.assertRaisesRegex(CromError, "names no profile"):
+            parse(MINIMAL + '[profiles.dev]\nseed = "chrome:"\n')
+
+    def test_an_ordinary_profile_name_with_a_space_is_still_accepted(self):
+        scope = parse(MINIMAL + '[profiles.dev]\nseed = "chrome:Profile 1"\n')
+        self.assertEqual(scope.profiles["dev"].seed, SeedChrome(profile="Profile 1"))
+
+
+class ChromeBinaryTest(unittest.TestCase):
+    """An explicit `chrome_binary` gets the same treatment as any other path."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp()).resolve()
+        self.source = self.root / ".crom.toml"
+        self.binary = self.root / "tools" / "chrome-wrapper"
+        self.binary.parent.mkdir(parents=True)
+        self.binary.write_text("#!/bin/sh\n")
+        self.binary.chmod(0o755)
+
+    def _parse(self, text: str):
+        return config.parse(text, self.source)
+
+    def test_a_relative_binary_resolves_against_the_config_not_the_cwd(self):
+        # The whole promise of a namespace is that `crom up myapp/dev` means the same
+        # thing from anywhere; a cwd-relative binary would break exactly that.
+        scope = self._parse(MINIMAL + 'chrome_binary = "./tools/chrome-wrapper"\n')
+        self.assertEqual(scope.chrome_binary, self.binary)
+
+    def test_a_missing_binary_is_refused_at_parse_time(self):
+        with self.assertRaisesRegex(CromError, "does not exist"):
+            self._parse(MINIMAL + 'chrome_binary = "./tools/absent"\n')
+
+    def test_a_non_executable_binary_is_refused_at_parse_time(self):
+        plain = self.root / "tools" / "notes.txt"
+        plain.write_text("hi")
+        plain.chmod(0o644)
+        with self.assertRaisesRegex(CromError, "not executable"):
+            self._parse(MINIMAL + 'chrome_binary = "./tools/notes.txt"\n')
+
+
 class SeedTest(unittest.TestCase):
     def test_keyword_seeds(self):
         cases = {

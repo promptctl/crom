@@ -119,7 +119,7 @@ def parse_seed(raw, where: str, source: Path, config_dir: Path) -> Seed:
     if raw == "chrome":
         return SeedChrome()
     if raw.startswith("chrome:"):
-        return SeedChrome(profile=raw.split(":", 1)[1])
+        return SeedChrome(profile=_parse_chrome_profile(raw.split(":", 1)[1], where, source))
     if raw[:1] in (".", "/", "~"):
         return SeedPath((config_dir / Path(raw).expanduser()).resolve())
     raise CromError(
@@ -128,12 +128,75 @@ def parse_seed(raw, where: str, source: Path, config_dir: Path) -> Seed:
     )
 
 
+def _parse_chrome_profile(which: str, where: str, source: Path) -> str:
+    """The name of one profile inside the user's Chrome directory, and nothing else.
+
+    `seed.materialize` builds the copy source as `chrome_user_data_dir() / which`, and
+    `Path.__truediv__` discards its left side when the right is absolute — so an
+    unchecked `chrome:/etc` reads as `Path("/etc")`, and `chrome:../../..` walks out by
+    ordinary resolution. Either way `shutil.copytree` would pull an arbitrary readable
+    directory into a profile whose CDP port is reachable by local tooling, which is a
+    file-exfiltration primitive handed to any `.crom.toml` — including one that arrived
+    with a cloned repo.
+
+    An empty name is refused for the same reason at a different scale: `Path('/a') / ''`
+    is `Path('/a')`, so `chrome:` would silently copy the user's *entire* Chrome
+    directory — every profile and every cookie — when they asked for one profile.
+
+    [LAW:parse-dont-validate] The checkpoint is here, so `seed.py` holds no guard: a
+    `SeedChrome` that exists names a single directory that cannot escape.
+    """
+    if not which:
+        raise CromError(
+            f"{source}: {where}.seed = 'chrome:' names no profile. Use 'chrome' for the "
+            f"default profile, or 'chrome:<Profile Name>' for a specific one."
+        )
+    if which in (".", "..") or len(Path(which).parts) != 1 or which.startswith("~"):
+        raise CromError(
+            f"{source}: {where}.seed = 'chrome:{which}' is not a profile name. It must "
+            f"name one directory inside your Chrome user-data-dir (e.g. 'Default', "
+            f"'Profile 1') — not a path."
+        )
+    return which
+
+
 def parse_port(raw, where: str, source: Path) -> int | None:
     if raw is None:
         return None
     if not isinstance(raw, int) or isinstance(raw, bool) or not (1 <= raw <= 65535):
         raise CromError(f"{source}: {where}.port must be an integer in 1..65535")
     return raw
+
+
+def _parse_chrome_binary(raw, source: Path, config_dir: Path) -> Path:
+    """The Chrome to launch: the configured one, checked, or the one we can find.
+
+    Resolved against the config file's directory exactly as `state_dir` and seed paths
+    are. A merely `expanduser()`'d relative path would be read against whatever the
+    working directory happened to be at launch, which breaks the one thing a namespace
+    promises — that `crom up myapp/dev` means the same thing from anywhere on the machine.
+
+    Checked for existence and executability here rather than discovered at `Popen`:
+    `browser.py` promises crom names the paths it tried "rather than failing later inside
+    Popen with a bare ENOENT", and that promise held only for the auto-detected path. A
+    typo'd `chrome_binary` used to surface as a raw `FileNotFoundError` traceback,
+    outside the CLI's exit-code contract entirely.
+    """
+    if raw is None:
+        return find_chrome()
+    if not isinstance(raw, str):
+        raise CromError(f"{source}: chrome_binary must be a string path")
+
+    binary = (config_dir / Path(raw).expanduser()).resolve()
+    if not binary.is_file():
+        raise CromError(
+            f"{source}: chrome_binary {raw!r} does not exist (resolved to {binary})."
+        )
+    if not os.access(binary, os.X_OK):
+        raise CromError(
+            f"{source}: chrome_binary {raw!r} is not executable (resolved to {binary})."
+        )
+    return binary
 
 
 def parse(text: str, source: Path, *, namespace: str | None = None) -> Scope:
@@ -175,10 +238,7 @@ def parse(text: str, source: Path, *, namespace: str | None = None) -> Scope:
         else default_profiles_root()
     )
 
-    chrome_binary = data.get("chrome_binary")
-    if chrome_binary is not None and not isinstance(chrome_binary, str):
-        raise CromError(f"{source}: chrome_binary must be a string path")
-    binary = Path(chrome_binary).expanduser() if chrome_binary else find_chrome()
+    binary = _parse_chrome_binary(data.get("chrome_binary"), source, config_dir)
 
     defaults = data.get("defaults", {})
     if not isinstance(defaults, dict):

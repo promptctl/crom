@@ -6,10 +6,12 @@ prefixes of one another. Both decide whether `crom up` sees its own browser or l
 a second one on top of it.
 """
 
+import socket
 import unittest
 from pathlib import Path
 
 from crom import chrome
+from crom.model import CromError, ProfileRef, ResolvedProfile, SeedFresh
 from crom.resolve import build_argv
 
 
@@ -75,6 +77,67 @@ class GroupByUserDataDirTest(unittest.TestCase):
 
     def test_ps_header_and_blank_lines_are_not_processes(self):
         self.assertEqual(chrome._group_by_user_data_dir("  PID COMMAND\n\n   \n"), {})
+
+    def test_a_configured_flag_cannot_spoof_the_user_data_dir(self):
+        """`parse_flags` only inspects the switch name before `=`, so a flag whose
+        *value* contains the literal text is accepted — and it lands before crom's own
+        switches in argv. Matching the first occurrence captured the decoy."""
+        profile_dir = Path("/state/profiles/myapp/dev")
+        spoof = "--fake=--user-data-dir=/evil --remote-debugging-port=1"
+        argv = build_argv(Path("/chrome"), profile_dir, 9300, (spoof,))
+
+        found = chrome._group_by_user_data_dir(ps_line(4242, argv))
+
+        self.assertEqual(found, {str(profile_dir): (4242,)})
+
+    def test_a_profile_path_containing_the_terminator_text_is_not_truncated(self):
+        """`state_dir` is an unrestricted string, so a profile path can contain the very
+        text used as the terminator. The non-greedy capture stopped at the embedded copy
+        until the pattern was anchored to a real port at the end of the line."""
+        profile_dir = Path("/state/x --remote-debugging-port=oops/myapp/dev")
+        argv = build_argv(Path("/chrome"), profile_dir, 9300, ())
+
+        found = chrome._group_by_user_data_dir(ps_line(4242, argv))
+
+        self.assertEqual(found, {str(profile_dir): (4242,)})
+
+
+class RequirePortAvailableTest(unittest.TestCase):
+    """The check that turns "Chrome timed out after 30s" into the actual diagnosis."""
+
+    @staticmethod
+    def _profile(port: int) -> ResolvedProfile:
+        return ResolvedProfile(
+            ref=ProfileRef("myapp", "dev"),
+            port=port,
+            profile_dir=Path("/state/profiles/myapp/dev"),
+            chrome_binary=Path("/chrome"),
+            argv=(),
+            env={},
+            seed=SeedFresh(),
+            source=None,
+        )
+
+    def test_a_free_port_passes_without_complaint(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", 0))
+            free_port = probe.getsockname()[1]
+        # The socket is closed again, so the port is genuinely free by the time we ask.
+        chrome._require_port_available(self._profile(free_port))
+
+    def test_a_held_port_is_named_along_with_the_profile_that_wanted_it(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as holder:
+            holder.bind(("127.0.0.1", 0))
+            holder.listen(1)
+            taken = holder.getsockname()[1]
+
+            with self.assertRaises(CromError) as caught:
+                chrome._require_port_available(self._profile(taken))
+
+        message = str(caught.exception)
+        self.assertIn(str(taken), message)
+        self.assertIn("myapp/dev", message)
+        self.assertIn("lsof", message)  # the message tells the user how to find it
 
 
 if __name__ == "__main__":

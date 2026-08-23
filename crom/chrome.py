@@ -31,9 +31,16 @@ SHUTDOWN_TIMEOUT_SECONDS = 5.0
 # follows is the reliable terminator, because crom emits `--user-data-dir` and
 # `--remote-debugging-port` adjacently and last (see `resolve.build_argv`; the pre-
 # namespace launcher did the same, which is what lets migration still find legacy
-# profiles). `ScanTest.test_a_directory_containing_spaces_survives_the_round_trip`
-# pins that adjacency so a reordering of build_argv fails loudly here.
-_USER_DATA_DIR_RE = re.compile(r"--user-data-dir=(.+?) --remote-debugging-port=")
+# profiles). `GroupByUserDataDirTest.test_a_directory_containing_spaces_survives_the_
+# round_trip` pins that adjacency so a reordering of build_argv fails loudly here.
+#
+# The pattern spells out the "adjacent and *last*" half rather than assuming it. The
+# leading greedy `.*` forces the final `--user-data-dir=`, so a configured flag whose
+# *value* contains that literal text cannot shadow the real one (`parse_flags` inspects
+# only the switch name before `=`, so such a value is not rejected). The trailing
+# `\d+\s*\Z` requires the true end of the command line, so a profile path that itself
+# contains ` --remote-debugging-port=` cannot truncate the capture early.
+_USER_DATA_DIR_RE = re.compile(r".*--user-data-dir=(.+?) --remote-debugging-port=\d+\s*\Z")
 
 
 def _group_by_user_data_dir(ps_output: str) -> dict[str, tuple[int, ...]]:
@@ -135,13 +142,23 @@ def launch(profile: ResolvedProfile) -> tuple[int, ...]:
     _require_port_available(profile)
     profile.profile_dir.mkdir(parents=True, exist_ok=True)
 
-    subprocess.Popen(
-        profile.argv,
-        env={**os.environ, **profile.env},
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
+    try:
+        subprocess.Popen(
+            profile.argv,
+            env={**os.environ, **profile.env},
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError as e:
+        # `config` checks an explicit `chrome_binary` at parse time, so reaching here
+        # means the binary moved or lost its permissions between then and now. Raised as
+        # a CromError so it lands inside the CLI's exit-code contract rather than
+        # escaping as a raw traceback. [LAW:no-silent-failure]
+        raise CromError(
+            f"could not start Chrome for '{profile.ref}': {e}\n"
+            f"Command was: {' '.join(profile.argv)}"
+        ) from e
 
     deadline = time.time() + LAUNCH_TIMEOUT_SECONDS
     while time.time() < deadline:
