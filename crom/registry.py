@@ -20,15 +20,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .locking import exclusive
-from .model import Conflict, CromError, ProfileRef
-from .paths import USER_NAMESPACE, registry_file
+from .model import MAX_PORT, MIN_PORT, USER_NAMESPACE, Conflict, CromError, ProfileRef
+from .paths import registry_file
 
 SCHEMA_VERSION = 2
 
 # `user/default` anchors on Chrome's conventional debugging port so the common case
 # needs no lookup at all; everything else takes the lowest free port above it.
 BASE_PORT = 9222
-MAX_PORT = 65535
 
 
 @dataclass(frozen=True)
@@ -106,10 +105,31 @@ def _read(path: Path) -> dict:
     for name, entry in data["ports"].items():
         # A non-integer port would compare unequal to every real port, so it would slip
         # past the collision checks and then reach `socket.bind` and Chrome's argv.
-        if not isinstance(entry["port"], int) or isinstance(entry["port"], bool):
+        #
+        # The range matters as much as the type, and in both directions. Above 65535,
+        # `socket.bind` raises `OverflowError` — not an `OSError`, so it escapes
+        # `_require_port_available`'s handler as a raw traceback. `0` is worse for being
+        # quieter: it binds successfully and means "pick any free port", so it reaches
+        # Chrome's argv as `--remote-debugging-port=0` and dissolves the one guarantee
+        # crom makes, without an error anywhere. [LAW:no-silent-failure]
+        port = entry["port"]
+        if not isinstance(port, int) or isinstance(port, bool):
             raise CromError(
-                f"{path}: the port ledger's `ports.{name}.port` is "
-                f"{entry['port']!r}, not an integer"
+                f"{path}: the port ledger's `ports.{name}.port` is {port!r}, not an integer"
+            )
+        if not (MIN_PORT <= port <= MAX_PORT):
+            raise CromError(
+                f"{path}: the port ledger's `ports.{name}.port` is {port}, "
+                f"outside the legal range {MIN_PORT}..{MAX_PORT}"
+            )
+    for name, entry in data["namespaces"].items():
+        # `namespaces()` does `Path(entry["config"])`, and `Path(123)` is a `TypeError`.
+        # Presence was checked above for both keys but the type only for `ports.port` —
+        # the same claim owed to both halves of that loop.
+        if not isinstance(entry["config"], str):
+            raise CromError(
+                f"{path}: the port ledger's `namespaces.{name}.config` is "
+                f"{entry['config']!r}, not a string path"
             )
     return data
 

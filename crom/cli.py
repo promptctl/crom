@@ -26,6 +26,7 @@ from . import chrome, config, configwrite, mcp, migrate, registry, resolve as re
 from .config import discover, load_ambient, load_user_scope, parse_flags, parse_port, parse_seed
 from .model import (
     NAME_LIMIT,
+    USER_NAMESPACE,
     Conflict,
     CromError,
     FailedProfile,
@@ -37,7 +38,7 @@ from .model import (
     parse_ref,
     validate_name,
 )
-from .paths import PROJECT_CONFIG_CANDIDATES, USER_NAMESPACE, user_config_file
+from .paths import PROJECT_CONFIG_CANDIDATES, user_config_file
 
 EXIT_FAILURE = 1
 EXIT_NOT_FOUND = 3
@@ -166,7 +167,16 @@ def up_cmd(session: _Session, ref: str, as_json: bool):
 def down_cmd(session: _Session, ref: str, as_json: bool):
     """Stop a running profile."""
     profile = session.profile(ref)
-    pids = chrome.kill(profile)
+    # Under the same lock `up` and `rm` hold. `up` keeps it from before seeding until CDP
+    # answers, but a launched process is visible to `chrome.scan` as soon as `Popen`
+    # returns — so an unlocked `down` could kill a Chrome that was still initialising a
+    # freshly-copied user-data-dir, which is precisely the state that is not safe to
+    # interrupt, and leave `up` reporting a readiness timeout for a browser someone else
+    # killed. [LAW:no-ambient-temporal-coupling] a lock one participant ignores is not
+    # serialising anything; `down` waiting for an in-flight `up` is also what makes
+    # "down returned" mean "it is stopped" rather than "I killed what I happened to see".
+    with seed.profile_lock(profile):
+        pids = chrome.kill(profile)
     message = (
         f"Stopped {profile.ref} (pid {', '.join(map(str, pids))})"
         if pids

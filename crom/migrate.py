@@ -19,12 +19,15 @@ from pathlib import Path
 from . import chrome, configwrite, registry
 from .config import parse_port
 from .locking import exclusive
-from .model import CromError, ProfileRef, ProfileSpec, SeedChrome, validate_name
-from .paths import (
+from .model import (
     USER_NAMESPACE,
-    default_profiles_root,
-    user_config_file,
+    CromError,
+    ProfileRef,
+    ProfileSpec,
+    SeedChrome,
+    validate_name,
 )
+from .paths import default_profiles_root, user_config_file
 
 LEGACY_REGISTRY = "profiles.json"
 
@@ -136,6 +139,7 @@ def run(log) -> None:
     _require_all_stopped(old_dirs)
     _require_legal_names(legacy)
     _require_distinct_ports(legacy, source)
+    _require_no_foreign_port_claim(legacy, source)
     _require_no_destination_collision(old_dirs, destination_root)
 
     log(f"crom: migrating {len(legacy)} profile(s) into the '{USER_NAMESPACE}' namespace")
@@ -255,6 +259,44 @@ def _require_distinct_ports(legacy: dict, source: Path) -> None:
                 f"one), then run crom again."
             )
         seen[port] = name
+
+
+def _require_no_foreign_port_claim(legacy: dict, source: Path) -> None:
+    """Refuse before the first write if a legacy port is already held by another profile.
+
+    `_require_distinct_ports` covers collisions *within* the legacy set; this covers the
+    other source, and it is not the exotic case it looks like. `registry._allocate` hands
+    out the lowest free port at or above `BASE_PORT`, and the legacy layout numbered from
+    the same base — so a project that ran `crom add` before the upgrade holds exactly the
+    low ports a legacy profile is most likely to have pinned. Two or three profiles is
+    enough to make this the expected outcome rather than a coincidence.
+
+    Same failure shape as its sibling, which is why it belongs beside it: `adopt` would
+    refuse from inside the loop, after earlier profiles were declared, and the legacy
+    registry is retired only on full success — so every subsequent crom command re-enters
+    migration and dies at the identical point, with no command left to repair it.
+
+    The reservation a legacy profile's *own* ref already holds is not a foreign claim: a
+    resumed migration re-enters with its earlier adoptions in the ledger, and refusing
+    those would turn the recovery path into the brick it exists to prevent.
+    """
+    held = registry.reservations()
+    for name, entry in legacy.items():
+        port = entry.get("port")
+        if port is None:
+            continue
+        mine = str(ProfileRef(USER_NAMESPACE, name))
+        clash = next(
+            (ref for ref, reservation in held.items() if reservation.port == port and ref != mine),
+            None,
+        )
+        if clash is not None:
+            raise CromError(
+                f"{source}: '{name}' claims port {port}, which is already reserved by "
+                f"'{clash}'.\ncrom cannot give one port to two profiles. Edit that file "
+                f"to give '{name}' a different port (or remove its `port`, and crom will "
+                f"assign a fresh one), then run crom again."
+            )
 
 
 def _require_no_destination_collision(old_dirs: dict[str, Path], destination_root: Path) -> None:

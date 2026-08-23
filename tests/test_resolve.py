@@ -40,6 +40,17 @@ class ParseRefTest(unittest.TestCase):
         with self.assertRaisesRegex(CromError, "invalid profile name"):
             ProfileRef("myapp", "Not A Name")
 
+    def test_the_spec_type_validates_its_own_name_too(self):
+        """`spec.name` is the only identity a `ProfileSpec` carries: `_declare` indexes
+        `profiles[spec.name]` straight into a TOML document and `resolve_spec` builds a
+        `ProfileRef` from it. Every call site validated first, which is the convention
+        this constructor replaces — `ProfileRef` was given the same guarantee for the
+        same reason."""
+        with self.assertRaisesRegex(CromError, "invalid profile name"):
+            ProfileSpec(name="../escape")
+        with self.assertRaisesRegex(CromError, "invalid profile name"):
+            ProfileSpec(name="Not A Name")
+
     def test_path_traversal_cannot_reach_the_name_type(self):
         # Names become directory components, so `.` and `..` must be unrepresentable.
         # Both segments are checked; whichever is illegal is the one that reports.
@@ -72,8 +83,15 @@ class ArgvTest(unittest.TestCase):
         self.assertLess(argv.index(LAUNCH_POLICY_FLAGS[0]), argv.index("--headless=new"))
 
 
-class ResolveTest(unittest.TestCase):
-    """Resolution touches the port ledger, so each test gets its own state directory."""
+class LedgerFixture(unittest.TestCase):
+    """A private state directory per test, and nothing else.
+
+    Deliberately holds no test methods. A class that carries both a fixture and tests
+    cannot be subclassed for the fixture alone — the subclass silently re-runs every
+    parent test under its own name, which is how `ResolveSpecTest` came to re-run the
+    whole of `ResolveTest` without exercising `resolve_spec` at all. Separating the two
+    is what makes the inheritance mean what it looks like. [LAW:decomposition]
+    """
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -92,6 +110,10 @@ class ResolveTest(unittest.TestCase):
         source = self.root / ".crom.toml"
         source.write_text(text)
         return config.parse(text, source)
+
+
+class ResolveTest(LedgerFixture):
+    """Resolution touches the port ledger, so each test gets its own state directory."""
 
     def test_profile_dir_is_namespaced(self):
         scope = self.scope(MINIMAL + "[profiles.dev]\n")
@@ -226,7 +248,7 @@ class ResolveTest(unittest.TestCase):
         self.assertEqual(str(profile.ref), "other/dev")
 
 
-class ResolveSpecTest(ResolveTest):
+class ResolveSpecTest(LedgerFixture):
     """`resolve_spec` takes its namespace from the scope, and cannot be told otherwise.
 
     It used to accept a `ProfileRef` *and* a `Scope` as independent arguments while

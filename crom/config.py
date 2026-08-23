@@ -13,6 +13,9 @@ from pathlib import Path
 
 from .browser import find_chrome
 from .model import (
+    MAX_PORT,
+    MIN_PORT,
+    USER_NAMESPACE,
     Conflict,
     CromError,
     NotFound,
@@ -26,7 +29,6 @@ from .model import (
 )
 from .paths import (
     PROJECT_CONFIG_CANDIDATES,
-    USER_NAMESPACE,
     default_profiles_root,
     user_config_file,
 )
@@ -201,8 +203,10 @@ def _parse_chrome_profile(which: str, where: str, source: Path) -> str:
 def parse_port(raw, where: str, source: Path) -> int | None:
     if raw is None:
         return None
-    if not isinstance(raw, int) or isinstance(raw, bool) or not (1 <= raw <= 65535):
-        raise CromError(f"{source}: {where}.port must be an integer in 1..65535")
+    if not isinstance(raw, int) or isinstance(raw, bool) or not (MIN_PORT <= raw <= MAX_PORT):
+        raise CromError(
+            f"{source}: {where}.port must be an integer in {MIN_PORT}..{MAX_PORT}"
+        )
     return raw
 
 
@@ -224,6 +228,16 @@ def _parse_chrome_binary(raw, source: Path, config_dir: Path) -> Path:
         return find_chrome()
     if not isinstance(raw, str):
         raise CromError(f"{source}: chrome_binary must be a string path")
+    if raw == "":
+        # `Path("")` is `Path(".")`, so the empty string resolves to the config's own
+        # directory — which exists. The `is_file()` check below still refuses it, but the
+        # message it produces says a directory that is plainly there "does not exist". A
+        # diagnostic that is false about the thing it names sends the reader to check the
+        # wrong fact; `state_dir` refuses the empty string by name for the same reason.
+        raise CromError(
+            f"{source}: chrome_binary is empty. Give a path to the Chrome executable, "
+            f"or remove the key to let crom find one."
+        )
 
     binary = (config_dir / Path(raw).expanduser()).resolve()
     if not binary.is_file():

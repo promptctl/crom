@@ -15,7 +15,6 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .paths import USER_NAMESPACE
 
 # Namespaces and profile names become both directory components and CLI tokens, so the
 # legal set is the intersection of what is safe in each. [LAW:parse-dont-validate] this
@@ -25,6 +24,13 @@ from .paths import USER_NAMESPACE
 # would accept "dev\n" — a directory component carrying a newline, which then splits the
 # process's line in two when `chrome.scan` reads `ps` output. `\Z` is the true end.
 #
+# The namespace every machine has without declaring one. A domain fact rather than a
+# path fact: `paths.py` composes directories from it, and `model` needs it to answer
+# whether a ref belongs to the implicit scope. Owning it here makes the dependency
+# one-way — `paths` imports `model` for `CromError`, and nothing imports back.
+# [LAW:one-way-deps]
+USER_NAMESPACE = "user"
+
 # The length cap is named rather than spelled into the pattern, because `cli._slug`
 # truncates to it — two hand-matched numbers would drift the first time either moved.
 NAME_LIMIT = 64
@@ -50,6 +56,14 @@ def validate_name(kind: str, value: str) -> str:
             f"(lowercase letters, digits, and . _ - ; starting alphanumeric)"
         )
     return value
+
+
+# The legal range for a TCP port, stated once. [LAW:one-source-of-truth] `config.parse_port`
+# rejects a configured port outside it, `registry._read` rejects a stored one, and
+# `registry._allocate` stops searching at the top — three enforcers of one rule, which
+# only stay in agreement if they read the same bound rather than each spelling it out.
+MIN_PORT = 1
+MAX_PORT = 65535
 
 
 # --- seeds -------------------------------------------------------------------------
@@ -109,13 +123,28 @@ class ProfileRef:
 
 @dataclass(frozen=True)
 class ProfileSpec:
-    """One `[profiles.<name>]` stanza, parsed but not yet resolved against a port."""
+    """One `[profiles.<name>]` stanza, parsed but not yet resolved against a port.
+
+    `name` is validated here for the same reason `ProfileRef` validates both of its
+    fields: it is the profile's identity, and it is written to places that cannot
+    re-check it. [LAW:parse-dont-validate] `configwrite._declare` indexes
+    `profiles[spec.name]` straight into a TOML document, and `resolve_spec` composes
+    `ProfileRef(scope.namespace, spec.name)` — so a name carrying a `/` or a `..` would
+    become an illegal TOML key and a profile directory outside the profiles root.
+
+    Every existing caller happens to validate first, which is exactly the arrangement
+    this constructor replaces: a convention every future call site must rediscover
+    becomes a property of the type. [LAW:types-are-the-program]
+    """
 
     name: str
     flags: tuple[str, ...] = ()
     env: dict[str, str] = field(default_factory=dict)
     seed: Seed | None = None
     port: int | None = None
+
+    def __post_init__(self) -> None:
+        validate_name("profile name", self.name)
 
 
 def _config_dir(source: Path | None) -> Path:

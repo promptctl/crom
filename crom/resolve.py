@@ -12,6 +12,7 @@ from pathlib import Path
 from . import registry
 from .config import load_file, load_user_scope
 from .model import (
+    USER_NAMESPACE,
     CromError,
     FailedProfile,
     NotFound,
@@ -22,7 +23,6 @@ from .model import (
     Scope,
     Seed,
 )
-from .paths import USER_NAMESPACE
 from .policy import LAUNCH_POLICY_FLAGS
 
 # The closed vocabulary a config may interpolate into flags and env values. Closed on

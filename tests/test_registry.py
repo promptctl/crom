@@ -105,6 +105,27 @@ class XdgTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {"XDG_STATE_HOME": "/tmp/xdg-abs"}):
             self.assertEqual(paths.state_home(), Path("/tmp/xdg-abs/crom"))
 
+    def test_an_override_does_not_need_a_home_directory_at_all(self):
+        """The override exists so a user need not depend on `$HOME` — and it did not
+        deliver that. The fallback was passed as `Path.home() / ".config"`, an *argument*,
+        and Python evaluates arguments eagerly, so the lookup happened on every call. In a
+        minimal container with no passwd entry that raises `RuntimeError`, so crom failed
+        in exactly the environment the variables were set for.
+        """
+        env = {"XDG_STATE_HOME": "/tmp/xdg-abs", "XDG_CONFIG_HOME": "/tmp/xdg-cfg"}
+        with mock.patch.dict(os.environ, env):
+            with mock.patch.object(Path, "home", side_effect=AssertionError("home consulted")):
+                self.assertEqual(paths.state_home(), Path("/tmp/xdg-abs/crom"))
+                self.assertEqual(paths.config_home(), Path("/tmp/xdg-cfg/crom"))
+
+    def test_no_home_and_no_override_is_an_error_not_a_traceback(self):
+        """The remaining case has to fail inside the exit-code contract, naming the
+        variable that would fix it — `RuntimeError` is not a `CromError`."""
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with mock.patch.object(Path, "home", side_effect=RuntimeError("no home")):
+                with self.assertRaisesRegex(CromError, "XDG_STATE_HOME"):
+                    paths.state_home()
+
 
 
 
@@ -183,6 +204,29 @@ class MalformedLedgerTest(unittest.TestCase):
         self._write_ledger({"ports": {}, "namespaces": {"myapp": {}}})
         with self.assertRaisesRegex(CromError, r"`namespaces.myapp` must be an object"):
             registry.namespaces()
+
+    def test_a_non_string_config_is_reported_rather_than_used(self):
+        """Presence was checked for both keys but the type only for `ports.port`.
+        `namespaces()` does `Path(entry["config"])`, and `Path(123)` is a `TypeError` —
+        reachable from `crom list --all` and from any cross-namespace resolution."""
+        self._write_ledger({"ports": {}, "namespaces": {"myapp": {"config": 123}}})
+        with self.assertRaisesRegex(CromError, "not a string path"):
+            registry.namespaces()
+
+    def test_a_port_above_the_legal_range_is_reported_rather_than_used(self):
+        """`socket.bind` raises `OverflowError` for these — not an `OSError`, so it
+        escapes `_require_port_available`'s handler as a raw traceback."""
+        self._write_ledger({"ports": {"user/default": {"port": 99999999}}, "namespaces": {}})
+        with self.assertRaisesRegex(CromError, "outside the legal range"):
+            registry.reservations()
+
+    def test_port_zero_is_reported_rather_than_handed_to_chrome(self):
+        """The quieter half, and the worse one: `0` binds successfully and means "pick
+        any free port", so it reaches Chrome's argv as `--remote-debugging-port=0` and
+        dissolves the one guarantee crom makes, raising nothing anywhere."""
+        self._write_ledger({"ports": {"user/default": {"port": 0}}, "namespaces": {}})
+        with self.assertRaisesRegex(CromError, "outside the legal range"):
+            registry.reservations()
 
     def test_the_optional_keys_are_genuinely_optional(self):
         """`pinned` and `source` are read with defaults, so requiring them would reject

@@ -149,6 +149,14 @@ class ChromeBinaryTest(unittest.TestCase):
         with self.assertRaisesRegex(CromError, "not executable"):
             self._parse(MINIMAL + 'chrome_binary = "./tools/notes.txt"\n')
 
+    def test_an_empty_binary_is_refused_by_name_not_resolved(self):
+        """`Path("")` is `Path(".")`, so the empty string resolves to the config's own
+        directory — which exists. The `is_file()` check still refuses it, but the message
+        then says a directory that is plainly there "does not exist", sending the reader
+        to check the wrong fact. Same stance `state_dir` takes."""
+        with self.assertRaisesRegex(CromError, "chrome_binary is empty"):
+            self._parse(MINIMAL + 'chrome_binary = ""\n')
+
 
 class SeedTest(unittest.TestCase):
     def test_keyword_seeds(self):

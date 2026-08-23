@@ -343,6 +343,42 @@ class MigrateTest(unittest.TestCase):
         self.assertEqual(config.load_user_scope().profiles, {})
         self.assertEqual(registry.reservations(), {})
 
+    def test_a_legacy_port_already_held_by_another_profile_is_refused_before_any_write(self):
+        """The other source of collision, and not an exotic one.
+
+        `_allocate` hands out the lowest free port at or above `BASE_PORT` and the legacy
+        layout numbered from the same base, so a project that ran `crom add` before the
+        upgrade holds exactly the ports a legacy profile is likely to have pinned.
+        Without the pre-flight, `adopt` refuses from inside the loop after earlier
+        profiles are declared — and since the legacy registry is retired only on full
+        success, every later crom command re-enters migration and dies at the same point.
+        """
+        registry.adopt(ProfileRef("myapp", "dev"), 4222, None)
+        self._rewrite_legacy({"default": {"port": 4222}})
+
+        with mock.patch("crom.chrome.scan", return_value={}):
+            with self.assertRaisesRegex(CromError, "already reserved by 'myapp/dev'"):
+                migrate.run(log=lambda _: None)
+
+        # Refused before the first write: nothing declared, nothing adopted, and the
+        # legacy registry still there for the retry.
+        self.assertTrue(migrate.legacy_registry_file().exists())
+        self.assertEqual(config.load_user_scope().profiles, {})
+        self.assertEqual(set(registry.reservations()), {"myapp/dev"})
+
+    def test_a_port_the_profile_itself_already_adopted_is_not_a_foreign_claim(self):
+        """A resumed migration re-enters with its own earlier adoptions in the ledger.
+        Refusing those would turn the recovery path into the brick it exists to prevent —
+        the check must exclude the profile's own ref, not merely the port."""
+        registry.adopt(ProfileRef("user", "default"), 4222, None)
+        self._rewrite_legacy({"default": {"port": 4222}})
+
+        with mock.patch("crom.chrome.scan", return_value={}):
+            migrate.run(log=lambda _: None)
+
+        self.assertEqual(registry.reservations()["user/default"].port, 4222)
+        self.assertFalse(migrate.legacy_registry_file().exists())
+
     def test_a_malformed_legacy_port_is_refused_before_any_write(self):
         """`adopt` checks who may hold a number, not whether it is one. An unvalidated
         value reached the new ledger and surfaced much later, from `socket.bind`."""

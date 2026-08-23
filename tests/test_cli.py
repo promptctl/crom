@@ -5,6 +5,7 @@ part apps integrate against. `chrome.scan` is stubbed because the process table 
 external system, not an implementation detail of crom.
 """
 
+import contextlib
 import json
 import os
 import shlex
@@ -475,6 +476,41 @@ class CliTest(unittest.TestCase):
         with mock.patch("crom.chrome.scan", return_value={profile_dir: (999,)}):
             self.crom("rm", "ci", "--yes", expect=4)
         self.assertIn("[profiles.ci]", (self.project / ".crom.toml").read_text())
+
+    def test_down_stops_the_browser_under_the_profile_lock(self):
+        """`up` and `rm` hold `profile_lock` across their check-then-act; `down` did not.
+
+        A launched Chrome is visible to `scan` as soon as `Popen` returns, well before
+        CDP answers — and `up` is still inside its locked section then, possibly having
+        just materialised the profile from a `chrome` seed. An unlocked `down` could kill
+        a browser mid-first-run against a freshly-copied user-data-dir, and leave `up`
+        reporting a readiness timeout for a process someone else terminated.
+
+        A lock one participant ignores serialises nothing, so the claim under test is
+        that the kill happens *inside* the critical section, not merely that it happens.
+        """
+        self.crom("init")
+        self.crom("add", "ci")
+
+        events: list[str] = []
+        real_lock = cli.seed.profile_lock
+
+        @contextlib.contextmanager
+        def tracking_lock(profile):
+            events.append("lock")
+            with real_lock(profile):
+                yield
+            events.append("unlock")
+
+        def kill(_profile):
+            events.append("kill")
+            return ()
+
+        with mock.patch("crom.cli.seed.profile_lock", tracking_lock):
+            with mock.patch("crom.cli.chrome.kill", kill):
+                self.crom("down", "ci")
+
+        self.assertEqual(events, ["lock", "kill", "unlock"])
 
     def test_rm_re_reads_liveness_under_the_lock(self):
         """A `crom up` that starts in the window must not have its browser deleted.
