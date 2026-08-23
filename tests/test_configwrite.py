@@ -5,6 +5,7 @@ the case crom exists for), and what crom writes back must be readable by crom's 
 parser, in the spelling the author would have used.
 """
 
+import shutil
 import tempfile
 import threading
 import time
@@ -13,7 +14,15 @@ from pathlib import Path
 from unittest import mock
 
 from crom import config, configwrite, locking
-from crom.model import Conflict, CromError, ProfileSpec, SeedChrome, SeedFresh, SeedPath
+from crom.model import (
+    Conflict,
+    CromError,
+    NotFound,
+    ProfileSpec,
+    SeedChrome,
+    SeedFresh,
+    SeedPath,
+)
 
 
 class RenderSeedTest(unittest.TestCase):
@@ -262,6 +271,78 @@ class MalformedConfigTest(unittest.TestCase):
         self.target.write_text('namespace = "myapp"\nprofiles = "typo"\n')
         with self.assertRaisesRegex(CromError, "`profiles` must be a table"):
             configwrite.declares(self.target, "yp")  # a substring of "typo"
+
+    def test_a_profiles_key_that_is_not_a_table_is_refused_when_removing(self):
+        """The third reader of the same key, which the shared helper originally missed.
+
+        `rm_cmd` keeps its `click.confirm` prompt outside the lock deliberately, so this
+        read happens an unbounded time after the one that validated the file — the window
+        in which another agent can rewrite it.
+        """
+        self.target.write_text('namespace = "myapp"\nprofiles = "typo"\n')
+        with self.assertRaisesRegex(CromError, "`profiles` must be a table"):
+            configwrite.remove_profile(self.target, "yp")
+
+    def test_removing_from_a_file_with_no_profiles_is_still_not_found(self):
+        """Routing through the shared helper must not turn "absent" into "malformed"."""
+        self.target.write_text('namespace = "myapp"\n')
+        with self.assertRaises(NotFound):
+            configwrite.remove_profile(self.target, "ci")
+
+
+class WriteFailureTest(unittest.TestCase):
+    """A filesystem that refuses the write is a `CromError`, not a traceback.
+
+    `CromGroup.invoke` catches only `CromError`, so a full disk or a read-only mount used
+    to escape the CLI's exit-code contract entirely. `migrate.run` reaches `_save` through
+    `ensure_profile` before anything else in `main`, which made that traceback every
+    command rather than one.
+    """
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.target = self.root / "config.toml"
+
+    def test_a_failing_write_is_reported_against_the_file(self):
+        self.target.write_text('namespace = "myapp"\n')
+        with mock.patch.object(
+            Path, "write_text", side_effect=OSError(28, "No space left on device")
+        ):
+            with self.assertRaisesRegex(CromError, "No space left on device"):
+                configwrite.add_profile(self.target, ProfileSpec(name="ci", seed=SeedFresh()))
+
+    def test_a_declaration_that_already_exists_is_still_a_plain_collision(self):
+        """The deliberate `FileExistsError` `add_profile` raises for the concurrent-add
+        race is raised outside `_declare`, so wrapping the write path must not capture
+        it — `add_cmd` distinguishes it from every other failure to decide whether
+        releasing the port reservation would strip a live profile of its port."""
+        configwrite.add_profile(
+            self.target, ProfileSpec(name="ci", seed=SeedFresh()), header='namespace = "m"\n'
+        )
+        with self.assertRaises(FileExistsError):
+            configwrite.add_profile(self.target, ProfileSpec(name="ci", seed=SeedFresh()))
+
+    def test_init_project_reports_an_unwritable_directory(self):
+        """`os.open` raises `PermissionError`, which is an `OSError` but not a
+        `FileExistsError`, so it fell straight through the narrow collision handler."""
+        with mock.patch("crom.configwrite.os.open", side_effect=PermissionError(13, "denied")):
+            with self.assertRaisesRegex(CromError, "denied"):
+                configwrite.init_project(self.target, "myapp")
+
+    def test_init_project_reports_a_failing_mkdir(self):
+        """The `mkdir` sat above the `try` entirely — not merely unconverted, but outside
+        the block written to handle this call's failures."""
+        with mock.patch.object(Path, "mkdir", side_effect=PermissionError(13, "denied")):
+            with self.assertRaisesRegex(CromError, "denied"):
+                configwrite.init_project(self.root / "sub" / "config.toml", "myapp")
+
+    def test_init_project_still_reports_an_existing_config_as_a_conflict(self):
+        """`Conflict` is a `CromError`, so the translation must pass it through with its
+        own meaning and its own exit code rather than flattening it."""
+        configwrite.init_project(self.target, "myapp")
+        with self.assertRaises(Conflict):
+            configwrite.init_project(self.target, "myapp")
 
 
 if __name__ == "__main__":

@@ -7,6 +7,8 @@ everything crom did not explicitly change.
 """
 
 import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import tomlkit
@@ -134,15 +136,39 @@ def _profiles_table(doc: tomlkit.TOMLDocument, path: Path, *, create: bool = Fal
     return profiles
 
 
+@contextmanager
+def _writing(path: Path) -> Iterator[None]:
+    """Translate a filesystem failure into a `CromError` naming the file.
+
+    [LAW:effects-at-boundaries] Every write in this module goes through here, because
+    `CromGroup.invoke` catches only `CromError`: a full disk or a read-only mount raised
+    a bare `OSError` that escaped the CLI's exit-code contract as a traceback. Putting
+    the translation at the calls that touch the disk covers every caller rather than the
+    one whose failure was traced — including `migrate.run`, which reaches `_save` through
+    `ensure_profile` before anything else in `main` and would therefore have produced
+    that traceback on *every* command.
+
+    `CromError` passes through untouched so a `Conflict` raised inside — `init_project`
+    reporting a config that already exists — keeps its own meaning and its exit code.
+    """
+    try:
+        yield
+    except CromError:
+        raise
+    except OSError as e:
+        raise CromError(f"{path}: {e.strerror or e}") from e
+
+
 def _save(path: Path, doc: tomlkit.TOMLDocument) -> None:
     """Replace the file atomically — this is a document a human wrote and may have
     committed, and `write_text` truncates before it writes. A failure partway through
     that would leave a half-written config, and crom's own parser is strict enough that
     the user would be locked out of every command until they repaired it by hand."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(tomlkit.dumps(doc))
-    os.replace(tmp, path)
+    with _writing(path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(tomlkit.dumps(doc))
+        os.replace(tmp, path)
 
 
 def init_project(path: Path, namespace: str) -> None:
@@ -158,13 +184,19 @@ def init_project(path: Path, namespace: str) -> None:
     exit-4 case the CLI contract promises. Raised here rather than translated at the call
     site so no future caller can reintroduce the gap by forgetting a wrapper.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-    except FileExistsError as e:
-        raise Conflict(f"{path} already exists") from e
-    with os.fdopen(fd, "w") as handle:
-        handle.write(PROJECT_CONFIG_TEMPLATE.format(namespace=namespace))
+    # The `mkdir` sits inside the translation too, and the `FileExistsError` catch stays
+    # scoped to `os.open` alone. `exist_ok=True` does not suppress a *non-directory* in a
+    # path component, so `mkdir` has its own `FileExistsError` — one that means something
+    # completely different from the collision this function reports, and would name the
+    # wrong file if the two shared a handler.
+    with _writing(path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError as e:
+            raise Conflict(f"{path} already exists") from e
+        with os.fdopen(fd, "w") as handle:
+            handle.write(PROJECT_CONFIG_TEMPLATE.format(namespace=namespace))
 
 
 def declares(path: Path, name: str) -> bool:
@@ -205,8 +237,9 @@ def _declare(path: Path, spec: ProfileSpec, header: str) -> bool:
                     f"header declaring its namespace — the file would be written and then "
                     f"rejected by crom's own parser on the next command."
                 )
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(header)
+            with _writing(path):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(header)
 
         doc = _load(path)
         profiles = _profiles_table(doc, path, create=True)
@@ -246,8 +279,14 @@ def remove_profile(path: Path, name: str) -> None:
     """Delete a profile's declaration, under the same lock `_declare` writes beneath."""
     with exclusive(path):
         doc = _load(path)
-        profiles = doc.get("profiles")
-        if not profiles or name not in profiles:
+        # Through `_profiles_table` like its two siblings: `rm_cmd` validates the config
+        # once and then waits on an open-ended `click.confirm` outside the lock, so this
+        # read is a fresh one against a file that may have been rewritten in between. A
+        # non-table `profiles` reaching `name not in profiles` is a substring test on a
+        # string or a raw `TypeError` on an int — neither a `CromError`, so neither
+        # inside the CLI's exit-code contract. [LAW:single-enforcer]
+        profiles = _profiles_table(doc, path)
+        if name not in profiles:
             raise NotFound(f"{path}: profile '{name}' is not declared here")
         del profiles[name]
         _save(path, doc)
