@@ -17,6 +17,9 @@ which is the whole trick.
 uv tool install --force .     # or, to hack on it: uv sync && .venv/bin/crom
 ```
 
+macOS and Linux. crom answers "is this profile running" by reading the process table
+with `ps` and serializes its ledger with `flock`, so Windows is not supported.
+
 ## Quick start
 
 ```bash
@@ -144,18 +147,22 @@ crom forget NAMESPACE   drop a namespace whose config is gone
 ```
 
 `REF` is `name` (resolved in the ambient namespace) or `namespace/name`. It defaults to
-`default`.
+`default` — except for `crom config`, where omitting it reports the ambient scope alone
+(which config is in effect, and what it declares) without resolving any one profile.
 
 ## How collisions are avoided
 
 Ports come from one ledger at `~/.local/state/crom/registry.json`, shared by every
 project on the machine. A profile is assigned a free port the first time it resolves and
 keeps it forever, so a checked-in `.mcp.json` or an app's `CDP_URL` stays correct. Before
-handing out a port crom binds it, which catches the unrelated dev server that grabbed
-9222 an hour ago. Two projects that pin the same port get an error naming the config file
-on the other side, not a mysterious launch failure. Every read-modify-write of the ledger
-takes an exclusive lock, because several agents each bringing up a browser at once is
-the case crom is for.
+handing out an *assigned* port crom binds it, which catches the unrelated dev server that
+grabbed 9222 an hour ago. A port you pin yourself skips that search, so its availability
+is checked at launch instead — `crom up` names the process holding it rather than timing
+out. Two projects that pin the same port get an error naming the config file on the other
+side, not a mysterious launch failure. Every read-modify-write of the ledger takes an
+exclusive lock, because several agents each bringing up a browser at once is the case
+crom is for — and the config files crom edits and the profile directories it seeds are
+locked the same way, for the same reason.
 
 Profile data is namespaced the same way: `<state_dir>/<namespace>/<name>`. Two projects
 can both have a `dev` profile and never see each other's cookies.
