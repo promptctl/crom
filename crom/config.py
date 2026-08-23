@@ -13,6 +13,7 @@ from pathlib import Path
 
 from .browser import find_chrome
 from .model import (
+    Conflict,
     CromError,
     NotFound,
     ProfileSpec,
@@ -209,7 +210,7 @@ def parse(text: str, source: Path, *, namespace: str | None = None) -> Scope:
             port=parse_port(raw.get("port"), where, source),
         )
 
-    _reject_duplicate_ports(profiles, source)
+    reject_duplicate_ports(profiles, source)
 
     return Scope(
         namespace=namespace,
@@ -223,13 +224,23 @@ def parse(text: str, source: Path, *, namespace: str | None = None) -> Scope:
     )
 
 
-def _reject_duplicate_ports(profiles: dict[str, ProfileSpec], source: Path) -> None:
+def reject_duplicate_ports(profiles: dict[str, ProfileSpec], source: Path) -> None:
+    """Refuse a set of declarations in which two profiles pin the same port.
+
+    Public because `crom add` checks the declarations it is *about* to write through
+    this same function. [LAW:single-enforcer] one rule, one implementation — a config
+    that would be rejected on load is rejected before it reaches the file, rather than
+    written and then discovered to be unloadable.
+    """
     claimed: dict[int, str] = {}
     for spec in profiles.values():
         if spec.port is None:
             continue
         if spec.port in claimed:
-            raise CromError(
+            # Conflict, not a bare CromError: two profiles claiming one port is the
+            # exit-4 case the CLI contract promises, whether it reaches us from a file
+            # on load or from `crom add` checking a declaration before it writes it.
+            raise Conflict(
                 f"{source}: profiles '{claimed[spec.port]}' and '{spec.name}' both "
                 f"pin port {spec.port}"
             )

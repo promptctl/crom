@@ -96,6 +96,26 @@ class CliTest(unittest.TestCase):
         self.crom("add", "ci")
         self.crom("add", "ci", expect=4)
 
+    def test_a_refused_add_writes_nothing_and_leaves_the_project_usable(self):
+        # A rejected profile that still reached the file would be rejected again on the
+        # next load — and the parser rejects the file as a whole, so every command in
+        # the project, `crom rm` included, would fail on the file the user needs crom to
+        # repair. The refusal has to happen before the write, not after.
+        self.crom("init")
+        self.crom("add", "alpha", "--port", "9500")
+        before = (self.project / ".crom.toml").read_text()
+
+        self.crom("add", "beta", "--port", "9500", expect=4)
+
+        self.assertEqual((self.project / ".crom.toml").read_text(), before)
+        self.assertNotIn("beta", before)
+        self.assertIn("alpha", self.crom("list"))
+
+    def test_a_pinned_port_already_taken_is_a_conflict_not_a_bare_failure(self):
+        self.crom("init")
+        self.crom("add", "alpha", "--port", "9500")
+        self.crom("add", "beta", "--port", "9500", expect=4)
+
     def test_add_refuses_a_reserved_chrome_switch(self):
         self.crom("init")
         self.crom("add", "ci", "--flag", "--user-data-dir=/tmp/x", expect=1)

@@ -19,7 +19,7 @@ from pathlib import Path
 
 import click
 
-from . import chrome, configwrite, mcp, migrate, registry, resolve as resolver, seed
+from . import chrome, config, configwrite, mcp, migrate, registry, resolve as resolver, seed
 from .config import discover, load_ambient, load_user_scope, parse_flags, parse_seed
 from .model import (
     Conflict,
@@ -211,12 +211,20 @@ def add_cmd(session: _Session, name: str, seed_text: str, flags: tuple[str, ...]
         seed=parse_seed(seed_text, f"[profiles.{name}]", target, scope.config_dir),
         port=port,
     )
+    # Everything that can refuse this profile runs before anything is written. Declaring
+    # first and resolving second would leave a rejected profile sitting in the file: a
+    # pinned port that collides is refused *here*, but the declaration carrying it would
+    # already be on disk, and the config parser rejects that file wholesale on the next
+    # load — every command in the project, `crom rm` included, would then fail to read
+    # the very file the user would need crom to fix.
+    config.reject_duplicate_ports({**scope.profiles, name: spec}, target)
+    profile = resolver.resolve_spec(ProfileRef(scope.namespace, name), scope, spec)
+
     try:
         configwrite.add_profile(target, spec, header=configwrite.USER_CONFIG_HEADER)
     except FileExistsError as e:
         raise Conflict(str(e)) from e
 
-    profile = resolver.resolve_spec(ProfileRef(scope.namespace, name), scope, spec)
     click.echo(f"Declared {profile.ref} in {target}")
     click.echo(f"  port {profile.port} · {profile.profile_dir}")
     click.echo(f"Run: crom up {profile.ref}")
