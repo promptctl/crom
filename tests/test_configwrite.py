@@ -122,7 +122,11 @@ class ConcurrentDeclareTest(unittest.TestCase):
 
         def declare(name: str):
             try:
-                configwrite.add_profile(target, ProfileSpec(name=name, seed=SeedFresh()))
+                configwrite.add_profile(
+                    target,
+                    ProfileSpec(name=name, seed=SeedFresh()),
+                    header='namespace = "myapp"\n',
+                )
             except BaseException as e:  # surfaced below rather than dying in the thread
                 errors.append(e)
 
@@ -134,9 +138,59 @@ class ConcurrentDeclareTest(unittest.TestCase):
                 t.join()
 
         self.assertEqual(errors, [])
-        written = target.read_text()
-        self.assertIn("[profiles.ci]", written)
-        self.assertIn("[profiles.staging]", written)
+        # Round-tripped through the parser rather than checked for substrings. Asserting
+        # that the text contains `[profiles.ci]` says nothing about whether crom can read
+        # the file back, so this test previously produced a config with no `namespace`
+        # key — one every later command would reject — and reported success.
+        scope = config.parse(target.read_text(), target)
+        self.assertEqual(sorted(scope.profiles), ["ci", "staging"])
+        self.assertEqual(scope.namespace, "myapp")
+
+
+
+
+class HeaderInvariantTest(unittest.TestCase):
+    """Creating a config without a header produces a file crom cannot read back.
+
+    The document would have no `namespace` key, so `config.parse` rejects it wholesale
+    on the next load — every command in that project failing on a file crom itself just
+    wrote, with no command left to repair it.
+    """
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.target = self.root / ".crom.toml"
+
+    def test_creating_a_config_without_a_header_is_refused(self):
+        with self.assertRaisesRegex(CromError, "will not create a config without a header"):
+            configwrite.add_profile(self.target, ProfileSpec(name="ci", seed=SeedFresh()))
+        self.assertFalse(self.target.exists())
+
+    def test_the_same_refusal_applies_to_the_converging_twin(self):
+        """`ensure_profile` is the path migration takes, so it needs the rule too."""
+        with self.assertRaisesRegex(CromError, "will not create a config without a header"):
+            configwrite.ensure_profile(self.target, ProfileSpec(name="ci", seed=SeedFresh()))
+        self.assertFalse(self.target.exists())
+
+    def test_an_existing_file_needs_no_header(self):
+        """The header is for creation only — an existing file owns its own preamble, and
+        appending to one must never duplicate or displace it."""
+        self.target.write_text('namespace = "myapp"\n')
+        configwrite.add_profile(self.target, ProfileSpec(name="ci", seed=SeedFresh()))
+
+        scope = config.parse(self.target.read_text(), self.target)
+        self.assertEqual(sorted(scope.profiles), ["ci"])
+        self.assertEqual(self.target.read_text().count("namespace = "), 1)
+
+    def test_a_created_config_round_trips_through_the_parser(self):
+        configwrite.add_profile(
+            self.target,
+            ProfileSpec(name="ci", seed=SeedFresh()),
+            header='namespace = "myapp"\n',
+        )
+        scope = config.parse(self.target.read_text(), self.target)
+        self.assertEqual(scope.namespace, "myapp")
+        self.assertEqual(sorted(scope.profiles), ["ci"])
 
 
 if __name__ == "__main__":

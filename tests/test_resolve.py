@@ -6,7 +6,14 @@ import unittest
 from pathlib import Path
 
 from crom import config, registry, resolve
-from crom.model import CromError, FailedProfile, ProfileRef, ResolvedProfile, parse_ref
+from crom.model import (
+    CromError,
+    FailedProfile,
+    ProfileRef,
+    ProfileSpec,
+    ResolvedProfile,
+    parse_ref,
+)
 from crom.policy import LAUNCH_POLICY_FLAGS
 
 MINIMAL = 'namespace = "myapp"\n'
@@ -217,6 +224,34 @@ class ResolveTest(unittest.TestCase):
         here = self.scope(MINIMAL + "[profiles.dev]\n")
         profile = resolve.resolve(ProfileRef("other", "dev"), here)
         self.assertEqual(str(profile.ref), "other/dev")
+
+
+class ResolveSpecTest(ResolveTest):
+    """`resolve_spec` takes its namespace from the scope, and cannot be told otherwise.
+
+    It used to accept a `ProfileRef` *and* a `Scope` as independent arguments while
+    silently assuming they agreed — the profile directory was built from the ref's
+    namespace and the ledger keyed on the ref, so pairing a ref with a foreign scope
+    would have created a directory and a port reservation under a namespace that scope
+    does not own, with nothing raised. Taking a bare name removes the second namespace
+    rather than guarding against it.
+    """
+
+    def test_the_namespace_comes_from_the_scope(self):
+        scope = self.scope(MINIMAL + "[profiles.dev]\n")
+        profile = resolve.resolve_spec(scope, "dev", ProfileSpec(name="dev"))
+
+        self.assertEqual(profile.ref, ProfileRef("myapp", "dev"))
+        self.assertEqual(profile.profile_dir.parts[-2:], ("myapp", "dev"))
+        self.assertIn("myapp/dev", registry.reservations())
+
+    def test_there_is_no_second_namespace_to_disagree_with_the_first(self):
+        """The guarantee is structural, so this asserts the signature itself: a caller
+        has nowhere to put a namespace that differs from the scope's."""
+        import inspect
+
+        parameters = list(inspect.signature(resolve.resolve_spec).parameters)
+        self.assertEqual(parameters, ["scope", "name", "spec"])
 
 
 if __name__ == "__main__":

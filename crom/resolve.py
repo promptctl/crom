@@ -144,10 +144,21 @@ def spec_for(ref: ProfileRef, scope: Scope) -> ProfileSpec:
 def resolve(ref: ProfileRef, ambient: Scope) -> ResolvedProfile:
     scope = scope_for(ref.namespace, ambient)
     spec = spec_for(ref, scope)
-    return resolve_spec(ref, scope, spec)
+    return resolve_spec(scope, ref.name, spec)
 
 
-def resolve_spec(ref: ProfileRef, scope: Scope, spec: ProfileSpec) -> ResolvedProfile:
+def resolve_spec(scope: Scope, name: str, spec: ProfileSpec) -> ResolvedProfile:
+    """Resolve one declared profile in the namespace that declares it.
+
+    [LAW:types-are-the-program] The namespace is taken from `scope` and never passed
+    alongside it. Accepting a `ProfileRef` *and* a `Scope` made a mismatch expressible —
+    the profile directory is built from the ref's namespace while the ledger is keyed on
+    the ref, so a caller pairing a ref with a foreign scope would silently create a
+    directory and a port reservation under a namespace that scope does not own, with
+    nothing raised. Deriving the ref here removes the second namespace rather than
+    adding a guard against it: there is no longer a pair that can disagree.
+    """
+    ref = ProfileRef(scope.namespace, name)
     profile_dir = scope.profiles_root / ref.namespace / ref.name
     where = str(scope.source or "user config")
     raw_flags = (*scope.default_flags, *spec.flags)
@@ -193,9 +204,8 @@ def resolve_all(scope: Scope) -> list[ProfileEntry]:
     """
     entries: list[ProfileEntry] = []
     for name, spec in sorted(scope.profiles.items()):
-        ref = ProfileRef(scope.namespace, name)
         try:
-            entries.append(resolve_spec(ref, scope, spec))
+            entries.append(resolve_spec(scope, name, spec))
         except CromError as error:
-            entries.append(FailedProfile(ref, str(error)))
+            entries.append(FailedProfile(ProfileRef(scope.namespace, name), str(error)))
     return entries

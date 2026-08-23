@@ -21,9 +21,7 @@ from .locking import exclusive
 from .model import CromError, ProfileRef, ProfileSpec, SeedChrome, validate_name
 from .paths import (
     USER_NAMESPACE,
-    config_home,
     default_profiles_root,
-    state_home,
     user_config_file,
 )
 
@@ -212,8 +210,11 @@ def _require_legal_names(legacy: dict) -> None:
     raise CromError(
         "crom cannot migrate these profiles — their names are not legal under the "
         f"namespaced layout:\n  {listing}\n"
+        # The *legacy* state directory, which is where the directories being renamed
+        # actually are — naming the new XDG-aware one would send a user with
+        # XDG_STATE_HOME set to a directory their profiles are not in.
         f"Rename them in {legacy_registry_file()} (and rename the matching directory "
-        f"under {state_home()}), then run crom again."
+        f"under {_legacy_state_dir()}), then run crom again."
     )
 
 

@@ -190,7 +190,14 @@ def adopt(ref: ProfileRef, port: int, source: Path | None) -> None:
     key = str(ref)
     with _locked() as path:
         data = _read(path)
+        # [LAW:single-enforcer] Both writers into `data["ports"]` enforce the identical
+        # rule set. An invariant checked on one of two doors is not an invariant, and
+        # this door's port comes from a file the user can hand-edit: a legacy
+        # `profiles.json` naming 9222 for something other than user/default would
+        # otherwise carry that violation through migration and keep it forever, in a
+        # ledger where `port_for` refuses it everywhere else.
         _reject_foreign_claim(key, port, data["ports"])
+        _reject_base_port_pin(key, port)
         data["ports"][key] = {"port": port, "pinned": False, "source": str(source) if source else None}
         _write(path, data)
 

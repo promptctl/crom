@@ -118,6 +118,21 @@ class ProfileSpec:
     port: int | None = None
 
 
+def _config_dir(source: Path | None) -> Path:
+    """The directory a config's relative paths resolve against.
+
+    [LAW:one-source-of-truth] `Scope` and `ResolvedProfile` both expose this and must
+    agree — a profile's seed is parsed against the scope's answer and rendered back
+    against the profile's, so a divergence would write a path that reads back as a
+    different one. Stating the rule once is what makes them agree; two copies with a
+    comment claiming they match is the arrangement that silently stops being true.
+
+    The fileless `user` scope has no directory of its own, so it anchors on the working
+    directory — which is why this is a function of `source` alone and nothing else.
+    """
+    return source.parent if source else Path.cwd()
+
+
 @dataclass(frozen=True)
 class Scope:
     """One config file's contents: a namespace, its defaults, and its profiles.
@@ -138,7 +153,7 @@ class Scope:
     @property
     def config_dir(self) -> Path:
         """The directory a project's relative paths and ${CROM_CONFIG_DIR} resolve against."""
-        return self.source.parent if self.source else Path.cwd()
+        return _config_dir(self.source)
 
     @property
     def is_user(self) -> bool:
@@ -177,7 +192,7 @@ class ResolvedProfile:
         The same notion `Scope.config_dir` carries, available downstream of resolution
         so a seed can be rendered back in the spelling its config file would use.
         """
-        return self.source.parent if self.source else Path.cwd()
+        return _config_dir(self.source)
 
     def describe(self, *, running: bool, pids: tuple[int, ...]) -> dict:
         """The machine-readable view — the contract `--json` output promises.

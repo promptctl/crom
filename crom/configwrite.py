@@ -12,7 +12,16 @@ from pathlib import Path
 import tomlkit
 
 from .locking import exclusive
-from .model import Conflict, NotFound, ProfileSpec, Seed, SeedChrome, SeedFresh, SeedPath
+from .model import (
+    Conflict,
+    CromError,
+    NotFound,
+    ProfileSpec,
+    Seed,
+    SeedChrome,
+    SeedFresh,
+    SeedPath,
+)
 
 USER_CONFIG_HEADER = """\
 # crom — your personal Chrome profiles (the `user` namespace).
@@ -138,9 +147,23 @@ def _declare(path: Path, spec: ProfileSpec, header: str) -> bool:
     against one config would otherwise both read the document before either wrote, and
     the later `_save` would drop the earlier profile while its process still reported
     success. Same hazard the port ledger takes a lock for, same lock.
+
+    Creating a file requires a header, and this is the one place that says so.
+    [LAW:single-enforcer] Without a header the created document has no `namespace` key,
+    so the profile is appended to a file `config.parse` then rejects wholesale on the
+    very next load — every command in that project failing on the file crom itself just
+    wrote. `cli.add_cmd` guarded its own call against this, which protected that one
+    caller rather than the invariant; enforcing it where the document is created covers
+    every caller, including the tests that were quietly producing unparseable configs.
     """
     with exclusive(path):
-        if not path.exists() and header:
+        if not path.exists():
+            if not header:
+                raise CromError(
+                    f"{path} does not exist, and crom will not create a config without a "
+                    f"header declaring its namespace — the file would be written and then "
+                    f"rejected by crom's own parser on the next command."
+                )
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(header)
 

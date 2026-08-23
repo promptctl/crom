@@ -106,5 +106,43 @@ class XdgTest(unittest.TestCase):
             self.assertEqual(paths.state_home(), Path("/tmp/xdg-abs/crom"))
 
 
+
+
+class AdoptTest(unittest.TestCase):
+    """`adopt` is the ledger's second write path, and must enforce the ledger's rules.
+
+    It exists so migration can preserve a port the world already points at, which means
+    the number it writes comes from a file the user can hand-edit. An invariant enforced
+    on `port_for` alone is not enforced.
+    """
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp()).resolve()
+        self.env = mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(self.root / "state")})
+        self.env.start()
+        self.addCleanup(self.env.stop)
+
+    def test_adopting_the_base_port_for_anything_but_the_default_is_refused(self):
+        """`port_for` refuses this; `adopt` used to let it through. A legacy registry
+        naming 9222 for some other profile would then carry that violation through
+        migration and keep it permanently, in a ledger that rejects it everywhere else —
+        and a bare `crom` would quietly stop finding its profile on the port the README
+        promises it without a lookup."""
+        with self.assertRaisesRegex(Conflict, "reserved for 'user/default'"):
+            registry.adopt(ProfileRef("myapp", "dev"), registry.BASE_PORT, None)
+
+        self.assertEqual(registry.reservations(), {})
+
+    def test_the_default_profile_may_still_adopt_the_base_port(self):
+        """The rule is about who holds 9222, not about the number being untouchable."""
+        registry.adopt(ProfileRef("user", "default"), registry.BASE_PORT, None)
+        self.assertEqual(registry.reservations()["user/default"].port, registry.BASE_PORT)
+
+    def test_adopting_a_port_another_profile_already_holds_is_refused(self):
+        registry.adopt(ProfileRef("myapp", "dev"), 9301, None)
+        with self.assertRaises(Conflict):
+            registry.adopt(ProfileRef("other", "dev"), 9301, None)
+
+
 if __name__ == "__main__":
     unittest.main()
