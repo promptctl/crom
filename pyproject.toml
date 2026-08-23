@@ -5,11 +5,12 @@ build-backend = "hatchling.build"
 [project]
 name = "crom"
 version = "0.1.0"
-description = "lunch crom bowser"
+description = "Per-project Chrome profiles with stable CDP ports"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "click>=8.3.1",
+    "tomlkit>=0.13",
 ]
 
 [project.scripts]

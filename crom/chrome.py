@@ -1,182 +1,224 @@
-"""Chrome launch/kill — all process management lives here.
+"""Starts, finds, and stops the Chrome processes behind resolved profiles.
 
-[LAW:one-source-of-truth] The OS process table is the sole authority on
-"is this profile running." We identify a crom-managed Chrome by the
-absolute `--user-data-dir` path it was launched with — no pidfiles, no
-shadow state that can drift from reality.
+[LAW:one-source-of-truth] The OS process table is the sole authority on "is this profile
+running." We identify a crom-managed Chrome by the absolute `--user-data-dir` path it
+was launched with — no pidfiles, no shadow state that can drift from reality.
+
+Everything here takes a `ResolvedProfile`, whose `argv` is already complete, so this
+module never reads a config file or decides a port.
 """
 
 import os
-import shutil
+import re
 import signal
+import socket
 import subprocess
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 
-from .profiles import CHROME_SRC, profile_port, profile_state_dir
+from .model import CromError, ResolvedProfile
 
-CHROME_BIN = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+LAUNCH_TIMEOUT_SECONDS = 30.0
+SHUTDOWN_TIMEOUT_SECONDS = 5.0
 
-# How every crom-managed Chrome launches, independent of *which* profile: one quiet,
-# non-phone-home, no-upsell launch policy applied identically on every launch.
-# [LAW:one-source-of-truth] this list is the sole owner of that policy;
-# [LAW:dataflow-not-control-flow] it is data spread into argv, not branches in launch().
+
+# `ps` hands us one flat string per process with no argv boundaries, so the directory
+# has to be delimited by something. It cannot be whitespace: a profile directory under a
+# project path like `~/My Projects/app` contains spaces, and `(\S+)` would silently clip
+# it to `~/My` — crom would then never recognise its own running browser. So the capture
+# runs to the next ` --switch`, or to the end of the line.
 #
-# The top-level switches are long-stable Chrome/Chromium command-line switches. The
-# trailing --disable-features entries are the version-fragile part: Chrome silently
-# ignores feature names it no longer knows, so new promo/upsell surfaces get suppressed
-# by adding a name there, not by touching launch().
-LAUNCH_POLICY_FLAGS = [
-    # "Don't check for default browser" — suppress the default-browser nag.
-    "--no-default-browser-check",
-
-    # "Don't send telemetry." No single switch does this; --disable-background-networking
-    # is the big one (kills UMA metrics upload, field-trial fetches, and component /
-    # safe-browsing update pings at once), and the rest close the remaining back-channels.
-    "--disable-background-networking",
-    "--disable-breakpad",            # crash-report upload
-    "--disable-domain-reliability",  # network-error reports to Google
-    "--no-pings",                    # hyperlink-auditing pings
-    # A separate real-time channel background-networking does NOT close: the Safe
-    # Browsing phishing lookup on navigation. Trade-off: no client-side phishing check.
-    "--disable-client-side-phishing-detection",
-
-    # "Don't register a profile / sign-in junk" — skip the first-run welcome/registration
-    # flow and the account sync machinery entirely.
-    "--no-first-run",
-    "--disable-sync",
-
-    # "Don't try to sell me things" — the upsell surfaces. --disable-search-engine-choice-screen
-    # kills the search-engine chooser; ChromeWhatsNewUI is the post-update "What's New" promo tab.
-    "--disable-search-engine-choice-screen",
-    "--disable-features=ChromeWhatsNewUI",
-
-    # Quiet UI — chrome-only nags, invisible to web content.
-    "--disable-session-crashed-bubble",  # no "Chrome didn't shut down correctly" bubble
-]
+# It deliberately does *not* depend on where `--user-data-dir` sits. An earlier version
+# required it to be immediately followed by `--remote-debugging-port` at the very end —
+# the shape `resolve.build_argv` emits — which made crom's own launch ordering a
+# load-bearing assumption about a string that Chrome owns. Chrome re-execs itself
+# (`--restart`) after something as ordinary as "relaunch the browser to load your profile
+# data", and rewrites its argv when it does:
+#
+#     ... --remote-debugging-port=9223 --restart --user-data-dir=/…/dev --restart
+#
+# The anchored pattern does not match that. `scan()` then returns nothing, and every
+# command that asks "is this profile running" is told no about a browser that is running:
+# `up` starts a second Chrome on the same directory, `down` cannot find it, `list` reports
+# it stopped, and `rm` deletes a live browser's user-data-dir. Observed against a real
+# Chrome, not hypothesised. [FRAMING:representation] this pattern is a map of Chrome's
+# *current* command line, not of how crom launched it; only the first is the territory.
+#
+# The cost of the looser terminator is that a directory containing a literal ` --word` is
+# not recognisable. Flattened `ps` output genuinely cannot distinguish that from a switch,
+# so no pattern over this input can. The old anchor made the same trade in reverse and had
+# it backwards: it defended a path nobody has at the price of a restart everybody gets.
+#
+# The leading greedy `.*` still forces the *last* `--user-data-dir=`, so a configured flag
+# whose value contains that literal text cannot shadow the real one (`parse_flags`
+# inspects only the switch name before `=`, so such a value is not rejected).
+_USER_DATA_DIR_RE = re.compile(r".*--user-data-dir=(.+?)(?=\s+--[A-Za-z0-9-]+|\s*\Z)")
 
 
-def copy_profile(name: str) -> Path:
-    dest = profile_state_dir(name)
-    if dest.exists():
-        return dest
-    dest.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(CHROME_SRC / "Default", dest / "Default")
-    return dest
+def _group_by_user_data_dir(ps_output: str) -> dict[str, tuple[int, ...]]:
+    """Parse `ps` output into main-browser PIDs grouped by their user-data-dir.
 
-
-def _find_main_pids(name: str) -> list[int]:
-    """Return PIDs of the main browser process(es) for this profile.
-
-    Matches the full command line for `--user-data-dir=<state_dir>` and
-    excludes Chrome helper processes (which carry `--type=...`).
+    Kept pure and separate from the `ps` call so the parsing — the part with the
+    interesting edge cases — is testable without spawning processes.
+    [LAW:effects-at-boundaries]
     """
-    state_dir = profile_state_dir(name)
-    needle = f"--user-data-dir={state_dir}"
-    # macOS BSD `pgrep` doesn't support -a (print cmdline), so we use
-    # `ps` and filter in Python. This is the portable path and gives us
-    # the full argv to distinguish main browser from helper processes.
-    result = subprocess.run(
-        ["ps", "-Ao", "pid=,command="],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    pids: list[int] = []
-    for line in result.stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        pid_str, _, cmd = line.partition(" ")
+    found: dict[str, list[int]] = {}
+    for line in ps_output.splitlines():
+        pid_str, _, cmd = line.strip().partition(" ")
         if not pid_str.isdigit():
-            continue
-        if needle not in cmd:
             continue
         if "--type=" in cmd:  # helper/renderer/gpu — not the main process
             continue
-        pids.append(int(pid_str))
-    return pids
+        match = _USER_DATA_DIR_RE.search(cmd)
+        if match:
+            found.setdefault(match.group(1), []).append(int(pid_str))
+    return {directory: tuple(pids) for directory, pids in found.items()}
+
+
+def scan() -> dict[str, tuple[int, ...]]:
+    """Every running main Chrome, grouped by the user-data-dir it was launched with.
+
+    One `ps` call answers the liveness question for every profile at once, so listing
+    twenty profiles costs one process scan rather than twenty.
+    [LAW:one-source-of-truth] this is the only place crom reads the process table.
+    """
+    # macOS BSD `pgrep` doesn't support -a (print cmdline), so we use `ps` and filter in
+    # Python. This is the portable path and gives us the full argv to distinguish the
+    # main browser from helper processes.
+    # This became the single process-table reader in this design, which concentrates the
+    # benefit and the failure alike: `list`, `up`, `down`, `rm`, `config` and migration
+    # all arrive here, so a raw `CalledProcessError` or a missing `ps` would escape the
+    # exit-code contract from every one of them. [LAW:no-silent-failure]
+    try:
+        result = subprocess.run(
+            ["ps", "-Ao", "pid=,command="],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except FileNotFoundError as e:
+        raise CromError(
+            "could not read the process table: `ps` was not found on PATH.\n"
+            "crom answers 'is this profile running' by reading `ps`, so it cannot work "
+            "without it."
+        ) from e
+    except subprocess.CalledProcessError as e:
+        raise CromError(
+            f"could not read the process table: `ps` exited {e.returncode}"
+            f"{(chr(10) + e.stderr.strip()) if e.stderr else ''}"
+        ) from e
+    return _group_by_user_data_dir(result.stdout)
+
+
+def find_pids_for_dir(profile_dir: Path) -> tuple[int, ...]:
+    """PIDs of the main browser process(es) using this user-data-dir.
+
+    Keyed on the raw path rather than a `ResolvedProfile` so migration can ask about
+    directories crom no longer has a profile for.
+    """
+    return scan().get(str(profile_dir), ())
+
+
+def find_pids(profile: ResolvedProfile) -> tuple[int, ...]:
+    return find_pids_for_dir(profile.profile_dir)
+
+
+def is_running(profile: ResolvedProfile) -> bool:
+    return bool(find_pids(profile))
 
 
 def _cdp_ready(port: int) -> bool:
     """True once Chrome's CDP HTTP endpoint answers on this port.
 
-    We probe the endpoint we intend to use rather than Chrome's DevToolsActivePort
-    file: Chrome only writes that file to *report* a port it chose itself (the
+    We probe the endpoint we intend to use rather than Chrome's DevToolsActivePort file:
+    Chrome only writes that file to *report* a port it chose itself (the
     `--remote-debugging-port=0` case), not when we hand it a fixed port. The live
     endpoint is the honest readiness signal.
     """
     try:
-        with urllib.request.urlopen(
-            f"http://127.0.0.1:{port}/json/version", timeout=1
-        ) as resp:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=1) as resp:
             return resp.status == 200
     except (urllib.error.URLError, OSError):
         return False
 
 
-def launch(name: str) -> int:
-    """Launch Chrome for this profile on its stable CDP port and return it.
+def _require_port_available(profile: ResolvedProfile) -> None:
+    """Fail immediately, and by name, when something else already holds the port.
 
-    The port comes from the profile config (profile_port), so it is the same on
-    every launch — the contract a client config can rely on. We launch on that
-    port, then poll the CDP endpoint until it answers. [LAW:no-silent-failure]
-    if it never comes up (e.g. the port is already in use), we raise rather than
-    return a lie.
+    Without this the launch simply times out after 30s and blames the wrong thing.
+    [LAW:no-silent-failure] the diagnosis belongs at the moment of failure.
     """
-    state_dir = profile_state_dir(name)
-    state_dir.mkdir(parents=True, exist_ok=True)
-    port = profile_port(name)
-    subprocess.Popen(
-        [
-            CHROME_BIN,
-            *LAUNCH_POLICY_FLAGS,
-            f"--user-data-dir={state_dir}",
-            f"--remote-debugging-port={port}",
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            probe.bind(("127.0.0.1", profile.port))
+            return
+        except OSError:
+            pass
+    raise CromError(
+        f"port {profile.port} (assigned to '{profile.ref}') is held by another process. "
+        f"Find it with: lsof -nP -iTCP:{profile.port} -sTCP:LISTEN"
     )
-    deadline = time.time() + 30.0
+
+
+def launch(profile: ResolvedProfile) -> tuple[int, ...]:
+    """Start Chrome for this profile and return its PIDs once CDP answers.
+
+    [LAW:no-silent-failure] we wait for the endpoint we promised the caller and raise if
+    it never comes up, rather than returning a port nothing is listening on.
+    """
+    _require_port_available(profile)
+    profile.profile_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        subprocess.Popen(
+            profile.argv,
+            env={**os.environ, **profile.env},
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError as e:
+        # `config` checks an explicit `chrome_binary` at parse time, so reaching here
+        # means the binary moved or lost its permissions between then and now. Raised as
+        # a CromError so it lands inside the CLI's exit-code contract rather than
+        # escaping as a raw traceback. [LAW:no-silent-failure]
+        raise CromError(
+            f"could not start Chrome for '{profile.ref}': {e}\n"
+            f"Command was: {' '.join(profile.argv)}"
+        ) from e
+
+    deadline = time.time() + LAUNCH_TIMEOUT_SECONDS
     while time.time() < deadline:
-        if _cdp_ready(port):
-            return port
+        if _cdp_ready(profile.port):
+            return find_pids(profile)
         time.sleep(0.1)
-    raise RuntimeError(
-        f"Chrome did not open CDP port {port} for '{name}' within 30s "
-        f"(is port {port} already in use?)"
+    raise CromError(
+        f"Chrome did not open CDP port {profile.port} for '{profile.ref}' within "
+        f"{LAUNCH_TIMEOUT_SECONDS:.0f}s.\nCommand was: {' '.join(profile.argv)}"
     )
 
 
-def kill(name: str) -> int | None:
-    """Terminate all main Chrome processes bound to this profile.
-
-    Returns the first PID killed, or None if nothing was running.
-    """
-    pids = _find_main_pids(name)
-    if not pids:
-        return None
+def kill(profile: ResolvedProfile) -> tuple[int, ...]:
+    """Terminate every main Chrome process bound to this profile; return what we killed."""
+    pids = find_pids(profile)
     for pid in pids:
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
+        _signal(pid, signal.SIGTERM)
+
     # Give Chrome a moment to shut down gracefully, then SIGKILL stragglers.
-    deadline = time.time() + 5.0
-    while time.time() < deadline:
-        if not _find_main_pids(name):
-            return pids[0]
+    deadline = time.time() + SHUTDOWN_TIMEOUT_SECONDS
+    while time.time() < deadline and find_pids(profile):
         time.sleep(0.1)
-    for pid in _find_main_pids(name):
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-    return pids[0]
+    for pid in find_pids(profile):
+        _signal(pid, signal.SIGKILL)
+    return pids
 
 
-def is_running(name: str) -> bool:
-    return bool(_find_main_pids(name))
+def _signal(pid: int, sig: int) -> None:
+    try:
+        os.kill(pid, sig)
+    except ProcessLookupError:
+        # The process exited between our scan and our signal — the outcome we wanted.
+        pass
