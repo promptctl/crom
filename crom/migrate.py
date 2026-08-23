@@ -57,7 +57,14 @@ def run(log) -> None:
         ref = ProfileRef(USER_NAMESPACE, name)
         # These profiles were all clones of the real Chrome profile; record that as their
         # seed so the config tells the truth about where their data came from.
-        configwrite.add_profile(
+        #
+        # `ensure_profile`, not `add_profile`: the legacy registry is only retired after
+        # the whole loop, so an attempt that dies partway is retried on the user's next
+        # command — and every step here has to survive being run twice. It is the one
+        # step that would not: re-declaring a name it already wrote would raise, and
+        # because migration runs before anything else in `main`, that exception would
+        # come back on *every* command and leave crom unusable with no way out.
+        configwrite.ensure_profile(
             user_config_file(),
             ProfileSpec(name=name, seed=SeedChrome()),
             header=configwrite.USER_CONFIG_HEADER,

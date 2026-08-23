@@ -6,6 +6,7 @@ table involved. [LAW:one-source-of-truth] the file on disk stays the authority o
 everything crom did not explicitly change.
 """
 
+import os
 from pathlib import Path
 
 import tomlkit
@@ -59,8 +60,14 @@ def _load(path: Path) -> tomlkit.TOMLDocument:
 
 
 def _save(path: Path, doc: tomlkit.TOMLDocument) -> None:
+    """Replace the file atomically — this is a document a human wrote and may have
+    committed, and `write_text` truncates before it writes. A failure partway through
+    that would leave a half-written config, and crom's own parser is strict enough that
+    the user would be locked out of every command until they repaired it by hand."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(tomlkit.dumps(doc))
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(tomlkit.dumps(doc))
+    os.replace(tmp, path)
 
 
 def init_project(path: Path, namespace: str) -> None:
@@ -71,11 +78,12 @@ def init_project(path: Path, namespace: str) -> None:
     path.write_text(PROJECT_CONFIG_TEMPLATE.format(namespace=namespace))
 
 
-def add_profile(path: Path, spec: ProfileSpec, *, header: str = "") -> None:
-    """Append a `[profiles.<name>]` table declaring `spec`.
+def _declare(path: Path, spec: ProfileSpec, header: str) -> bool:
+    """Append a `[profiles.<name>]` table for `spec`; report whether it was written.
 
-    `header` is written only when the file is being created, so an existing file's own
-    preamble is never duplicated or displaced.
+    Returns False, having changed nothing, when the name is already declared — leaving
+    each caller to say what that means for it. `header` is written only when the file is
+    being created, so an existing file's own preamble is never duplicated or displaced.
     """
     if not path.exists() and header:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -84,7 +92,7 @@ def add_profile(path: Path, spec: ProfileSpec, *, header: str = "") -> None:
     doc = _load(path)
     profiles = doc.setdefault("profiles", tomlkit.table(is_super_table=True))
     if spec.name in profiles:
-        raise FileExistsError(f"{path}: profile '{spec.name}' is already declared")
+        return False
 
     table = tomlkit.table()
     table["seed"] = render_seed(spec.seed or SeedFresh())
@@ -95,6 +103,24 @@ def add_profile(path: Path, spec: ProfileSpec, *, header: str = "") -> None:
         table["env"] = dict(spec.env)
     profiles[spec.name] = table
     _save(path, doc)
+    return True
+
+
+def add_profile(path: Path, spec: ProfileSpec, *, header: str = "") -> None:
+    """Declare a profile the user asked to create. A name already taken is a conflict."""
+    if not _declare(path, spec, header):
+        raise FileExistsError(f"{path}: profile '{spec.name}' is already declared")
+
+
+def ensure_profile(path: Path, spec: ProfileSpec, *, header: str = "") -> bool:
+    """Declare a profile unless it is already declared; report whether we wrote it.
+
+    The converging twin of `add_profile`, for callers whose goal is that the declaration
+    *exist* rather than that they be the one to create it. Migration is the caller that
+    needs this: it re-runs from the top after a failed attempt, so a name it already
+    wrote must be a no-op rather than a collision.
+    """
+    return _declare(path, spec, header)
 
 
 def remove_profile(path: Path, name: str) -> None:

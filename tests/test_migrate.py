@@ -78,6 +78,51 @@ class MigrateTest(unittest.TestCase):
         self.assertTrue((state_home() / "worker1").is_dir())
         self.assertTrue(migrate.legacy_registry_file().exists())
 
+    def test_an_attempt_that_dies_partway_is_resumed_by_the_next_one(self):
+        # The legacy registry is only retired after the whole loop, so a failed attempt
+        # is retried on the user's next command — and migration runs before anything
+        # else in `main`. A step that could not survive being run twice would therefore
+        # raise on every command from then on, with no command left to recover with.
+        real_move = migrate.shutil.move
+
+        def fail_on_worker1(source, destination):
+            if "worker1" in str(source):
+                raise OSError("simulated: no space left on device")
+            return real_move(source, destination)
+
+        with mock.patch("crom.chrome.scan", return_value={}):
+            with mock.patch.object(migrate.shutil, "move", fail_on_worker1):
+                with self.assertRaises(OSError):
+                    migrate.run(log=lambda _: None)
+
+            # Half done: `default` moved and both names are already declared.
+            self.assertTrue(migrate.needed())
+            migrate.run(log=lambda _: None)
+
+        self.assertFalse(migrate.needed())
+        ports = registry.reservations()
+        self.assertEqual(ports["user/default"].port, 4222)
+        self.assertEqual(ports["user/worker1"].port, 4223)
+        for name in LEGACY["profiles"]:
+            self.assertTrue((state_home() / "profiles" / "user" / name / "Default").is_dir())
+
+    def test_a_resumed_attempt_declares_each_profile_exactly_once(self):
+        real_move = migrate.shutil.move
+
+        def fail_on_worker1(source, destination):
+            if "worker1" in str(source):
+                raise OSError("simulated: no space left on device")
+            return real_move(source, destination)
+
+        with mock.patch("crom.chrome.scan", return_value={}):
+            with mock.patch.object(migrate.shutil, "move", fail_on_worker1):
+                with self.assertRaises(OSError):
+                    migrate.run(log=lambda _: None)
+            migrate.run(log=lambda _: None)
+
+        scope = config.load_user_scope()
+        self.assertEqual(sorted(scope.profiles), ["default", "worker1"])
+
     def test_migrated_profiles_resolve_to_their_original_ports(self):
         self.run_migration()
         from crom import resolve
