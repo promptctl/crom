@@ -23,8 +23,20 @@ PROJECT_CONFIG_CANDIDATES = (
 
 
 def _xdg(env: str, fallback: Path) -> Path:
+    """The XDG directory named by `env`, or `fallback` when it is unset or relative.
+
+    The spec says a relative value in these variables must be ignored, and here that is
+    load-bearing rather than pedantry: crom is run from many different directories by
+    design, so a relative `XDG_STATE_HOME` would put the ledger, the user config, and
+    every profile directory somewhere different depending on the cwd at invocation —
+    quietly dissolving the "same profile, same port, same directory every time"
+    guarantee, and scattering cookies and logins across the filesystem while doing it.
+    """
     raw = os.environ.get(env)
-    return Path(raw).expanduser() if raw else fallback
+    if not raw:
+        return fallback
+    expanded = Path(raw).expanduser()
+    return expanded if expanded.is_absolute() else fallback
 
 
 def config_home() -> Path:

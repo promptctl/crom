@@ -12,7 +12,6 @@ the case where two `crom up` calls race for the same free port.
 """
 
 import contextlib
-import fcntl
 import json
 import os
 import socket
@@ -20,8 +19,9 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
-from .model import Conflict, ProfileRef
-from .paths import registry_file
+from .locking import exclusive
+from .model import Conflict, CromError, ProfileRef
+from .paths import USER_NAMESPACE, registry_file
 
 SCHEMA_VERSION = 2
 
@@ -46,22 +46,34 @@ def _empty() -> dict:
 def _locked() -> Iterator[Path]:
     """Hold an exclusive lock on the ledger for the duration of a read-modify-write."""
     path = registry_file()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = path.with_suffix(".lock")
-    with open(lock_path, "w") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
-        try:
-            yield path
-        finally:
-            fcntl.flock(handle, fcntl.LOCK_UN)
+    with exclusive(path):
+        yield path
 
 
 def _read(path: Path) -> dict:
+    """Load the ledger, or fail naming the file a human has to repair.
+
+    [LAW:no-silent-failure] Both ways a ledger can be unusable — unparseable, or written
+    by a crom that speaks a later schema — surface as `CromError`, so they reach the
+    user through the CLI's documented exit-code contract instead of escaping as a raw
+    traceback. Every command touches the ledger, so an uncaught raise here takes the
+    whole tool down with no indication of which file is at fault.
+
+    A `CromError` and not a `Conflict`: `Conflict` means two declarations claim one
+    resource and maps to exit 4. A ledger crom cannot read is neither.
+    """
     if not path.exists():
         return _empty()
-    data = json.loads(path.read_text())
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError as e:
+        raise CromError(
+            f"{path}: the port ledger is not valid JSON ({e}).\n"
+            f"Repair or delete the file; crom rebuilds it, but every profile then gets "
+            f"a freshly assigned port."
+        ) from e
     if data.get("version") != SCHEMA_VERSION:
-        raise Conflict(
+        raise CromError(
             f"{path}: unsupported registry version {data.get('version')!r} "
             f"(this crom speaks version {SCHEMA_VERSION})"
         )
@@ -111,14 +123,45 @@ def namespaces() -> dict[str, Path]:
 
 
 def remember_namespace(namespace: str, source: Path) -> None:
+    """Record which config file owns a namespace, refusing a second claimant.
+
+    A namespace is free text a user types, checked for legal characters and nothing
+    else, so two unrelated projects can both pick `app`. Left unchecked they would share
+    a `ProfileRef` — and therefore one ledger key and one profile directory, mixing two
+    projects' cookies and logins in the same Chrome data dir. That is the exact bleed
+    namespaces exist to prevent, so the second claimant is refused by name rather than
+    silently becoming the owner.
+    """
     with _locked() as path:
         data = _read(path)
+        recorded = data["namespaces"].get(namespace, {}).get("config")
+        if recorded is not None and recorded != str(source):
+            raise Conflict(
+                f"namespace '{namespace}' is already claimed by {recorded}.\n"
+                f"{source} cannot use it too — they would share profile directories and "
+                f"ports. Rename this project's `namespace`, or run "
+                f"`crom forget {namespace}` if {recorded} is gone."
+            )
         data["namespaces"][namespace] = {"config": str(source)}
         _write(path, data)
 
 
 def forget_namespace(namespace: str) -> int:
-    """Drop a namespace and every port reserved under it; report how many were released."""
+    """Drop a namespace and every port reserved under it; report how many were released.
+
+    [LAW:single-enforcer] The `user` namespace is refused here, at the ledger that owns
+    the reservations, rather than at each entry point — `config.parse` and `crom init`
+    already reject it on their own paths, and a third copy of the rule in `forget_cmd`
+    would be a third chance to drift. Dropping `user/` would silently release the port
+    reservations behind personal profiles, which are declared, in use, and would come
+    back on different numbers.
+    """
+    if namespace == USER_NAMESPACE:
+        raise Conflict(
+            f"namespace '{USER_NAMESPACE}' is reserved for your personal profiles and "
+            f"cannot be forgotten — dropping it would release the ports they are using. "
+            f"Remove individual profiles with `crom rm {USER_NAMESPACE}/<name>`."
+        )
     prefix = f"{namespace}/"
     with _locked() as path:
         data = _read(path)
@@ -160,6 +203,7 @@ def port_for(ref: ProfileRef, *, pinned: int | None, source: Path | None) -> int
     app's `CDP_URL` relies on.
     """
     key = str(ref)
+    _reject_base_port_pin(key, pinned)
     with _locked() as path:
         data = _read(path)
         ports: dict[str, dict] = data["ports"]
@@ -178,6 +222,25 @@ def port_for(ref: ProfileRef, *, pinned: int | None, source: Path | None) -> int
         return port
 
 
+_DEFAULT_REF = f"{USER_NAMESPACE}/default"
+
+
+def _reject_base_port_pin(key: str, pinned: int | None) -> None:
+    """Keep BASE_PORT for `user/default`, on the pinned path as well as the assigned one.
+
+    `_allocate` holds 9222 back from auto-assignment, but a config pinning `port = 9222`
+    took the other branch and skipped that reservation entirely — after which a bare
+    `crom` quietly lands on 9223 and the documented "the common case needs no lookup at
+    all" guarantee stops being true, with nothing reporting that it changed.
+    """
+    if pinned == BASE_PORT and key != _DEFAULT_REF:
+        raise Conflict(
+            f"port {BASE_PORT} is reserved for '{_DEFAULT_REF}', which a bare `crom` "
+            f"expects to find there without a lookup.\n"
+            f"Pin a different port for '{key}', or remove the pin to let crom assign one."
+        )
+
+
 def _reject_foreign_claim(key: str, port: int, ports: dict[str, dict]) -> None:
     for other_key, entry in ports.items():
         if other_key == key or entry["port"] != port:
@@ -193,8 +256,8 @@ def _allocate(ref: ProfileRef, ports: dict[str, dict]) -> int:
     taken = {entry["port"] for entry in ports.values()}
     # BASE_PORT is held for user/default whether or not it has been created yet, so a
     # project profile never steals the port a bare `crom up` will want.
-    preferred = BASE_PORT if str(ref) == "user/default" else BASE_PORT + 1
-    reserved = taken if str(ref) == "user/default" else taken | {BASE_PORT}
+    preferred = BASE_PORT if str(ref) == _DEFAULT_REF else BASE_PORT + 1
+    reserved = taken if str(ref) == _DEFAULT_REF else taken | {BASE_PORT}
 
     for port in range(preferred, MAX_PORT + 1):
         if port not in reserved and _port_is_free(port):
