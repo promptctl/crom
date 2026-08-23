@@ -30,18 +30,56 @@ def chrome_user_data_dir() -> Path:
     return _CHROME_USER_DATA.get(sys.platform, _CHROME_USER_DATA["linux"])
 
 
+def _reject_escaping_symlinks(source: Path, described: str) -> None:
+    """Refuse a seed containing a link that points outside itself.
+
+    Neither way of handling such a link is safe, which is why this rejects rather than
+    choosing one. Dereferencing copies the *content* of whatever the link names, so a
+    seed could pull in `~/.ssh/id_rsa` and land the real key inside a profile whose CDP
+    port is reachable by local tooling. Preserving the link is worse in the other
+    direction: `profile_dir` becomes Chrome's live user-data-dir, and Chrome writes
+    `Default/Preferences` and its siblings with ordinary `open()`, which follows
+    symlinks — so a planted link is a write primitive aimed at any file the invoking
+    user can modify.
+
+    Links that stay inside the tree are kept as links: they resolve within the finished
+    profile, and they are how a real Chrome user-data-dir's own internal links survive
+    the copy.
+
+    `os.walk(followlinks=False)` rather than `rglob`: a symlinked directory still needs
+    checking, but must not be recursed into — a link cycle would otherwise hang here.
+    """
+    root = source.resolve()
+    for dirpath, dirnames, filenames in os.walk(source, followlinks=False):
+        for name in (*dirnames, *filenames):
+            entry = Path(dirpath) / name
+            if not entry.is_symlink():
+                continue
+            # An absolute target discards the left side of the join, so this handles
+            # relative and absolute links alike.
+            target = (entry.parent / entry.readlink()).resolve()
+            if target == root or root in target.parents:
+                continue
+            raise CromError(
+                f"seed {described} contains a symlink that points outside it:\n"
+                f"  {entry.relative_to(source)} -> {target}\n"
+                f"crom will not copy it: following the link would pull that file into "
+                f"the profile, and keeping it would let Chrome write through it. Remove "
+                f"the link, or point it inside the seed."
+            )
+
+
 def _copy(source: Path, dest: Path, described: str) -> None:
     if not source.is_dir():
         raise CromError(f"seed {described} does not exist: {source}")
+    _reject_escaping_symlinks(source, described)
     dest.parent.mkdir(parents=True, exist_ok=True)
     # `dest` is either absent or the freshly-made empty staging directory, never a
     # profile with contents of its own.
     #
-    # `symlinks=True` copies a link as a link. The default dereferences it and copies
-    # the *content* it points at, which turns a symlink inside a seed directory into a
-    # way to pull a file the seed never contained — an `~/.ssh/id_rsa` link in a seed
-    # checked into a repo would land as the real key inside a profile whose CDP port is
-    # then open to local tooling. Preserving the link copies the pointer and nothing else.
+    # `symlinks=True` copies a link as a link rather than dereferencing it. Every link
+    # that survives the check above resolves inside the tree, so the copy reproduces the
+    # seed's internal structure without reaching outside it in either direction.
     shutil.copytree(source, dest, dirs_exist_ok=True, symlinks=True)
 
 
@@ -83,11 +121,24 @@ def materialize(profile: ResolvedProfile) -> bool:
     on the winner's finished profile. Under the lock the second caller observes the
     directory and reports False, which is what idempotent was supposed to mean.
     """
-    with exclusive(profile.profile_dir):
-        return _materialize_locked(profile)
+    with profile_lock(profile):
+        return materialize_under_lock(profile)
 
 
-def _materialize_locked(profile: ResolvedProfile) -> bool:
+def profile_lock(profile: ResolvedProfile):
+    """The exclusive lock guarding one profile's directory.
+
+    Public because bringing a profile up is a longer critical section than seeding: the
+    liveness check and the launch have to sit under the same lock, or two `crom up`
+    calls both see no running Chrome and both start one. `flock` on a second descriptor
+    blocks even within one process, so the caller takes this once and calls
+    `materialize_under_lock` rather than nesting `materialize`.
+    """
+    return exclusive(profile.profile_dir)
+
+
+def materialize_under_lock(profile: ResolvedProfile) -> bool:
+    """`materialize`'s body, for a caller already holding `profile_lock`."""
     if profile.profile_dir.exists():
         return False
 

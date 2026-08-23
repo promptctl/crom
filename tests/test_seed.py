@@ -7,6 +7,8 @@ for the next run to mistake for a finished profile.
 
 import shutil
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -138,31 +140,102 @@ class MaterializeTest(unittest.TestCase):
         self.assertFalse(self.dest.exists())
         self.assertEqual(self._stray_directories(), [])
 
-    def test_a_symlink_in_a_seed_is_copied_as_a_link_not_as_its_target(self):
-        """A seed must not be able to pull in a file it only points at.
+    def test_a_seed_pointing_outside_itself_is_refused(self):
+        """Neither handling of an escaping link is safe, so the seed is refused.
 
-        Dereferencing would copy the *content* of whatever the link names — an
-        `~/.ssh/id_rsa` link in a seed checked into a repo would land as the real key
-        inside a profile whose CDP port is reachable by local tooling.
+        Dereferencing copies the *content* of whatever the link names, pulling a file
+        into a profile whose CDP port is reachable by local tooling. Preserving it is
+        worse in the other direction: profile_dir becomes Chrome's live user-data-dir,
+        and Chrome writes `Default/Preferences` and friends with ordinary `open()`,
+        which follows symlinks — so the link becomes a write primitive aimed at any file
+        the invoking user can modify.
         """
         source = self._source()
         secret = self.root / "secret.txt"
         secret.write_text("private key")
-        (source / "link").symlink_to(secret)
+        (source / "Default").mkdir()
+        (source / "Default" / "Preferences").symlink_to(secret)
+
+        with self.assertRaisesRegex(CromError, "points outside it"):
+            seed.materialize(profile(self.dest, SeedPath(source)))
+
+        self.assertFalse(self.dest.exists())
+        self.assertEqual(secret.read_text(), "private key")  # untouched
+
+    def test_a_link_that_stays_inside_the_seed_is_kept_as_a_link(self):
+        """Internal links resolve within the finished profile, so they are safe —
+        and preserving them is how a real Chrome user-data-dir survives the copy."""
+        source = self._source()
+        (source / "inner").symlink_to(source / "sub" / "a.txt")
 
         self.assertTrue(seed.materialize(profile(self.dest, SeedPath(source))))
-        self.assertTrue((self.dest / "link").is_symlink())
-        self.assertEqual((self.dest / "link").readlink(), secret)
+        self.assertTrue((self.dest / "inner").is_symlink())
+
+    def test_a_symlinked_directory_cycle_does_not_hang_the_check(self):
+        """The walk must not follow links, or a cycle spins forever."""
+        source = self._source()
+        (source / "loop").symlink_to(source)
+
+        # `loop` resolves to the seed root itself, which counts as inside.
+        self.assertTrue(seed.materialize(profile(self.dest, SeedPath(source))))
 
     def test_a_second_materialize_of_the_same_profile_is_a_no_op(self):
-        """The existence check and the copy are one critical section.
+        """The steady state: an existing directory is never re-seeded.
 
-        Serialized, the second caller sees a finished directory and reports False, which
-        is what `crom up`'s advertised idempotence means.
+        Sequential on purpose — this covers the plain existence check, not the lock. The
+        race is covered by `ConcurrentMaterializeTest` below, which fails without it.
         """
         source = self._source()
         self.assertTrue(seed.materialize(profile(self.dest, SeedPath(source))))
         self.assertFalse(seed.materialize(profile(self.dest, SeedPath(source))))
+
+
+class ConcurrentMaterializeTest(unittest.TestCase):
+    """Two `crom up` calls racing on a profile that does not exist yet.
+
+    Unlocked, both see no directory, both build a full staging copy, and the loser's
+    commit hits ENOTEMPTY on the winner's finished profile — leaking its staging
+    directory, since that raise used to happen outside the guarded block.
+
+    The threads take separate descriptors, so `fcntl.flock` serializes them exactly as
+    it would two processes; the copy is slowed to force the interleaving. Verified to
+    fail with `exclusive()` stubbed out.
+    """
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.dest = self.root / "profiles" / "myapp" / "dev"
+        self.source = self.root / "template"
+        (self.source / "sub").mkdir(parents=True)
+        (self.source / "sub" / "a.txt").write_text("a")
+
+    def test_exactly_one_caller_seeds_and_nothing_is_left_behind(self):
+        real_copytree = shutil.copytree
+
+        def slow_copytree(*args, **kwargs):
+            time.sleep(0.05)
+            return real_copytree(*args, **kwargs)
+
+        results, errors = [], []
+
+        def go():
+            try:
+                results.append(seed.materialize(profile(self.dest, SeedPath(self.source))))
+            except BaseException as e:
+                errors.append(e)
+
+        with mock.patch.object(seed.shutil, "copytree", slow_copytree):
+            threads = [threading.Thread(target=go) for _ in range(2)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+        self.assertEqual(errors, [])
+        self.assertEqual(sorted(results), [False, True])  # one seeded, one found it done
+        self.assertTrue((self.dest / "sub" / "a.txt").is_file())
+        self.assertEqual([p for p in self.dest.parent.iterdir() if p.is_dir()], [self.dest])
 
 
 if __name__ == "__main__":
