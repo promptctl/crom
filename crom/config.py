@@ -121,11 +121,42 @@ def parse_seed(raw, where: str, source: Path, config_dir: Path) -> Seed:
     if raw.startswith("chrome:"):
         return SeedChrome(profile=_parse_chrome_profile(raw.split(":", 1)[1], where, source))
     if raw[:1] in (".", "/", "~"):
-        return SeedPath((config_dir / Path(raw).expanduser()).resolve())
+        return SeedPath(_parse_seed_path(raw, where, source, config_dir))
     raise CromError(
         f"{source}: {where}.seed = {raw!r} is not recognised. Use 'fresh', 'chrome', "
         f"'chrome:<Profile Name>', or a path beginning with './', '/', or '~'."
     )
+
+
+def _parse_seed_path(raw: str, where: str, source: Path, config_dir: Path) -> Path:
+    """A directory to copy a profile from, checked before it becomes a `SeedPath`.
+
+    `seed` is read from a `.crom.toml` that may have arrived with a cloned repository —
+    the same untrusted-config threat model `_parse_chrome_profile` and `seed._link_guard`
+    are built around — and `materialize` will `copytree` whatever this names. So
+    `seed = "~"` or `seed = "/"` meant copying the user's entire home directory, or the
+    filesystem, into a profile directory served by a locally reachable CDP port. The
+    sibling vocabulary was guarded and this one, beside it, accepted anything.
+
+    Refusing the home directory and the filesystem root refuses the whole class, because
+    an ancestor of the profile's own home is what makes the copy unbounded. A legitimate
+    seed is some specific profile directory, never the tree containing all of them.
+
+    [LAW:parse-dont-validate] checked here, so `seed.materialize` holds no guard: a
+    `SeedPath` that exists names a directory crom is willing to copy.
+    """
+    resolved = (config_dir / Path(raw).expanduser()).resolve()
+    home = Path.home().resolve()
+    forbidden = {resolved == home, resolved in home.parents, resolved == Path(resolved.anchor)}
+    if any(forbidden):
+        raise CromError(
+            f"{source}: {where}.seed = {raw!r} resolves to {resolved}, which contains "
+            f"your whole home directory or filesystem.\n"
+            f"crom copies a seed directory in full, so this would duplicate everything "
+            f"under it into a profile reachable over CDP. Name the specific profile "
+            f"directory to copy instead."
+        )
+    return resolved
 
 
 def _parse_chrome_profile(which: str, where: str, source: Path) -> str:
@@ -217,10 +248,18 @@ def parse(text: str, source: Path, *, namespace: str | None = None) -> Scope:
 
     if namespace is None:
         declared = data.get("namespace")
-        if not isinstance(declared, str):
+        # Two different problems, so two different messages. Telling someone who wrote
+        # `namespace = 123` that their key is missing is the least useful thing crom
+        # could say to the person actually looking at the line.
+        if "namespace" not in data:
             raise CromError(
                 f'{source}: missing required key `namespace`. Add e.g. namespace = "myapp" — '
                 f"it is how this project's profiles and ports stay clear of every other project's."
+            )
+        if not isinstance(declared, str):
+            raise CromError(
+                f"{source}: `namespace` must be a string, not "
+                f"{type(declared).__name__} ({declared!r})."
             )
         namespace = validate_name("namespace", declared)
         if namespace == USER_NAMESPACE:
@@ -242,9 +281,21 @@ def parse(text: str, source: Path, *, namespace: str | None = None) -> Scope:
     state_dir = data.get("state_dir")
     if state_dir is not None and not isinstance(state_dir, str):
         raise CromError(f"{source}: state_dir must be a string path")
+    if state_dir == "":
+        # Refused rather than interpreted. A truthy test silently treated this as absent
+        # and fell back to the default, so someone debugging why their explicit
+        # `state_dir` "was ignored" had nothing to go on. `is not None` would be worse:
+        # it resolves to the config's own directory, quietly scattering profile
+        # directories next to the config file. An empty path is not a location under any
+        # reading, so the parser should not admit one — the same stance the seed
+        # vocabulary already takes toward "".
+        raise CromError(
+            f"{source}: state_dir is empty. Give a path, or remove the key to use "
+            f"{default_profiles_root()}."
+        )
     profiles_root = (
         (config_dir / Path(state_dir).expanduser()).resolve()
-        if state_dir
+        if state_dir is not None
         else default_profiles_root()
     )
 

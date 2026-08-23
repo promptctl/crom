@@ -290,7 +290,7 @@ def add_cmd(session: _Session, name: str, seed_text: str, flags: tuple[str, ...]
     if configwrite.declares(target, name):
         raise Conflict(f"{target}: profile '{name}' is already declared")
     config.reject_duplicate_ports({**scope.profiles, name: spec}, target)
-    profile = resolver.resolve_spec(scope, name, spec)
+    profile = resolver.resolve_spec(scope, spec)
 
     # Resolution above already persisted a port reservation. If the declaration does not
     # land, that reservation is for a profile no config declares — unreachable by `crom

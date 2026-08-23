@@ -5,6 +5,7 @@ at the config key that overrides the search, rather than failing later inside Po
 with a bare ENOENT.
 """
 
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -37,7 +38,13 @@ def _resolve(candidate: str) -> Path | None:
     """A candidate is either an absolute path that exists or a name found on PATH."""
     path = Path(candidate)
     if path.is_absolute():
-        return path if path.exists() else None
+        # Executable, not merely present. `shutil.which` applies this test on the other
+        # branch and `config._parse_chrome_binary` applies it to an explicitly configured
+        # binary, so without it the two halves of this one function mean different things:
+        # one "usable as a browser", the other "exists". A stripped or corrupted install
+        # would then be returned as the answer, defeating this module's promise to name
+        # every path it tried rather than failing later inside Popen.
+        return path if path.is_file() and os.access(path, os.X_OK) else None
     found = shutil.which(candidate)
     return Path(found) if found else None
 

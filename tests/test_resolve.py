@@ -239,11 +239,22 @@ class ResolveSpecTest(ResolveTest):
 
     def test_the_namespace_comes_from_the_scope(self):
         scope = self.scope(MINIMAL + "[profiles.dev]\n")
-        profile = resolve.resolve_spec(scope, "dev", ProfileSpec(name="dev"))
+        profile = resolve.resolve_spec(scope, ProfileSpec(name="dev"))
 
         self.assertEqual(profile.ref, ProfileRef("myapp", "dev"))
         self.assertEqual(profile.profile_dir.parts[-2:], ("myapp", "dev"))
         self.assertIn("myapp/dev", registry.reservations())
+
+    def test_the_name_comes_from_the_spec_that_carries_it(self):
+        """`configwrite._declare` and `config.reject_duplicate_ports` key off `spec.name`
+        — the latter iterates `.values()` and has no other identity available. Taking the
+        name separately meant a caller could resolve one profile and declare another,
+        with every call site keeping them in step only by convention."""
+        scope = self.scope(MINIMAL + "[profiles.dev]\n")
+        profile = resolve.resolve_spec(scope, ProfileSpec(name="dev"))
+
+        self.assertEqual(profile.ref.name, "dev")
+        self.assertEqual(profile.profile_dir.name, "dev")
 
     def test_there_is_no_second_namespace_to_disagree_with_the_first(self):
         """The guarantee is structural, so this asserts the signature itself: a caller
@@ -251,7 +262,7 @@ class ResolveSpecTest(ResolveTest):
         import inspect
 
         parameters = list(inspect.signature(resolve.resolve_spec).parameters)
-        self.assertEqual(parameters, ["scope", "name", "spec"])
+        self.assertEqual(parameters, ["scope", "spec"])
 
 
 if __name__ == "__main__":

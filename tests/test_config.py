@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest import mock
 
 from crom import config
+from crom.paths import default_profiles_root
 from crom.model import Conflict, CromError, SeedChrome, SeedFresh, SeedPath
 
 SOURCE = Path("/proj/.crom.toml")
@@ -209,6 +210,72 @@ class DiscoveryTest(unittest.TestCase):
         inner.mkdir()
         (inner / ".crom.toml").write_text('namespace = "inner"\n')
         self.assertEqual(config.discover(inner), inner / ".crom.toml")
+
+
+class SeedPathGuardTest(unittest.TestCase):
+    """`seed` names a directory crom will copy in full, from a file that may have arrived
+    with a cloned repository — the same untrusted-config threat model the `chrome:`
+    vocabulary beside it was hardened against."""
+
+    def setUp(self):
+        self.base = Path(tempfile.mkdtemp()).resolve()
+        self.source = self.base / ".crom.toml"
+
+    def _parse(self, raw: str):
+        return config.parse_seed(raw, "[profiles.dev]", self.source, self.base)
+
+    def test_the_home_directory_is_refused(self):
+        with self.assertRaisesRegex(CromError, "your whole home directory or filesystem"):
+            self._parse("~")
+
+    def test_the_filesystem_root_is_refused(self):
+        with self.assertRaisesRegex(CromError, "your whole home directory or filesystem"):
+            self._parse("/")
+
+    def test_an_ancestor_of_home_is_refused(self):
+        ancestor = str(Path.home().resolve().parent)
+        with self.assertRaisesRegex(CromError, "your whole home directory or filesystem"):
+            self._parse(ancestor)
+
+    def test_an_ordinary_profile_directory_is_still_accepted(self):
+        """The guard has to refuse the class without refusing the feature."""
+        seed = self._parse("./local-seed")
+        self.assertEqual(seed.path, self.base / "local-seed")
+
+    def test_a_directory_inside_home_is_still_accepted(self):
+        inside = Path.home().resolve() / "some" / "profile"
+        self.assertEqual(self._parse(str(inside)).path, inside)
+
+
+class NamespaceDiagnosisTest(unittest.TestCase):
+    """Two different problems deserve two different messages."""
+
+    def setUp(self):
+        self.source = Path(tempfile.mkdtemp()).resolve() / ".crom.toml"
+
+    def test_an_absent_namespace_says_it_is_missing(self):
+        with self.assertRaisesRegex(CromError, "missing required key"):
+            config.parse("[profiles.dev]\n", self.source)
+
+    def test_a_wrong_typed_namespace_says_so_instead_of_missing(self):
+        with self.assertRaisesRegex(CromError, "`namespace` must be a string, not int"):
+            config.parse("namespace = 123\n", self.source)
+
+
+class StateDirTest(unittest.TestCase):
+    def setUp(self):
+        self.source = Path(tempfile.mkdtemp()).resolve() / ".crom.toml"
+
+    def test_an_empty_state_dir_is_refused_rather_than_ignored(self):
+        """A truthy test treated this as absent and silently used the default, leaving
+        someone debugging an "ignored" setting with nothing to go on. Resolving it
+        instead would be worse — it lands on the config's own directory."""
+        with self.assertRaisesRegex(CromError, "state_dir is empty"):
+            config.parse('namespace = "myapp"\nstate_dir = ""\n', self.source)
+
+    def test_an_absent_state_dir_still_uses_the_default(self):
+        scope = config.parse('namespace = "myapp"\n', self.source)
+        self.assertEqual(scope.profiles_root, default_profiles_root())
 
 
 if __name__ == "__main__":

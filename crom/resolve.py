@@ -144,21 +144,29 @@ def spec_for(ref: ProfileRef, scope: Scope) -> ProfileSpec:
 def resolve(ref: ProfileRef, ambient: Scope) -> ResolvedProfile:
     scope = scope_for(ref.namespace, ambient)
     spec = spec_for(ref, scope)
-    return resolve_spec(scope, ref.name, spec)
+    return resolve_spec(scope, spec)
 
 
-def resolve_spec(scope: Scope, name: str, spec: ProfileSpec) -> ResolvedProfile:
+def resolve_spec(scope: Scope, spec: ProfileSpec) -> ResolvedProfile:
     """Resolve one declared profile in the namespace that declares it.
 
-    [LAW:types-are-the-program] The namespace is taken from `scope` and never passed
-    alongside it. Accepting a `ProfileRef` *and* a `Scope` made a mismatch expressible —
-    the profile directory is built from the ref's namespace while the ledger is keyed on
-    the ref, so a caller pairing a ref with a foreign scope would silently create a
-    directory and a port reservation under a namespace that scope does not own, with
-    nothing raised. Deriving the ref here removes the second namespace rather than
-    adding a guard against it: there is no longer a pair that can disagree.
+    [LAW:types-are-the-program] Both halves of the identity come from arguments that
+    already carry them, and neither is passed a second time.
+
+    The namespace comes from `scope`. Accepting a `ProfileRef` *and* a `Scope` made a
+    mismatch expressible — the profile directory is built from the ref's namespace while
+    the ledger is keyed on the ref, so a caller pairing a ref with a foreign scope would
+    silently create a directory and a reservation under a namespace that scope does not
+    own, with nothing raised.
+
+    The name comes from `spec`. Taking it separately left the same defect one step over:
+    `configwrite._declare` and `config.reject_duplicate_ports` key off `spec.name` — the
+    latter iterates `.values()` and has no other identity available — so a caller passing
+    a name that disagreed with `spec.name` would resolve as one profile and be declared
+    as another. Every call site kept them in sync by convention, which is exactly the
+    guarantee a type should be making instead.
     """
-    ref = ProfileRef(scope.namespace, name)
+    ref = ProfileRef(scope.namespace, spec.name)
     profile_dir = scope.profiles_root / ref.namespace / ref.name
     where = str(scope.source or "user config")
     raw_flags = (*scope.default_flags, *spec.flags)
@@ -203,9 +211,9 @@ def resolve_all(scope: Scope) -> list[ProfileEntry]:
     the situation it exists for.
     """
     entries: list[ProfileEntry] = []
-    for name, spec in sorted(scope.profiles.items()):
+    for _, spec in sorted(scope.profiles.items()):
         try:
-            entries.append(resolve_spec(scope, name, spec))
+            entries.append(resolve_spec(scope, spec))
         except CromError as error:
-            entries.append(FailedProfile(ProfileRef(scope.namespace, name), str(error)))
+            entries.append(FailedProfile(ProfileRef(scope.namespace, spec.name), str(error)))
     return entries

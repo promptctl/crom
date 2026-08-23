@@ -6,6 +6,7 @@ for the next run to mistake for a finished profile.
 """
 
 import shutil
+import sys
 import tempfile
 import threading
 import time
@@ -261,6 +262,38 @@ class ConcurrentMaterializeTest(unittest.TestCase):
         self.assertEqual(sorted(results), [False, True])  # one seeded, one found it done
         self.assertTrue((self.dest / "sub" / "a.txt").is_file())
         self.assertEqual([p for p in self.dest.parent.iterdir() if p.is_dir()], [self.dest])
+
+
+class ChromeUserDataDirTest(unittest.TestCase):
+    """Which real browser directory a `chrome` seed copies from.
+
+    `browser._CANDIDATES` treats Chromium as first-class on both platforms, so a table
+    here naming only Google Chrome meant `find_chrome()` could succeed on a Chromium-only
+    machine while the first command failed — `_bootstrap_user_config` seeds `user/default`
+    with `SeedChrome()` unconditionally, so a fresh install could not run once.
+    """
+
+    def setUp(self):
+        self.home = Path(tempfile.mkdtemp()).resolve()
+        self.chrome = self.home / "chrome-data"
+        self.chromium = self.home / "chromium-data"
+        self.candidates = (self.chrome, self.chromium)
+        patch = mock.patch.dict(seed._CHROME_USER_DATA, {sys.platform: self.candidates})
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_google_chrome_wins_when_both_are_installed(self):
+        self.chrome.mkdir()
+        self.chromium.mkdir()
+        self.assertEqual(seed.chrome_user_data_dir(), self.chrome)
+
+    def test_chromium_is_used_when_it_is_the_only_one_installed(self):
+        self.chromium.mkdir()
+        self.assertEqual(seed.chrome_user_data_dir(), self.chromium)
+
+    def test_with_neither_installed_it_names_a_real_path_to_report(self):
+        """The caller's "seed 'chrome' does not exist: …" has to name something."""
+        self.assertEqual(seed.chrome_user_data_dir(), self.chrome)
 
 
 if __name__ == "__main__":

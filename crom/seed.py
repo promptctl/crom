@@ -20,14 +20,34 @@ from .model import CromError, ResolvedProfile, SeedChrome, SeedFresh, SeedPath
 # Where the user's real Chrome keeps its user-data-dir, per platform. POSIX only, as
 # crom is throughout: `chrome.scan` answers "is this profile running" by shelling out to
 # `ps`, so a Windows entry here would describe a platform no other part of crom reaches.
-_CHROME_USER_DATA: dict[str, Path] = {
-    "darwin": Path.home() / "Library" / "Application Support" / "Google" / "Chrome",
-    "linux": Path.home() / ".config" / "google-chrome",
+#
+# A list per platform, resolved first-hit-wins — the same shape and the same strategy as
+# `browser._CANDIDATES`, because the two answer halves of one question and disagreeing
+# about which browsers exist is what went wrong. `_CANDIDATES` treats Chromium as
+# first-class on both platforms while this table named only Google Chrome, so on a
+# Chromium-only machine `find_chrome()` succeeded and then the very first command failed:
+# `_bootstrap_user_config` seeds `user/default` with `SeedChrome()` unconditionally, so a
+# fresh install could not run once.
+_CHROME_USER_DATA: dict[str, tuple[Path, ...]] = {
+    "darwin": (
+        Path.home() / "Library" / "Application Support" / "Google" / "Chrome",
+        Path.home() / "Library" / "Application Support" / "Chromium",
+    ),
+    "linux": (
+        Path.home() / ".config" / "google-chrome",
+        Path.home() / ".config" / "chromium",
+    ),
 }
 
 
 def chrome_user_data_dir() -> Path:
-    return _CHROME_USER_DATA.get(sys.platform, _CHROME_USER_DATA["linux"])
+    """The real browser's user-data-dir, for a `chrome` seed.
+
+    Falls back to the first candidate when none exists, so the caller's "seed 'chrome'
+    does not exist: …" still names a real path rather than reporting nothing.
+    """
+    candidates = _CHROME_USER_DATA.get(sys.platform, _CHROME_USER_DATA["linux"])
+    return next((path for path in candidates if path.is_dir()), candidates[0])
 
 
 def _link_guard(source: Path, described: str):
