@@ -193,7 +193,12 @@ class Scope:
     chrome_binary: Path
     default_flags: tuple[str, ...] = ()
     default_env: dict[str, str] = field(default_factory=dict)
-    default_seed: Seed = SeedFresh()
+    # `DEFAULT_SEED`, not a literal — this dataclass default is the sixth answer to the
+    # question that constant exists to answer, and it sat 80 lines below the comment
+    # claiming the drift was gone. It is reachable, not decorative: `load_user_scope`
+    # builds a fileless `Scope` without this field on a machine with no user config, so
+    # that scope reported `fresh` while every file-backed scope reported `chrome`.
+    default_seed: Seed = DEFAULT_SEED
     profiles: dict[str, ProfileSpec] = field(default_factory=dict)
 
     @property

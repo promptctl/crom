@@ -228,12 +228,42 @@ class KillTest(unittest.TestCase):
         self.assertEqual(self.signals, [(11, signal.SIGTERM), (22, signal.SIGTERM)])
 
     def test_a_straggler_still_running_after_the_timeout_is_force_killed(self):
-        with mock.patch.object(chrome, "find_pids", return_value=(11,)):
+        """Escalates to SIGKILL, and returns once the process is actually gone.
+
+        The scans model a browser that ignores SIGTERM through the grace period and dies
+        on SIGKILL. Returning is gated on it having *gone*, not on the signal having been
+        sent: `rm` deletes the user-data-dir the moment this returns.
+        """
+        alive = [True]
+
+        def signal_(pid, sig):
+            self.signals.append((pid, sig))
+            if sig == signal.SIGKILL:
+                alive[0] = False
+
+        with (
+            mock.patch.object(chrome, "_signal", signal_),
+            mock.patch.object(chrome, "find_pids", side_effect=lambda p: (11,) if alive[0] else ()),
+        ):
             killed = chrome.kill(self.profile)
 
         self.assertEqual(killed, (11,))
-        self.assertEqual(self.signals[0], (11, signal.SIGTERM))
-        self.assertIn((11, signal.SIGKILL), self.signals)
+        self.assertEqual(self.signals, [(11, signal.SIGTERM), (11, signal.SIGKILL)])
+
+    def test_a_browser_that_survives_sigkill_is_never_reported_as_stopped(self):
+        """[LAW:no-silent-failure] returning would tell `rm` it is safe to delete.
+
+        Nothing crom can do will stop this process, so the honest outcome is to say so
+        and leave the profile directory alone — the alternative is `shutil.rmtree` under
+        a live browser, which is the failure the return-gate exists to prevent.
+        """
+        with (
+            mock.patch.object(chrome, "find_pids", return_value=(11,)),
+            self.assertRaisesRegex(CromError, "survived SIGKILL"),
+        ):
+            chrome.kill(self.profile)
+
+        self.assertEqual(self.signals, [(11, signal.SIGTERM), (11, signal.SIGKILL)])
 
     def test_stopping_a_profile_that_is_not_running_signals_nothing(self):
         with mock.patch.object(chrome, "find_pids", return_value=()):

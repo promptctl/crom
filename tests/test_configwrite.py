@@ -349,6 +349,26 @@ class WriteFailureTest(unittest.TestCase):
         configwrite.init_project(self.target, "myapp", SeedChrome(profile="Work"))
         self.assertIn('seed = "chrome:Work"', self.target.read_text())
 
+    def test_a_seed_containing_a_quote_is_written_as_readable_toml(self):
+        """The template interpolates into a TOML document, so the value must be escaped.
+
+        `chrome:<Profile Name>` accepts any Chrome profile name — only `/`, `~` and path
+        components are refused — so a quote reaches here. Interpolated into a hand-written
+        `seed = "{seed}"` it produced `seed = "chrome:My"Work"`: `crom init` exited 0
+        reporting success, and every later command in that directory died on invalid
+        TOML, including the ones that could have repaired it. The assertion is that the
+        file parses back to the value we put in, not that it has some particular spelling
+        — escaping is tomlkit's business, and pinning its output would be a second copy
+        of a rule it already owns.
+        """
+        seed = SeedChrome(profile='My"Work')
+        configwrite.init_project(self.target, "myapp", seed)
+
+        # Read back through crom's own parser, which is the property that actually
+        # matters: the config crom writes is one crom can load on the next command.
+        scope = config.parse(self.target.read_text(), self.target)
+        self.assertEqual(scope.default_seed, seed)
+
     def test_init_project_still_reports_an_existing_config_as_a_conflict(self):
         """`Conflict` is a `CromError`, so the translation must pass it through with its
         own meaning and its own exit code rather than flattening it."""
