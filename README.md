@@ -46,23 +46,27 @@ names in the `myapp` namespace, so `crom up dev` means `myapp/dev`. Other projec
 other ports. And once crom has read this config, `myapp/dev` is addressable from
 anywhere on the machine.
 
-`crom init` writes a commented skeleton with a `default` profile. Add more by hand, or
-with `crom add`, which appends to the same file and leaves your comments alone:
+`crom init` writes a commented skeleton with a `default` profile, and `--seed` decides
+what goes into its `[defaults].seed`. Add more profiles by hand, or with `crom add`,
+which appends to the same file and leaves your comments alone:
 
 ```toml
 namespace = "myapp"
 
 [defaults]
+seed = "chrome"
 flags = ["--window-size=1280,900"]
 
 [profiles.default]
-seed = "fresh"
 flags = []
 
 [profiles.ci]
-seed = "fresh"
 flags = ["--headless=new"]
 ```
+
+Neither profile declares a `seed`, so both inherit `[defaults].seed` — a copy of your
+real Chrome profile. `crom init --seed fresh` writes an empty one there instead, and
+`crom add ci --seed fresh` overrides it for a single profile.
 
 ### Config reference
 
@@ -76,7 +80,7 @@ file is always the `user` namespace and must not declare one.
 | `state_dir` | top level | Where profile directories go, relative to the config file. Defaults to `~/.local/state/crom/profiles`. Set it to `.crom/profiles` to keep a project's browser data inside the repo (and gitignore it). |
 | `flags` | `[defaults]`, `[profiles.X]` | Extra Chrome switches. Namespace defaults come first, then the profile's own. |
 | `env` | `[defaults]`, `[profiles.X]` | Environment variables for the Chrome process. |
-| `seed` | `[defaults]`, `[profiles.X]` | Where a new profile's data comes from: `fresh`, `chrome`, `chrome:<Profile Name>`, or a path to an existing user-data-dir. Defaults to `fresh`. |
+| `seed` | `[defaults]`, `[profiles.X]` | Where a new profile's data comes from: `fresh`, `chrome`, `chrome:<Profile Name>`, or a path to an existing user-data-dir. A profile with no `seed` key inherits `[defaults].seed`, which is `chrome` unless the config says otherwise. |
 | `port` | `[profiles.X]` | Pin the CDP port. Leave it out and crom assigns a free one and remembers it. |
 
 Flags and env values can interpolate `${CROM_PROFILE_DIR}`, `${CROM_CONFIG_DIR}`,
@@ -144,18 +148,18 @@ or namespace, `4` a port or declaration conflict.
 ## Commands
 
 ```
-crom                    launch the default profile
-crom up [REF]           launch, or report the running browser
-crom down [REF]         stop it
-crom list [--all]       profiles addressable from here; --all covers every namespace
-crom add NAME           declare a profile in the config governing this directory
-crom rm REF             undeclare it, release its port, delete its data
-crom init [NAMESPACE]   write a .crom.toml here
-crom config [REF]       which config is in effect, and the exact Chrome command line
-crom port [REF]         print the port
-crom env [REF]          print shell exports
-crom mcp [REF]          write .mcp.json
-crom forget NAMESPACE   drop a namespace whose config is gone
+crom                          launch the default profile
+crom up [REF]                 launch, or report the running browser
+crom down [REF]               stop it
+crom list [--all]             profiles addressable from here; --all covers every namespace
+crom add NAME [--seed SEED]   declare a profile in the config governing this directory
+crom rm REF                   stop it if running, undeclare it, release its port, delete its data
+crom init [NS] [--seed SEED]  write a .crom.toml here
+crom config [REF]             which config is in effect, and the exact Chrome command line
+crom port [REF]               print the port
+crom env [REF]                print shell exports
+crom mcp [REF]                write .mcp.json
+crom forget NAMESPACE         drop a namespace whose config is gone
 ```
 
 `REF` is `name` (resolved in the ambient namespace) or `namespace/name`. It defaults to
@@ -186,10 +190,14 @@ no pidfile to go stale.
 
 ## A note on seeds
 
-Copying your real Chrome profile is expensive: a working profile runs to hundreds of
-megabytes and carries every cookie you have. That is why `seed = "fresh"` is the default
-for project profiles and `chrome` is opt-in. The seed applies once, when the directory is
-created; after that the profile owns its own state and crom never overwrites it.
+A new profile is a copy of your real Chrome profile by default, because a browser with
+no logins and no extensions cannot do the work crom exists for — you would spend the
+first ten minutes of every new profile signing back into everything. An empty one is a
+word away: `--seed fresh` on `crom init` or `crom add`.
+
+The copy is not free. A working Chrome profile runs to a few hundred megabytes, and
+that gets copied once per profile, when crom first creates its directory. After that
+the profile owns its own state and crom never overwrites it.
 
 ## Where things live
 

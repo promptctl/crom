@@ -135,8 +135,17 @@ def spec_for(ref: ProfileRef, scope: Scope) -> ProfileSpec:
     if spec is None:
         declared = ", ".join(sorted(scope.profiles)) or "(none)"
         where = scope.source or "your user config"
+        # Names the way out, not just the fact. This is the error a bare `crom up` in a
+        # project whose only profile was removed produces, and "not declared" alone left
+        # the reader to work out both that `crom add` is the repair and that their
+        # personal profiles are still reachable from here under an explicit namespace.
+        hint = f"Declare it with `crom add {ref.name}`"
+        if not scope.is_user:
+            hint += f", or name a personal profile explicitly: `crom up {USER_NAMESPACE}/default`"
         raise NotFound(
-            f"profile '{ref}' is not declared in {where}. Declared there: {declared}"
+            f"profile '{ref}' is not declared in {where}.\n"
+            f"Declared there: {declared}\n"
+            f"{hint}."
         )
     return spec
 
