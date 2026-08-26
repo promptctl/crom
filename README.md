@@ -199,6 +199,16 @@ The copy is not free. A working Chrome profile runs to a few hundred megabytes, 
 that gets copied once per profile, when crom first creates its directory. After that
 the profile owns its own state and crom never overwrites it.
 
+A hand-written config is the one place that default can surprise you. A profile that
+declares no `seed`, in a file that declares no `[defaults].seed` either, gets a copy of
+your real Chrome profile — every cookie and session — the next time `crom up` creates
+its directory, and if `state_dir` points at `.crom/profiles` that copy lands inside your
+working tree. Configs crom wrote itself are never in that position, because `crom init`
+always records a `[defaults].seed` for the profiles beneath it to inherit. Before it
+starts copying, `crom up` prints
+`Creating <ref> from seed 'chrome' …` on stderr, so the copy is announced rather than
+silent — and `seed = "fresh"`, on the profile or in `[defaults]`, gets you an empty one.
+
 ## Where things live
 
 ```

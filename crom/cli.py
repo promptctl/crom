@@ -467,6 +467,17 @@ def rm_cmd(session: _Session, ref: str, yes: bool, keep_data: bool):
     # nothing to stop, so the same operation runs every time and only its result varies.
     with seed.profile_lock(profile):
         stopped = chrome.kill(profile)
+        # Data first, while the profile is still fully declared. `rm` resolves by name
+        # before it does anything, so a delete that failed partway after the declaration
+        # was gone left a half-removed directory belonging to a profile no command could
+        # name — unreachable by the `crom rm` that would have retried it. Deleting first
+        # inverts that: a failure here leaves everything nameable and the command
+        # repeatable, and a failure *after* a successful delete leaves a declared profile
+        # whose directory the next `crom up` simply re-seeds. Same principle the comment
+        # below applies to the other two steps — between interruptible steps, take the
+        # one whose failure is recoverable.
+        if not keep_data and profile.profile_dir.exists():
+            _delete_profile_data(profile)
         # Release the reservation before removing the declaration, not after. Both
         # orderings can be interrupted, but they strand different things: undeclaring
         # first leaves a port held by a profile no longer nameable, so no command can
@@ -475,8 +486,6 @@ def rm_cmd(session: _Session, ref: str, yes: bool, keep_data: bool):
         # interruptible steps, take the one whose failure is recoverable.
         registry.forget(profile.ref)
         configwrite.remove_profile(scope.source or user_config_file(), profile.ref.name)
-        if not keep_data and profile.profile_dir.exists():
-            shutil.rmtree(profile.profile_dir)
     # The stop is reported rather than performed quietly: killing someone's browser is
     # the most surprising thing this command does, and `--yes` skips the prompt that
     # would otherwise have been its only mention. [LAW:no-silent-failure]
@@ -516,12 +525,22 @@ def init_cmd(namespace: str | None, seed_text: str | None):
     # module, and a local of that name shadows it for the rest of the function — working
     # today only because `init_cmd` happens not to need it, and failing with an
     # AttributeError the first time someone adds a line that does.
-    chosen_seed = DEFAULT_SEED if seed_text is None else parse_seed(seed_text, "[defaults]", target, here)
+    #
+    # Anchored on `target.parent`, not on `here`: a relative seed path is parsed against
+    # the config's own directory everywhere else, and `init_project` renders it back with
+    # `render_seed(seed, path.parent)`. Those agree today only because
+    # `PROJECT_CONFIG_CANDIDATES[0]` is the bare `.crom.toml`, so its parent *is* `here`.
+    # Under the `.crom/config.toml` candidate they diverge, and `--seed ./fixtures` would
+    # parse to `here/fixtures`, fail `relative_to(here/'.crom')`, and be written as this
+    # machine's absolute path into a file meant to be committed — the exact outcome
+    # `render_seed`'s docstring exists to prevent. [LAW:one-source-of-truth]
+    base = target.parent
+    chosen_seed = DEFAULT_SEED if seed_text is None else parse_seed(seed_text, "[defaults]", target, base)
     configwrite.init_project(target, namespace, chosen_seed)
     click.echo(f"Wrote {target} (namespace '{namespace}')")
     click.echo(
         f"  profiles here start from seed "
-        f"'{configwrite.render_seed(chosen_seed, here)}' — change it in [defaults]"
+        f"'{configwrite.render_seed(chosen_seed, base)}' — change it in [defaults]"
     )
     click.echo(f"Run: crom up  # brings up {namespace}/default")
 
@@ -664,6 +683,27 @@ def _slug(text: str) -> str:
     """
     slug = re.sub(r"[^a-z0-9._-]+", "-", text.lower()).strip("._-")
     return slug[:NAME_LIMIT].strip("._-") or "project"
+
+
+def _delete_profile_data(profile: ResolvedProfile) -> None:
+    """Remove a profile's user-data-dir, as a `CromError` rather than a traceback.
+
+    `shutil.rmtree` raises a bare `OSError` — `FileNotFoundError` for an entry that
+    vanishes mid-walk, `ENOTEMPTY` for one that appears — and `CromGroup.invoke` catches
+    only `CromError`, so those escaped the CLI's exit-code contract entirely. That became
+    reachable when `rm` started stopping the browser itself instead of refusing: a Chrome
+    helper outliving `chrome.kill` can still be writing here for a moment.
+
+    The message names the retry because the caller ordered the delete first precisely so
+    that one exists — the profile is still declared when this raises.
+    """
+    try:
+        shutil.rmtree(profile.profile_dir)
+    except OSError as e:
+        raise CromError(
+            f"could not delete {profile.profile_dir}: {e}\n"
+            f"'{profile.ref}' is still declared — run `crom rm {profile.ref}` again."
+        ) from e
 
 
 def _human_size(directory: Path) -> str:

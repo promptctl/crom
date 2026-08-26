@@ -54,7 +54,7 @@ namespace = "{namespace}"
 # ${{CROM_PROFILE_DIR}}, ${{CROM_CONFIG_DIR}}, ${{CROM_PORT}}, ${{CROM_NAMESPACE}},
 # ${{CROM_PROFILE}}.
 [defaults]
-seed = "{seed}"
+seed = {seed}
 flags = []
 
 # `crom up` with no argument brings this one up. Add more with `crom add <name>`.
@@ -213,11 +213,25 @@ def init_project(path: Path, namespace: str, seed: Seed) -> None:
         with os.fdopen(fd, "w") as handle:
             handle.write(
                 PROJECT_CONFIG_TEMPLATE.format(
+                    # `namespace` needs no quoting: `validate_name` is its checkpoint and
+                    # admits only `[a-z0-9._-]`, so a `ProfileRef`-legal namespace cannot
+                    # carry a quote or a newline. [LAW:parse-dont-validate]
                     namespace=namespace,
-                    # Rendered through the same function that writes a seed into any
-                    # other stanza, so the template's spelling is derived from the value
-                    # rather than being a second literal that could drift from it.
-                    seed=render_seed(seed, path.parent),
+                    # A seed carries no such stamp — `chrome:<Profile Name>` takes any
+                    # Chrome profile name (only `/`, `~` and path components are refused)
+                    # and `SeedPath` renders an arbitrary filesystem path, so both can
+                    # contain a `"`. Interpolating one into `seed = "{seed}"` produced
+                    # `seed = "chrome:My"Work"`: `crom init` reported success and exit 0,
+                    # and every command afterwards died on `invalid TOML` — including the
+                    # `crom init` and `crom rm` that might have repaired it.
+                    #
+                    # `tomlkit.item(...).as_string()` emits the value already quoted and
+                    # escaped, which is why the template now reads `seed = {seed}`. This
+                    # is the same library `_declare` writes every other stanza through;
+                    # `init_project` was the one path hand-rolling the serialization, and
+                    # `crom add --seed 'chrome:My"Work'` was correct throughout.
+                    # [LAW:single-enforcer] one thing knows how to spell a TOML string.
+                    seed=tomlkit.item(render_seed(seed, path.parent)).as_string(),
                 )
             )
 

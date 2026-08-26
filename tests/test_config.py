@@ -7,7 +7,7 @@ from unittest import mock
 
 from crom import config
 from crom.paths import default_profiles_root
-from crom.model import DEFAULT_SEED, Conflict, CromError, SeedChrome, SeedFresh, SeedPath
+from crom.model import DEFAULT_SEED, Conflict, CromError, Scope, SeedChrome, SeedFresh, SeedPath
 
 SOURCE = Path("/proj/.crom.toml")
 
@@ -192,6 +192,22 @@ class SeedTest(unittest.TestCase):
         [LAW:one-source-of-truth]
         """
         self.assertEqual(parse(MINIMAL).default_seed, DEFAULT_SEED)
+
+    def test_a_scope_built_without_a_seed_agrees_with_the_parsed_default(self):
+        """`Scope`'s dataclass default is a sixth answer to the same question.
+
+        `load_user_scope` builds a fileless `Scope` without `default_seed` on a machine
+        with no user config, so a literal here made that scope report `fresh` while every
+        file-backed scope reported `chrome` — the divergent second map `DEFAULT_SEED`
+        exists to delete, sitting eighty lines below its own comment saying so.
+        """
+        bare = Scope(
+            namespace="user",
+            source=None,
+            profiles_root=Path("/tmp/profiles"),
+            chrome_binary=Path("/chrome"),
+        )
+        self.assertEqual(bare.default_seed, parse(MINIMAL).default_seed)
 
 
 class DiscoveryTest(unittest.TestCase):

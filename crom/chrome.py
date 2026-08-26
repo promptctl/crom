@@ -201,19 +201,63 @@ def launch(profile: ResolvedProfile) -> tuple[int, ...]:
     )
 
 
-def kill(profile: ResolvedProfile) -> tuple[int, ...]:
-    """Terminate every main Chrome process bound to this profile; return what we killed."""
-    pids = find_pids(profile)
-    for pid in pids:
-        _signal(pid, signal.SIGTERM)
-
-    # Give Chrome a moment to shut down gracefully, then SIGKILL stragglers.
+def _await_exit(profile: ResolvedProfile) -> bool:
+    """Wait up to the shutdown timeout for no main Chrome to hold this profile."""
     deadline = time.time() + SHUTDOWN_TIMEOUT_SECONDS
     while time.time() < deadline and find_pids(profile):
         time.sleep(0.1)
-    for pid in find_pids(profile):
-        _signal(pid, signal.SIGKILL)
-    return pids
+    return not find_pids(profile)
+
+
+def kill(profile: ResolvedProfile) -> tuple[int, ...]:
+    """Stop every main Chrome bound to this profile, returning only once they are gone.
+
+    The postcondition is the whole point. `rm` deletes the profile's user-data-dir the
+    instant this returns, and "the signals were sent" is not a strong enough promise to
+    delete a directory on: `os.kill` returns before the kernel has finished tearing the
+    process down, and this used to return inside that window. `shutil.rmtree` walking a
+    directory Chrome is still writing raises `FileNotFoundError` when an entry vanishes
+    mid-walk or `ENOTEMPTY` when one appears — neither a `CromError`, so it escaped the
+    CLI's exit-code contract as a traceback, after `rm` had already undeclared the
+    profile. [LAW:no-ambient-temporal-coupling] a transition `rm` depends on is owned
+    here rather than assumed to have completed by the time the caller looks.
+
+    Escalation is a table walked the same way each round — signal whatever is still
+    alive, then wait for it — rather than a graceful path and a separate forced one.
+    [LAW:dataflow-not-control-flow] A profile that was never running finds nothing to
+    signal, waits on nothing, and returns `()` on the first round, which is what makes
+    `rm` and `down` safe to call unconditionally.
+
+    Residual, and deliberately not chased: `find_pids` matches only the main browser and
+    skips Chrome's `--type=` helpers, so a crashpad handler can briefly outlive this.
+    Extending the wait to helpers would widen `scan`'s contract for a window that closes
+    on its own; `cli._delete_profile_data` covers what remains by reporting a failed
+    delete as a retryable `CromError` rather than a traceback.
+    """
+    pids = find_pids(profile)
+    survivors = pids
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        for pid in survivors:
+            _signal(pid, sig)
+        if _await_exit(profile):
+            return pids
+        # Re-read only between rounds. Rescanning before the first round would spend a
+        # second `ps` to re-learn what `pids` already holds, and open a window in which a
+        # process that appeared meanwhile gets signalled but is not in the returned set.
+        survivors = find_pids(profile)
+
+    # [LAW:no-silent-failure] Returning here would report a running browser as stopped —
+    # to `down`, which would print "Stopped", and to `rm`, which would go on to delete a
+    # live browser's directory.
+    #
+    # The message says nothing about deleting: `rm` aborting before its delete is `rm`'s
+    # business, and a module that names one caller's next step is coupled to that caller.
+    # [LAW:composability]
+    remaining = ", ".join(map(str, find_pids(profile)))
+    raise CromError(
+        f"could not stop '{profile.ref}': pid(s) {remaining} survived SIGKILL after "
+        f"{SHUTDOWN_TIMEOUT_SECONDS:.0f}s.\nInspect it with: ps -p {remaining}"
+    )
 
 
 def _signal(pid: int, sig: int) -> None:

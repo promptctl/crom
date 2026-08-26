@@ -583,6 +583,29 @@ class CliTest(unittest.TestCase):
         size = cli._human_size(directory)
         self.assertEqual(size, "2KB")  # 2048 bytes, and neither link counted
 
+    def test_a_failed_delete_leaves_the_profile_declared_and_retryable(self):
+        """`rm` deletes data *before* it undeclares, so a failure is recoverable.
+
+        `rm` stops the browser itself now, and a Chrome helper can outlive
+        `chrome.kill` — so `rmtree` can raise on a directory still being written. When
+        the delete ran last, that failure left a half-removed directory belonging to a
+        profile no command could name: `rm` resolves by name first, so the retry it
+        suggests was impossible. It also escaped as a traceback, since a bare `OSError`
+        is not a `CromError`.
+        """
+        self.crom("init")
+        self.crom("add", "ci")
+        before = json.loads(self.crom("config", "ci", "--json"))["resolved"]
+        Path(before["profile_dir"]).mkdir(parents=True)
+
+        with mock.patch("crom.cli.shutil.rmtree", side_effect=OSError(66, "Directory not empty")):
+            output = self.crom("rm", "ci", "--yes", expect=1)
+
+        self.assertIn("still declared", output)
+        self.assertIn("[profiles.ci]", (self.project / ".crom.toml").read_text())
+        # Still nameable, on its original port — which is what makes the retry real.
+        self.assertEqual(json.loads(self.crom("config", "ci", "--json"))["resolved"], before)
+
     def test_help_sections_cover_every_command(self):
         """Every command appears in exactly one curated `crom --help` section.
 
