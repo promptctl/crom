@@ -41,15 +41,24 @@ PROJECT_CONFIG_TEMPLATE = """\
 
 namespace = "{namespace}"
 
-# Flags every profile in this namespace gets, appended after crom's launch policy.
-# Available in flags and env values: ${{CROM_PROFILE_DIR}}, ${{CROM_CONFIG_DIR}},
-# ${{CROM_PORT}}, ${{CROM_NAMESPACE}}, ${{CROM_PROFILE}}.
+# What every profile below inherits unless it says otherwise.
+#
+# `seed` is where a profile's data comes from the first time crom creates it:
+#   chrome                  a copy of your real Chrome profile — your logins, your
+#                           extensions, ready to use
+#   chrome:<Profile Name>   a copy of one named profile inside your Chrome
+#   fresh                   an empty profile; Chrome sets it up on first launch
+#   ./path/to/user-data-dir a copy of a directory you keep yourself
+#
+# Flags are appended after crom's launch policy. Available in flags and env values:
+# ${{CROM_PROFILE_DIR}}, ${{CROM_CONFIG_DIR}}, ${{CROM_PORT}}, ${{CROM_NAMESPACE}},
+# ${{CROM_PROFILE}}.
 [defaults]
+seed = {seed}
 flags = []
 
+# `crom up` with no argument brings this one up. Add more with `crom add <name>`.
 [profiles.default]
-# fresh | chrome | chrome:<Profile Name> | ./path/to/a/user-data-dir
-seed = "fresh"
 flags = []
 """
 
@@ -171,8 +180,14 @@ def _save(path: Path, doc: tomlkit.TOMLDocument) -> None:
         os.replace(tmp, path)
 
 
-def init_project(path: Path, namespace: str) -> None:
+def init_project(path: Path, namespace: str, seed: Seed) -> None:
     """Write a new project config, or refuse if one is already there.
+
+    `seed` is written into `[defaults]` rather than defaulted in code, so the project's
+    answer to "where does a new profile's data come from" is visible in the file the
+    team commits. It arrives already parsed — `cli.init_cmd` runs `--seed` through
+    `config.parse_seed`, the same checkpoint a value read back from this file goes
+    through. [LAW:parse-dont-validate] there is no second spelling of the vocabulary here.
 
     The refusal is the kernel's, not a check of ours: `O_CREAT | O_EXCL` creates the
     file only if it does not exist, atomically. An `exists()` test followed by a write
@@ -196,7 +211,29 @@ def init_project(path: Path, namespace: str) -> None:
         except FileExistsError as e:
             raise Conflict(f"{path} already exists") from e
         with os.fdopen(fd, "w") as handle:
-            handle.write(PROJECT_CONFIG_TEMPLATE.format(namespace=namespace))
+            handle.write(
+                PROJECT_CONFIG_TEMPLATE.format(
+                    # `namespace` needs no quoting: `validate_name` is its checkpoint and
+                    # admits only `[a-z0-9._-]`, so a `ProfileRef`-legal namespace cannot
+                    # carry a quote or a newline. [LAW:parse-dont-validate]
+                    namespace=namespace,
+                    # A seed carries no such stamp — `chrome:<Profile Name>` takes any
+                    # Chrome profile name (only `/`, `~` and path components are refused)
+                    # and `SeedPath` renders an arbitrary filesystem path, so both can
+                    # contain a `"`. Interpolating one into `seed = "{seed}"` produced
+                    # `seed = "chrome:My"Work"`: `crom init` reported success and exit 0,
+                    # and every command afterwards died on `invalid TOML` — including the
+                    # `crom init` and `crom rm` that might have repaired it.
+                    #
+                    # `tomlkit.item(...).as_string()` emits the value already quoted and
+                    # escaped, which is why the template now reads `seed = {seed}`. This
+                    # is the same library `_declare` writes every other stanza through;
+                    # `init_project` was the one path hand-rolling the serialization, and
+                    # `crom add --seed 'chrome:My"Work'` was correct throughout.
+                    # [LAW:single-enforcer] one thing knows how to spell a TOML string.
+                    seed=tomlkit.item(render_seed(seed, path.parent)).as_string(),
+                )
+            )
 
 
 def declares(path: Path, name: str) -> bool:
@@ -246,13 +283,24 @@ def _declare(path: Path, spec: ProfileSpec, header: str) -> bool:
         if spec.name in profiles:
             return False
 
+        # A stanza records what the user *stated*, and an unstated seed is a real value in
+        # this vocabulary rather than a missing one: TOML spells "inherit `[defaults]`" as
+        # the absence of the key, and `resolve_spec` already reads that absence as
+        # `scope.default_seed`. Writing a seed nobody chose would freeze one day's default
+        # into the file and leave `[defaults].seed` silently powerless over every profile
+        # `crom add` ever created — the config format promising an inheritance the writer
+        # quietly overrode. [LAW:dataflow-not-control-flow] every key is rendered the same
+        # way and its value decides whether it appears.
+        stated = {
+            "seed": None if spec.seed is None else render_seed(spec.seed, path.parent),
+            "flags": list(spec.flags),
+            "port": spec.port,
+            "env": dict(spec.env) or None,
+        }
         table = tomlkit.table()
-        table["seed"] = render_seed(spec.seed or SeedFresh(), path.parent)
-        table["flags"] = list(spec.flags)
-        if spec.port is not None:
-            table["port"] = spec.port
-        if spec.env:
-            table["env"] = dict(spec.env)
+        for key, value in stated.items():
+            if value is not None:
+                table[key] = value
         profiles[spec.name] = table
         _save(path, doc)
         return True

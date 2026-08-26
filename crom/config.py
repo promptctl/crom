@@ -13,6 +13,7 @@ from pathlib import Path
 
 from .browser import find_chrome
 from .model import (
+    DEFAULT_SEED,
     MAX_PORT,
     MIN_PORT,
     USER_NAMESPACE,
@@ -323,7 +324,7 @@ def parse(text: str, source: Path, *, namespace: str | None = None) -> Scope:
     default_seed = (
         parse_seed(defaults["seed"], "[defaults]", source, config_dir)
         if "seed" in defaults
-        else SeedFresh()
+        else DEFAULT_SEED
     )
 
     raw_profiles = data.get("profiles", {})
