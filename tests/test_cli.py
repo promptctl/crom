@@ -469,13 +469,26 @@ class CliTest(unittest.TestCase):
         self.crom("rm", "ci", "--keep-data")
         self.assertTrue(profile_dir.exists())
 
-    def test_rm_refuses_while_the_profile_is_running(self):
+    def test_rm_stops_a_running_profile_rather_than_refusing(self):
+        """`rm` owns the stop; it does not send the user away to run `crom down` first.
+
+        The old contract exported a state transition `rm` needs — and can reach itself,
+        under the lock it already takes — as a two-command ritual the caller had to
+        perform. [LAW:no-ambient-temporal-coupling] The stop is reported, because `--yes`
+        skips the prompt that would otherwise be its only mention.
+        """
         self.crom("init")
         self.crom("add", "ci")
         profile_dir = json.loads(self.crom("config", "ci", "--json"))["resolved"]["profile_dir"]
-        with mock.patch("crom.chrome.scan", return_value={profile_dir: (999,)}):
-            self.crom("rm", "ci", "--yes", expect=4)
-        self.assertIn("[profiles.ci]", (self.project / ".crom.toml").read_text())
+
+        with (
+            mock.patch("crom.chrome.scan", return_value={profile_dir: (999,)}),
+            mock.patch("crom.cli.chrome.kill", return_value=(999,)),
+        ):
+            output = self.crom("rm", "ci", "--yes")
+
+        self.assertIn("stopped pid 999", output)
+        self.assertNotIn("[profiles.ci]", (self.project / ".crom.toml").read_text())
 
     def test_down_stops_the_browser_under_the_profile_lock(self):
         """`up` and `rm` hold `profile_lock` across their check-then-act; `down` did not.
@@ -512,31 +525,45 @@ class CliTest(unittest.TestCase):
 
         self.assertEqual(events, ["lock", "kill", "unlock"])
 
-    def test_rm_re_reads_liveness_under_the_lock(self):
-        """A `crom up` that starts in the window must not have its browser deleted.
+    def test_rm_stops_and_deletes_inside_one_critical_section(self):
+        """A `crom up` racing this command must land wholly before it or wholly after.
 
-        `up_cmd` holds `profile_lock` across its own check-and-launch, so the launch
-        either precedes this command's lock or follows its delete. What makes that
-        useful is re-reading liveness *inside* the lock: the check before the
-        confirmation prompt cannot speak for the state after it, since the prompt is
-        deliberately not held under the lock.
+        `up_cmd` holds `profile_lock` across its own seed-check-and-launch, so the two
+        commands interleave only if `rm` performs any of its destruction outside the
+        lock. Deleting a user-data-dir out from under a browser that is mid-first-run
+        leaves a process crom can no longer find or stop, writing into a directory that
+        no longer exists.
 
-        The concurrent launch is modelled by answering "not running" once and "running"
-        thereafter — exactly what `rm` observes when a browser starts between the two
-        reads. Without the second read this deletes a live profile and reports success.
+        The liveness read that composes the confirmation prompt is deliberately *not*
+        part of that guarantee: the prompt is held open for a human, so that read is
+        stale by construction. Which is why the kill inside the lock is unconditional
+        rather than guarded by it — a browser started while the question was on screen
+        must not survive the answer. The claim under test is therefore ordering, not
+        merely that the steps happen.
         """
         self.crom("init")
         self.crom("add", "ci")
         profile_dir = Path(json.loads(self.crom("config", "ci", "--json"))["resolved"]["profile_dir"])
         profile_dir.mkdir(parents=True)
 
-        answers = iter([False, True])
+        events: list[str] = []
+        real_lock = cli.seed.profile_lock
 
-        with mock.patch("crom.cli.chrome.is_running", lambda _profile: next(answers)):
-            self.crom("rm", "ci", "--yes", expect=4)
+        @contextlib.contextmanager
+        def tracking_lock(profile):
+            events.append("lock")
+            with real_lock(profile):
+                yield
+            events.append("unlock")
 
-        self.assertTrue(profile_dir.exists())
-        self.assertIn("[profiles.ci]", (self.project / ".crom.toml").read_text())
+        with (
+            mock.patch("crom.cli.seed.profile_lock", tracking_lock),
+            mock.patch("crom.cli.chrome.kill", lambda _p: events.append("kill") or ()),
+            mock.patch("crom.cli.shutil.rmtree", lambda _p: events.append("rmtree")),
+        ):
+            self.crom("rm", "ci", "--yes")
+
+        self.assertEqual(events, ["lock", "kill", "rmtree", "unlock"])
 
     def test_the_size_prompt_counts_only_what_the_delete_reclaims(self):
         """`_human_size` measures what removing the directory frees, so a symlink's
@@ -556,11 +583,68 @@ class CliTest(unittest.TestCase):
         size = cli._human_size(directory)
         self.assertEqual(size, "2KB")  # 2048 bytes, and neither link counted
 
+    def test_a_failed_delete_leaves_the_profile_declared_and_retryable(self):
+        """`rm` deletes data *before* it undeclares, so a failure is recoverable.
+
+        `rm` stops the browser itself now, and a Chrome helper can outlive
+        `chrome.kill` — so `rmtree` can raise on a directory still being written. When
+        the delete ran last, that failure left a half-removed directory belonging to a
+        profile no command could name: `rm` resolves by name first, so the retry it
+        suggests was impossible. It also escaped as a traceback, since a bare `OSError`
+        is not a `CromError`.
+        """
+        self.crom("init")
+        self.crom("add", "ci")
+        before = json.loads(self.crom("config", "ci", "--json"))["resolved"]
+        Path(before["profile_dir"]).mkdir(parents=True)
+
+        with mock.patch("crom.cli.shutil.rmtree", side_effect=OSError(66, "Directory not empty")):
+            output = self.crom("rm", "ci", "--yes", expect=1)
+
+        self.assertIn("still declared", output)
+        self.assertIn("[profiles.ci]", (self.project / ".crom.toml").read_text())
+        # Still nameable, on its original port — which is what makes the retry real.
+        self.assertEqual(json.loads(self.crom("config", "ci", "--json"))["resolved"], before)
+
+    def test_help_sections_cover_every_command(self):
+        """Every command appears in exactly one curated `crom --help` section.
+
+        `format_commands` renders anything ungrouped under an "Other" heading so a new
+        command can never silently vanish from the only place users look for it. That
+        fallback is the safety net; this is the plan, and a failure here means a command
+        was added without deciding which of crom's three jobs it belongs to.
+        """
+        listed = [name for _, names in cli._COMMAND_SECTIONS for name in names]
+        self.assertEqual(sorted(listed), sorted(set(listed)), "a command is listed twice")
+        self.assertEqual(set(cli.main.commands) - set(listed), set(), "ungrouped command(s)")
+        self.assertEqual(set(listed) - set(cli.main.commands), set(), "section names a dead command")
+
     # --- seeding --------------------------------------------------------------------
 
-    def test_project_profiles_default_to_a_fresh_seed(self):
+    def test_a_project_profile_starts_from_the_same_seed_as_a_personal_one(self):
+        """The regression a user actually hit: `crom init` then `crom up` opened a Chrome
+        with none of their extensions or logins, while a bare `crom up` anywhere else
+        opened one that had them — because the project template wrote `fresh` and
+        `_bootstrap_user_config` wrote `SeedChrome()`. Asserting the two agree is what
+        keeps `default` meaning one thing. [LAW:one-source-of-truth]
+        """
         self.crom("init")
-        self.assertIn('seed = "fresh"', (self.project / ".crom.toml").read_text())
+        project = json.loads(self.crom("config", "default", "--json"))["resolved"]["seed"]
+        personal = json.loads(self.crom("config", "user/default", "--json"))["resolved"]["seed"]
+        self.assertEqual(project, "chrome")
+        self.assertEqual(project, personal)
+
+    def test_an_added_profile_inherits_the_projects_seed(self):
+        """`crom add` with no `--seed` writes no `seed` key, so `[defaults].seed`
+        governs. The old `--seed` default of `"fresh"` stamped an explicit seed nobody
+        asked for into every added profile, which left `[defaults].seed` applying to the
+        profile `crom init` wrote and to no profile added after it."""
+        self.crom("init", "--seed", "chrome:Work")
+        self.crom("add", "ci")
+
+        self.assertNotIn("seed", (self.project / ".crom.toml").read_text().split("[profiles.ci]")[1])
+        resolved = json.loads(self.crom("config", "ci", "--json"))["resolved"]
+        self.assertEqual(resolved["seed"], "chrome:Work")
 
     def test_state_dir_can_be_relocated_into_the_project(self):
         self.crom("init")
