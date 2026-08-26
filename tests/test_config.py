@@ -7,7 +7,7 @@ from unittest import mock
 
 from crom import config
 from crom.paths import default_profiles_root
-from crom.model import Conflict, CromError, SeedChrome, SeedFresh, SeedPath
+from crom.model import DEFAULT_SEED, Conflict, CromError, SeedChrome, SeedFresh, SeedPath
 
 SOURCE = Path("/proj/.crom.toml")
 
@@ -183,8 +183,15 @@ class SeedTest(unittest.TestCase):
         self.assertIsNone(scope.profiles["dev"].seed)
         self.assertEqual(scope.default_seed, SeedChrome())
 
-    def test_the_schema_default_is_fresh(self):
-        self.assertEqual(parse(MINIMAL).default_seed, SeedFresh())
+    def test_an_unstated_schema_default_is_the_one_shared_default_seed(self):
+        """Asserted against the constant, not against today's value of it.
+
+        Spelling `SeedChrome()` here would make this a fourth independent answer to
+        "where does a profile's data come from" — the same duplication that let the
+        project template and the user-config bootstrap drift apart in the first place.
+        [LAW:one-source-of-truth]
+        """
+        self.assertEqual(parse(MINIMAL).default_seed, DEFAULT_SEED)
 
 
 class DiscoveryTest(unittest.TestCase):

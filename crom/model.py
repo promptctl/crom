@@ -95,6 +95,23 @@ class SeedPath:
 Seed = SeedFresh | SeedChrome | SeedPath
 
 
+# Where a profile's data comes from when nothing says otherwise.
+#
+# [LAW:one-source-of-truth] This question used to be answered in five places, and two of
+# the answers disagreed: `cli._bootstrap_user_config` seeded `user/default` from the real
+# browser while `configwrite.PROJECT_CONFIG_TEMPLATE` wrote `fresh`. So the word `default`
+# meant "your Chrome, with your logins" outside a project and "an empty browser" inside
+# one, with nothing in any output marking the difference — someone who ran `crom init` and
+# then `crom up` got a browser they could not use and no way to see why it differed from
+# the one they had yesterday. Both templates now render *this*, so they cannot drift again.
+#
+# `chrome` is the answer because a profile with no cookies and no extensions cannot do the
+# job crom exists for: driving a real session. It costs one copy of one Chrome profile
+# directory at create time — `crom init --seed fresh` and `crom add --seed fresh` decline
+# it, and `crom up` names the seed on stderr before it starts copying.
+DEFAULT_SEED: Seed = SeedChrome()
+
+
 # --- declarations ------------------------------------------------------------------
 
 
