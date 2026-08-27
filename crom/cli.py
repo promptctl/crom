@@ -151,14 +151,17 @@ def _bootstrap_user_config() -> None:
     Written explicitly into the file rather than defaulted in code, so `user/default`
     cloning your real Chrome profile is a visible, editable decision and not folklore.
     """
-    # Loading the scope first is what makes the write below safe on a user config crom
-    # cannot parse. `configwrite._load` raises on such a file, and this function runs
-    # before every command — so an unreadable `~/.config/crom/config.toml` failed all of
-    # them, the ones that would have repaired it included. `load_user_scope` goes through
-    # `load_file`, which resets a config it cannot read, so by the time `ensure_profile`
-    # opens the file it is one crom can parse. [LAW:no-ambient-temporal-coupling] the
+    # Repairing first is what makes the write below safe on a user config crom cannot
+    # read. `configwrite._load` raises on such a file, and this function runs before every
+    # command — so an unreadable `~/.config/crom/config.toml` failed all of them, the ones
+    # that would have repaired it included. [LAW:no-ambient-temporal-coupling] the
     # ordering is the repair's, and stating it here is what keeps it from being luck.
-    load_user_scope()
+    #
+    # `repair_unreadable`, not `load_user_scope`: loading resolves `chrome_binary`, which
+    # would make `find_chrome()` a precondition of every command including `crom init` —
+    # the one `_Session` exists to keep working on a machine with no Chrome yet. Whether a
+    # file tokenizes as TOML is a question about bytes and asks nothing of the machine.
+    config.repair_unreadable(user_config_file(), namespace=USER_NAMESPACE)
     # The seed comes from `model.DEFAULT_SEED`, which the project template renders too.
     # The literal `SeedChrome()` that used to sit here was the half of the disagreement
     # that happened to be right. [LAW:one-source-of-truth]
@@ -310,11 +313,12 @@ def _scopes_to_list(session: _Session, everything: bool) -> tuple[list[Scope], l
     """The scopes `crom list` should report, plus the namespaces it could not load.
 
     A remembered namespace whose config file has been deleted or moved raises `NotFound`
-    from `scope_for` — and `crom forget` is the documented cleanup for exactly that. One
+    from `scope_for`, which drops crom's record of where it lives on the way past. One
     stale entry used to abort the entire listing, so the command that would have shown
     the user which namespace was broken was the one command that could not run. Each
     namespace is isolated and reported by name instead. [LAW:no-silent-failure] nothing
-    is skipped quietly: the failure is a row in the output, human and JSON alike.
+    is skipped quietly: the failure is a row in the output, human and JSON alike, and
+    `scope_for` narrates the drop on stderr with the file it could no longer find.
     """
     scopes = [session.scope]
     if not session.scope.is_user:

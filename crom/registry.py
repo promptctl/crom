@@ -204,29 +204,35 @@ def remember_namespace(namespace: str, source: Path, log=report.to_stderr) -> No
                     f"{source} cannot use it too — they would share profile directories "
                     f"and ports. Rename this project's `namespace`."
                 )
-            # Dropped inline rather than through `forget_namespace`: that call takes this
-            # same lock on a second file descriptor, which `flock` treats as a distinct
-            # holder — so the process would block forever waiting for itself.
-            released = _drop_namespace(data, namespace)
+            # Only the mapping goes; the reservations stay. See `forget_mapping`.
+            data["namespaces"].pop(namespace, None)
             log(
                 f"Namespace '{namespace}' was claimed by {recorded}, which is gone — "
-                f"released {released} port reservation(s) and gave the name to {source}."
+                f"gave the name to {source}."
             )
         data["namespaces"][namespace] = {"config": str(source)}
         _write(path, data)
 
 
-def _drop_namespace(data: dict, namespace: str) -> int:
-    """Remove a namespace and every port reserved under it from an open ledger; report
-    how many reservations went. The one spelling of what forgetting a namespace *is*,
-    shared by the command that does it deliberately and the takeover that does it as
-    cleanup. [LAW:one-source-of-truth]"""
-    prefix = f"{namespace}/"
-    released = [key for key in data["ports"] if key.startswith(prefix)]
-    for key in released:
-        del data["ports"][key]
-    data["namespaces"].pop(namespace, None)
-    return len(released)
+def forget_mapping(namespace: str) -> None:
+    """Drop crom's record of *where* a namespace lives, keeping its port reservations.
+
+    The lighter half of `forget_namespace`, and the only one crom performs on its own. A
+    config file that is not there right now is not proof the project is gone: an
+    unmounted volume, a network share, a `git checkout` mid-flight all look identical
+    from here. Releasing the reservations on that evidence would be irreversible — the
+    ports get handed to other profiles, and every checked-in `.mcp.json` and `CDP_URL`
+    pointing at the old numbers breaks with no way to recover them.
+
+    Dropping only the mapping costs nothing and heals itself: the moment the project is
+    reachable again, `_Session.scope` re-records it and every profile resolves to the
+    port it always had. Releasing ports stays where it belongs — behind `crom forget`,
+    which a person runs deliberately about a project they know is gone.
+    """
+    with _locked() as path:
+        data = _read(path)
+        data["namespaces"].pop(namespace, None)
+        _write(path, data)
 
 
 def forget_namespace(namespace: str) -> int:
@@ -245,11 +251,15 @@ def forget_namespace(namespace: str) -> int:
             f"cannot be forgotten — dropping it would release the ports they are using. "
             f"Remove individual profiles with `crom rm {USER_NAMESPACE}/<name>`."
         )
+    prefix = f"{namespace}/"
     with _locked() as path:
         data = _read(path)
-        released = _drop_namespace(data, namespace)
+        released = [key for key in data["ports"] if key.startswith(prefix)]
+        for key in released:
+            del data["ports"][key]
+        data["namespaces"].pop(namespace, None)
         _write(path, data)
-    return released
+    return len(released)
 
 
 def forget(ref: ProfileRef) -> None:

@@ -123,15 +123,15 @@ class CliTest(unittest.TestCase):
             "also = = broken",
         )
 
-    def test_a_user_config_with_a_non_table_profiles_key_is_reset(self):
-        """Valid TOML that crom's own parser rejects is just as total a lockout as
-        invalid TOML, and reaches the reset by the same route."""
+    def test_a_user_config_with_a_non_table_profiles_key_is_reported(self):
+        """Valid TOML with a wrong value is not a reset case: crom can read the file, so
+        it names the key instead of replacing everything around it."""
         user_config_file().parent.mkdir(parents=True, exist_ok=True)
         user_config_file().write_text('profiles = "typo"\n')
 
-        self.crom("list")
+        output = self.crom("list", expect=1)
 
-        self.assertIn("[profiles.default]", user_config_file().read_text())
+        self.assertIn("`profiles` must be a table", output)
 
     def test_a_broken_project_config_is_reset_keeping_its_namespace(self):
         """The namespace is what the project's ports and profile directories are keyed
@@ -147,20 +147,66 @@ class CliTest(unittest.TestCase):
         self.assertIn(port_before, self.crom("port"))
         self.assertIn('namespace = "myproj"', (self.project / ".crom.toml").read_text())
 
-    def test_a_config_crom_cannot_read_survives_a_failure_a_reset_would_not_fix(self):
-        """The reset is proven before anything moves: crom writes the default only after
-        parsing it. A machine with no Chrome makes *every* config fail, default included
-        — and destroying the user's file over a problem the reset cannot fix would lose
-        their work and leave crom just as broken.
+    def test_a_config_crom_can_still_read_is_reported_never_reset(self):
+        """The reset fires only when the file will not tokenize, because that is the only
+        state holding nothing crom can act on. Every other way a config is wrong keeps its
+        precise diagnostic — resetting over one bad line would destroy the good
+        declarations beside it to punish the bad one.
         """
-        user_config_file().parent.mkdir(parents=True, exist_ok=True)
-        user_config_file().write_text("not = = valid toml [[[")
+        self.crom("init")
+        self.crom("add", "dev", "--port", "9401")
+        path = self.project / ".crom.toml"
+        path.write_text(path.read_text() + "\n[profiles.ci]\nport = 9401\n")
 
+        output = self.crom("list", expect=4)
+
+        self.assertIn("both pin port 9401", output)
+        self.assertIn("[profiles.dev]", path.read_text())
+
+    def test_repairing_a_config_does_not_require_finding_chrome(self):
+        """Whether a file tokenizes as TOML is a question about bytes. Running the repair
+        through a full load would have made `find_chrome()` a precondition of every
+        command — including `crom init`, which `_Session` exists to keep working on a
+        machine that has no Chrome yet.
+        """
         with mock.patch("crom.config.find_chrome", side_effect=CromError("no Chrome here")):
-            self.crom("list", expect=1)
+            self.crom("init", "myapp")
 
-        self.assertEqual(user_config_file().read_text(), "not = = valid toml [[[")
-        self.assertFalse(user_config_file().with_name(user_config_file().name + ".broken").exists())
+        self.assertIn('namespace = "myapp"', (self.project / ".crom.toml").read_text())
+
+    def test_a_foreign_projects_config_is_never_reset_from_here(self):
+        """`crom list --all` reaches every registered project's config through the
+        registry. Repairing from there meant one listing could rewrite every `.crom.toml`
+        on the machine, dropping declarations belonging to work the user is not doing.
+        """
+        other = self.root / "other"
+        other.mkdir()
+        self.crom("init", cwd=other)
+        self.crom("add", "dev", cwd=other)
+        self.crom("init")
+        (other / ".crom.toml").write_text("not = = valid toml [[[")
+
+        self.crom("list", "--all")
+
+        self.assertEqual((other / ".crom.toml").read_text(), "not = = valid toml [[[")
+
+    def test_a_namespace_whose_config_is_gone_keeps_its_ports(self):
+        """An absent config file is not proof the project is gone — an unmounted volume
+        looks identical, and released ports are irreversible: they get handed to other
+        profiles and every checked-in `.mcp.json` pointing at the old number breaks. Only
+        crom's record of where the project lives is dropped.
+        """
+        other = self.root / "other"
+        other.mkdir()
+        self.crom("init", cwd=other)
+        port_before = self.crom("port", cwd=other).strip()
+        self.crom("init")
+        (other / ".crom.toml").rename(self.root / "stashed.toml")
+
+        self.crom("up", "other/default", expect=3)
+
+        (self.root / "stashed.toml").rename(other / ".crom.toml")
+        self.assertEqual(self.crom("port", cwd=other).strip(), port_before)
 
     # --- init and namespaces --------------------------------------------------------
 
