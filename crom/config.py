@@ -1,19 +1,29 @@
-"""Discovers a project's crom config and parses any config file into a `Scope`.
+"""Discovers a project's crom config and turns any config file into a `Scope`.
 
 This module is the border checkpoint for everything a human writes on disk
 ([LAW:parse-dont-validate]): a config file goes in as untyped TOML and comes out as a
 `Scope` whose every field is already legal — names validated, seeds recognised, paths
 made absolute, reserved Chrome switches rejected. Nothing downstream re-checks a key,
 because downstream code only ever sees a `Scope`.
+
+`repair_unreadable` is the one thing here that writes, and it writes in exactly one
+situation: the file will not tokenize as TOML, so it holds nothing crom can act on and
+no command — `crom init` and `crom rm` included — can run to repair it. Then, and only
+then, it is reset to the default and the original is kept beside it. Every other way a
+config can be wrong keeps its precise diagnostic, because crom can still read those
+files and a reset would destroy the good declarations along with the bad line.
 """
 
 import os
 import tomllib
 from pathlib import Path
 
+from . import configwrite, registry, report
 from .browser import find_chrome
+from .locking import exclusive
 from .model import (
     DEFAULT_SEED,
+    FALLBACK_NAMESPACE,
     MAX_PORT,
     MIN_PORT,
     USER_NAMESPACE,
@@ -26,6 +36,7 @@ from .model import (
     SeedChrome,
     SeedFresh,
     SeedPath,
+    slug_for,
     validate_name,
 )
 from .paths import (
@@ -394,10 +405,110 @@ def reject_duplicate_ports(profiles: dict[str, ProfileSpec], source: Path) -> No
         claimed[spec.port] = spec.name
 
 
+# --- loading, and the one repair that writes -----------------------------------------
+
+
 def load_file(source: Path, *, namespace: str | None = None) -> Scope:
     if not source.is_file():
         raise NotFound(f"config file not found: {source}")
     return parse(source.read_text(), source, namespace=namespace)
+
+
+def repair_unreadable(source: Path, *, namespace: str | None = None, log=report.to_stderr) -> None:
+    """Reset `source` to crom's default if it cannot be read as TOML at all.
+
+    The trigger is deliberately narrow, and the narrowness is the whole design. A file
+    that will not tokenize holds nothing crom can act on and locks out every command in
+    the project — `crom init` and `crom rm` included — so there is no command crom could
+    name as the repair, which is what makes resetting it the only useful answer.
+
+    Every *other* way a config can be wrong is excluded, because in all of them crom can
+    still read the file: two profiles pinning one port, an unknown key, a typo'd
+    `chrome_binary`, an unrecognised seed. Those already produce a message naming the
+    file and the exact key, and resetting over one of them would destroy four good
+    declarations to punish one bad line. [LAW:no-silent-failure] a precise diagnostic is
+    information; replacing it with a reset throws that information away and takes the
+    user's other work with it.
+
+    Reading the file is also all this asks of the machine — no Chrome lookup, no seed
+    vocabulary, no port ledger — so it can run before every command without making
+    `find_chrome()` a precondition of `crom init`.
+
+    Under the lock `configwrite` writes beneath, re-reading inside it, so two crom
+    processes meeting one broken file produce one reset and one no-op rather than two —
+    the second of which would set aside the first's freshly written default and file the
+    user's real config one name further along.
+    """
+    # Read once outside the lock, and again inside it. Not a redundant check: this runs
+    # before every command, and `exclusive` creates a `.crom.toml.lock` beside the config
+    # — in the user's repository — the moment it is called. Taking the lock only when
+    # there is something to repair keeps crom from dropping a lock file into every
+    # project on every invocation. The in-lock read is the authoritative one.
+    if not source.is_file() or _reads_as_toml(source) is None:
+        return
+
+    with exclusive(source):
+        unreadable = _reads_as_toml(source)
+        if unreadable is None:
+            return
+
+        chosen = None if namespace == USER_NAMESPACE else _namespace_for(source)
+        kept = configwrite.reset(
+            source,
+            configwrite.default_text(namespace=chosen, seed=DEFAULT_SEED, base=source.parent),
+        )
+        # The namespace and the seed are named, not just the reset. Both are guesses this
+        # function had to make because the file that would have answered them is the file
+        # that could not be read: the namespace decides which ports and profile
+        # directories the project keeps, and the seed decides whether the next `crom up`
+        # copies the user's real Chrome profile or starts empty. A project that had
+        # chosen `seed = "fresh"` gets `default` back, and saying so is the difference
+        # between a repair and a surprise. [LAW:no-silent-failure]
+        wrote = f"namespace '{chosen}', " if chosen else ""
+        seed_name = configwrite.render_seed(DEFAULT_SEED, source.parent)
+        log(
+            f"{source} could not be read as TOML: {unreadable}\n"
+            f"crom reset it to the default ({wrote}seed '{seed_name}'); your original is "
+            f"kept at {kept}. Copy anything you need back out of it."
+        )
+
+
+def _reads_as_toml(source: Path) -> str | None:
+    """Why `source` cannot be tokenized as TOML, or None when it can.
+
+    `UnicodeDecodeError` sits beside the decode error rather than escaping: it is a
+    `ValueError`, so a config saved as UTF-16 used to leave `CromGroup.invoke` — which
+    catches only `CromError` — as a traceback. Both mean the same thing to every caller,
+    which is that there are no bytes here crom can read. [LAW:parse-dont-validate]
+    """
+    try:
+        tomllib.loads(source.read_text())
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as e:
+        return str(e)
+    return None
+
+
+def _namespace_for(source: Path) -> str:
+    """The namespace a reset project config should declare, when the file cannot say.
+
+    The registry is asked first because it is crom's own record of which file owns which
+    namespace, and it survives the file becoming unreadable. Keeping the old name keeps
+    the project's port reservations and profile directories, which are keyed on it — a
+    reset that renamed the namespace would hand the project a fresh set of both and
+    orphan everything already pointing at the old ports.
+
+    The registry can only answer for a project crom has loaded successfully at least
+    once, because `_Session.scope` records the name *after* the load. A `.crom.toml` that
+    arrived broken — a fresh clone, a hand-written file — therefore falls back to the
+    directory name, which is the same rule `crom init` applies. That is a real rename, and
+    it is why `repair_unreadable` reports the name it chose rather than assuming the
+    caller can predict it. [LAW:one-source-of-truth]
+    """
+    remembered = next((name for name, path in registry.namespaces().items() if path == source), None)
+    candidate = remembered or slug_for(source.parent.name)
+    # `parse` refuses `user` in a project file, so a directory literally named `user`
+    # would otherwise be reset to a config crom rejects on the very next command.
+    return FALLBACK_NAMESPACE if candidate == USER_NAMESPACE else candidate
 
 
 def load_user_scope() -> Scope:
@@ -408,6 +519,7 @@ def load_user_scope() -> Scope:
     exists, because a Scope is always what they get.
     """
     source = user_config_file()
+    repair_unreadable(source, namespace=USER_NAMESPACE)
     if source.is_file():
         return load_file(source, namespace=USER_NAMESPACE)
     return Scope(
@@ -419,6 +531,18 @@ def load_user_scope() -> Scope:
 
 
 def load_ambient(start: Path | None = None) -> Scope:
-    """The scope governing the current directory: the discovered project, else `user`."""
+    """The scope governing the current directory: the discovered project, else `user`.
+
+    The repair is attached to the two loads that answer "which config governs *me*" —
+    here and in `load_user_scope` — rather than to `load_file`, which also serves
+    `resolve.scope_for` reaching a *foreign* project's config through the registry.
+    Resetting from there meant one `crom list --all` could rewrite every registered
+    project's `.crom.toml` on the machine, dropping declarations belonging to work the
+    user was not even doing. A config is repaired by the project standing in it.
+    [LAW:decomposition] the joint is ownership, not the act of reading a file.
+    """
     found = discover(start)
-    return load_file(found) if found else load_user_scope()
+    if found is None:
+        return load_user_scope()
+    repair_unreadable(found)
+    return load_file(found)

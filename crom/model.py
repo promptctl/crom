@@ -31,10 +31,13 @@ from pathlib import Path
 # [LAW:one-way-deps]
 USER_NAMESPACE = "user"
 
-# The length cap is named rather than spelled into the pattern, because `cli._slug`
+# The length cap is named rather than spelled into the pattern, because `slug_for`
 # truncates to it — two hand-matched numbers would drift the first time either moved.
 NAME_LIMIT = 64
 _NAME_RE = re.compile(rf"^[a-z0-9][a-z0-9._-]{{0,{NAME_LIMIT - 1}}}\Z")
+
+# What a namespace is called when nothing better can be derived from the directory.
+FALLBACK_NAMESPACE = "project"
 
 
 class CromError(Exception):
@@ -47,6 +50,32 @@ class NotFound(CromError):
 
 class Conflict(CromError):
     """Two declarations claim the same resource — usually a port."""
+
+
+def slug_for(text: str) -> str:
+    """A directory name turned into something `validate_name` will accept.
+
+    Lives beside `validate_name` and `NAME_LIMIT` because it is the inverse of them —
+    the one rule for deriving a legal name from arbitrary text — and it now has two
+    callers that must agree: `crom init` naming a new project, and `config`'s repair path
+    naming a project whose config file can no longer say what its namespace was. Two
+    spellings would let a reset config claim a different namespace from the one `crom
+    init` gave it, which is a new set of profile directories and ports for the same
+    project. [LAW:one-source-of-truth]
+
+    Stripping `._-` from both ends, not just `-`: `.` and `_` survive the substitution
+    because they are inside the allowed class, so a directory named `.dotfiles` or
+    `_internal` used to slugify unchanged and then fail name validation — a confusing
+    error from a command whose whole promise is that it works in any directory. Stripping
+    them also lets an all-punctuation name fall through to the fallback.
+
+    Truncated to the same 64 characters `validate_name` allows, and re-stripped
+    afterwards so the cut cannot leave a trailing separator that fails on its own. A
+    deeply nested build directory or a long branch checkout is a name crom can handle,
+    not a reason to make the user pick one by hand.
+    """
+    slug = re.sub(r"[^a-z0-9._-]+", "-", text.lower()).strip("._-")
+    return slug[:NAME_LIMIT].strip("._-") or FALLBACK_NAMESPACE
 
 
 def validate_name(kind: str, value: str) -> str:

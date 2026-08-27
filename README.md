@@ -159,7 +159,7 @@ crom config [REF]             which config is in effect, and the exact Chrome co
 crom port [REF]               print the port
 crom env [REF]                print shell exports
 crom mcp [REF]                write .mcp.json
-crom forget NAMESPACE         drop a namespace whose config is gone
+crom forget NAMESPACE         drop a namespace deliberately, releasing its ports
 ```
 
 `REF` is `name` (resolved in the ambient namespace) or `namespace/name`. It defaults to
@@ -187,6 +187,71 @@ can both have a `dev` profile and never see each other's cookies.
 Liveness is not tracked at all. crom reads the process table and matches on
 `--user-data-dir`, so a browser you quit by closing the window is simply gone — there is
 no pidfile to go stale.
+
+## Repairs crom makes for you
+
+A crom command names an end state and converges to it, so crom never tells you to run a
+different crom command first. If the only thing between a command and its job is another
+crom command, crom runs it and says so.
+
+A profile you refer to but never declared gets declared, exactly as `crom add <name>`
+with no options would declare it — a bare stanza, so `[defaults]` still governs its seed.
+That covers `crom up`, `crom port`, `crom env`, `crom mcp`, and `crom config <ref>`, and
+the case it fires in most is a bare `crom up` in a project whose `.crom.toml` declares no
+profiles at all, which used to exit 3 for want of the `default` all of those commands
+default to. The cost is that a mistyped ref no longer errors: it writes a declaration into
+a version-controlled `.crom.toml` and reserves a port, and under `crom up` copies a few
+hundred megabytes of Chrome profile as well. `crom rm <name>` undoes all of it.
+
+`crom down` and `crom rm` are the deliberate exception. They converge a profile toward
+*not* running and *not* existing, so declaring one on the way would be crom creating the
+thing it was asked to take away. `crom rm typo` is still an error, and leaves no profile
+named `typo` behind.
+
+A config file that will not tokenize as TOML at all is reset to the default crom would have
+written, and the file it replaced is renamed beside it as `.crom.toml.broken` — then
+`.broken-2`, `.broken-3`, because an earlier reset's copy is never overwritten. Nothing is
+deleted. crom's parser is strict, so one unterminated string used to take out every command
+in the project, including `crom init` and `crom rm`, the two you would reach for to repair
+it; there was no command crom could have named as the fix.
+
+Every other way a config can be wrong keeps its precise message naming the file and the
+exact key, and leaves the file completely alone: two profiles pinning the same port, an
+unknown key, a typo'd `chrome_binary`, an unrecognised seed keyword, `state_dir = ""`. When
+crom can still read the file it can still see your other declarations, and resetting would
+destroy four good ones to punish one bad line. Only a file that will not tokenize holds
+nothing crom can act on. The trigger is a question about bytes, so nothing about the state
+of the machine — whether Chrome is installed, where it is — can cause a reset.
+
+The reset usually keeps your namespace. The registry records which config file owns which
+namespace, so a project crom has loaded successfully at least once keeps its name, and with
+it its ports and its profile directories. But the registry only learns that name *after* a
+successful load, so a `.crom.toml` that arrived already broken — a fresh clone, a
+hand-written file crom has never read — falls back to the directory name. That is a real
+rename, onto a fresh set of ports and profile directories, and it is why crom reports the
+namespace it chose instead of leaving you to work it out.
+
+What gets reset is the config governing the directory you are standing in, plus your own
+user config. A foreign project's config — one reached by name, as `crom up otherproject/dev`
+does, or swept up by `crom list --all` — is reported and never rewritten from here, because
+one `crom list --all` that repaired every registered project on the machine would drop
+declarations belonging to work you weren't even doing. A config is repaired by the project
+standing in it.
+
+Two smaller repairs follow the same rule. `crom add` recreates a project config deleted
+after crom read it — a `git clean`, another agent resetting the workspace — rather than
+sending you back to `crom init`. And when a registered namespace's config file is gone, or
+it has renamed its namespace in place, crom drops its record of *where that project lives*
+and reports the namespace unknown, which is what it now is — but keeps the ports reserved
+under it. An absent file is not proof the project is gone: an unmounted volume or a
+mid-flight `git checkout` looks identical from here, and a released port is irreversible,
+handed straight to another profile while every checked-in `.mcp.json` and `CDP_URL` pointing
+at the old number breaks. If the project comes back it re-registers itself and every profile
+resolves to the port it always had. `crom forget` is the only thing that releases those
+ports, run deliberately about a project you know is gone.
+
+Every one of these is reported on stderr as it happens. stdout still carries only the
+answer, so a script parsing `crom port` sees exactly what it saw before.
 
 ## A note on seeds
 

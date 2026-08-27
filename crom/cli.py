@@ -14,7 +14,6 @@ exit codes are a contract a script can branch on:
 
 import json
 import os
-import re
 import shlex
 import shutil
 from pathlib import Path
@@ -26,7 +25,6 @@ from . import chrome, config, configwrite, mcp, migrate, registry, resolve as re
 from .config import discover, load_ambient, load_user_scope, parse_flags, parse_port, parse_seed
 from .model import (
     DEFAULT_SEED,
-    NAME_LIMIT,
     USER_NAMESPACE,
     Conflict,
     CromError,
@@ -36,6 +34,7 @@ from .model import (
     ResolvedProfile,
     Scope,
     parse_ref,
+    slug_for,
     validate_name,
 )
 from .paths import PROJECT_CONFIG_CANDIDATES, user_config_file
@@ -121,7 +120,19 @@ class _Session:
         return self._scope
 
     def profile(self, ref_text: str) -> ResolvedProfile:
+        """A profile that must already be declared — for `down` and `rm`."""
         return resolver.resolve(parse_ref(ref_text, self.scope.namespace), self.scope)
+
+    def working(self, ref_text: str) -> ResolvedProfile:
+        """A profile to work with, declared on the spot if nothing declares it yet.
+
+        The split is the whole of crom's stance on prerequisites, stated as two calls
+        rather than as a flag: a command asking *where profile X is* gets it created, a
+        command asking crom to *take X away* does not. [LAW:types-are-the-program] a
+        `declare=True` parameter would have made "create the profile I am about to
+        delete" expressible at every call site.
+        """
+        return resolver.resolve_or_declare(parse_ref(ref_text, self.scope.namespace), self.scope)
 
 
 def _emit(as_json: bool, payload, lines: list[str]) -> None:
@@ -140,6 +151,17 @@ def _bootstrap_user_config() -> None:
     Written explicitly into the file rather than defaulted in code, so `user/default`
     cloning your real Chrome profile is a visible, editable decision and not folklore.
     """
+    # Repairing first is what makes the write below safe on a user config crom cannot
+    # read. `configwrite._load` raises on such a file, and this function runs before every
+    # command — so an unreadable `~/.config/crom/config.toml` failed all of them, the ones
+    # that would have repaired it included. [LAW:no-ambient-temporal-coupling] the
+    # ordering is the repair's, and stating it here is what keeps it from being luck.
+    #
+    # `repair_unreadable`, not `load_user_scope`: loading resolves `chrome_binary`, which
+    # would make `find_chrome()` a precondition of every command including `crom init` —
+    # the one `_Session` exists to keep working on a machine with no Chrome yet. Whether a
+    # file tokenizes as TOML is a question about bytes and asks nothing of the machine.
+    config.repair_unreadable(user_config_file(), namespace=USER_NAMESPACE)
     # The seed comes from `model.DEFAULT_SEED`, which the project template renders too.
     # The literal `SeedChrome()` that used to sit here was the half of the disagreement
     # that happened to be right. [LAW:one-source-of-truth]
@@ -183,6 +205,11 @@ def main(ctx):
 
     A new profile starts as a copy of your real Chrome profile, so it has your
     logins and extensions. `--seed fresh` on `init` or `add` gets an empty one.
+
+    crom does the setup step for you rather than naming it: a profile you refer
+    to but never declared is declared, and a config file crom cannot read is
+    reset to the default with your original kept beside it as `<name>.broken`.
+    Both are reported on stderr as they happen.
     """
     migrate.run_if_needed()
     _bootstrap_user_config()
@@ -197,7 +224,7 @@ def main(ctx):
 @click.pass_obj
 def up_cmd(session: _Session, ref: str, as_json: bool):
     """Launch a profile, or report the running one. Idempotent."""
-    profile = session.profile(ref)
+    profile = session.working(ref)
     # Seeding, the liveness check, and the launch are one critical section. Split, two
     # concurrent `crom up` calls both see no running Chrome and both launch against the
     # same profile directory and port — and because Chrome binds the CDP port well before
@@ -286,11 +313,12 @@ def _scopes_to_list(session: _Session, everything: bool) -> tuple[list[Scope], l
     """The scopes `crom list` should report, plus the namespaces it could not load.
 
     A remembered namespace whose config file has been deleted or moved raises `NotFound`
-    from `scope_for` — and `crom forget` is the documented cleanup for exactly that. One
+    from `scope_for`, which drops crom's record of where it lives on the way past. One
     stale entry used to abort the entire listing, so the command that would have shown
     the user which namespace was broken was the one command that could not run. Each
     namespace is isolated and reported by name instead. [LAW:no-silent-failure] nothing
-    is skipped quietly: the failure is a row in the output, human and JSON alike.
+    is skipped quietly: the failure is a row in the output, human and JSON alike, and
+    `scope_for` narrates the drop on stderr with the file it could no longer find.
     """
     scopes = [session.scope]
     if not session.scope.is_user:
@@ -359,17 +387,20 @@ def add_cmd(session: _Session, name: str, seed_text: str | None, flags: tuple[st
     # existing `ci` would move the real `ci` onto 9500 and break whatever already points
     # at its old port — a failed command silently repointing a live profile.
     # `_declare` creates the file when it is missing, and the header it would write is
-    # the *user* scope's — which carries no `namespace` key, because only `init_project`'s
-    # template does. So recreating a vanished project config from it produces a file the
-    # parser rejects wholesale. The scope was read at discovery time and the file can be
-    # gone by now (a `git clean`, another agent resetting the workspace), so say so
-    # instead of writing a config crom cannot read back.
+    # the *user* scope's — which carries no `namespace` key, because only the project
+    # template has one. So recreating a vanished project config from it produces a file
+    # the parser rejects wholesale. The scope was read at discovery time and the file can
+    # be gone by now (a `git clean`, another agent resetting the workspace), which used to
+    # end in "Run `crom init` to recreate it" — a command crom is holding every argument
+    # for. `write_default` writes exactly what that `crom init` would have, from the scope
+    # already in hand, and is a no-op when the file is still there.
     header = configwrite.USER_CONFIG_HEADER if target == user_config_file() else ""
-    if target != user_config_file() and not target.exists():
-        raise NotFound(
-            f"{target} no longer exists — the project config crom discovered has been "
-            f"removed. Run `crom init` to recreate it."
-        )
+    if configwrite.write_default(
+        target,
+        namespace=None if scope.is_user else scope.namespace,
+        seed=scope.default_seed,
+    ):
+        click.echo(f"Recreated {target}, which had been removed since crom read it", err=True)
 
     if configwrite.declares(target, name):
         raise Conflict(f"{target}: profile '{name}' is already declared")
@@ -511,7 +542,7 @@ def init_cmd(namespace: str | None, seed_text: str | None):
     if existing:
         raise Conflict(f"{existing} already exists")
 
-    namespace = validate_name("namespace", namespace or _slug(here.name))
+    namespace = validate_name("namespace", namespace or slug_for(here.name))
     if namespace == USER_NAMESPACE:
         raise Conflict(f'"{USER_NAMESPACE}" is reserved; pass a different namespace')
 
@@ -584,7 +615,7 @@ def config_cmd(session: _Session, ref: str | None, as_json: bool):
     ]
 
     if ref:
-        profile = session.profile(ref)
+        profile = session.working(ref)
         running, pids = _status(profile, chrome.scan())
         payload["resolved"] = {
             **profile.describe(running=running, pids=pids),
@@ -613,7 +644,7 @@ def config_cmd(session: _Session, ref: str | None, as_json: bool):
 @click.pass_obj
 def port_cmd(session: _Session, ref: str):
     """Print a profile's CDP port and nothing else."""
-    click.echo(session.profile(ref).port)
+    click.echo(session.working(ref).port)
 
 
 @main.command("env")
@@ -621,7 +652,7 @@ def port_cmd(session: _Session, ref: str):
 @click.pass_obj
 def env_cmd(session: _Session, ref: str):
     """Print shell exports for a profile: eval "$(crom env dev)"."""
-    profile = session.profile(ref)
+    profile = session.working(ref)
     # `CROM_PROFILE` is the profile *name*, matching what the same spelling means inside
     # a config's `${CROM_PROFILE}` interpolation. It used to be the full "namespace/name"
     # here and the bare name there, so one identifier named two different things
@@ -651,7 +682,7 @@ def env_cmd(session: _Session, ref: str):
 @click.pass_obj
 def mcp_cmd(session: _Session, ref: str, path: str):
     """Wire chrome-devtools-mcp at a profile by writing .mcp.json here."""
-    profile = session.profile(ref)
+    profile = session.working(ref)
     try:
         mcp.write(profile.port, Path(path))
     except ValueError as e:
@@ -665,24 +696,6 @@ def forget_cmd(namespace: str):
     """Drop a namespace from the registry, releasing its reserved ports."""
     released = registry.forget_namespace(validate_name("namespace", namespace))
     click.echo(f"Forgot namespace '{namespace}' ({released} port reservation(s) released)")
-
-
-def _slug(text: str) -> str:
-    """A directory name turned into something `validate_name` will accept.
-
-    Stripping `._-` from both ends, not just `-`: `.` and `_` survive the substitution
-    because they are inside the allowed class, so a directory named `.dotfiles` or
-    `_internal` used to slugify unchanged and then fail name validation — a confusing
-    error from a command whose whole promise is that it works in any directory. Stripping
-    them also lets an all-punctuation name fall through to the `project` fallback.
-
-    Truncated to the same 64 characters `validate_name` allows, and re-stripped
-    afterwards so the cut cannot leave a trailing separator that fails on its own. A
-    deeply nested build directory or a long branch checkout is a name crom can handle,
-    not a reason to make the user pick one by hand.
-    """
-    slug = re.sub(r"[^a-z0-9._-]+", "-", text.lower()).strip("._-")
-    return slug[:NAME_LIMIT].strip("._-") or "project"
 
 
 def _delete_profile_data(profile: ResolvedProfile) -> None:
