@@ -162,7 +162,7 @@ class SeedTest(unittest.TestCase):
     def test_keyword_seeds(self):
         cases = {
             "fresh": SeedFresh(),
-            "chrome": SeedChrome(),
+            "default": SeedChrome(),
             "chrome:Profile 1": SeedChrome(profile="Profile 1"),
         }
         for text, expected in cases.items():
@@ -179,7 +179,7 @@ class SeedTest(unittest.TestCase):
             parse(MINIMAL + '[profiles.dev]\nseed = "chorme"\n')
 
     def test_profile_without_a_seed_falls_back_to_the_scope_default(self):
-        scope = parse(MINIMAL + '[defaults]\nseed = "chrome"\n[profiles.dev]\n')
+        scope = parse(MINIMAL + '[defaults]\nseed = "default"\n[profiles.dev]\n')
         self.assertIsNone(scope.profiles["dev"].seed)
         self.assertEqual(scope.default_seed, SeedChrome())
 

@@ -111,22 +111,33 @@ def parse_env(raw, where: str, source: Path) -> dict[str, str]:
 def parse_seed(raw, where: str, source: Path, config_dir: Path) -> Seed:
     """Turn a seed string into one of the three real sources.
 
-    The vocabulary is closed: `fresh`, `chrome`, `chrome:<Profile Name>`, or a path
+    The vocabulary is closed: `fresh`, `default`, `chrome:<Profile Name>`, or a path
     (which must start with `.`, `/`, or `~` so a typo'd keyword can never be mistaken
     for a relative path that happens not to exist yet).
+
+    `default` names the Chrome profile it copies. The keyword used to be `chrome`, which
+    named the browser instead — and a browser has many profiles, so the value said
+    nothing about which one it meant.
     """
     if not isinstance(raw, str):
         raise CromError(f"{source}: {where}.seed must be a string")
     if raw == "fresh":
         return SeedFresh()
-    if raw == "chrome":
+    if raw == "default":
         return SeedChrome()
+    if raw == "chrome":
+        # A tombstone, not a spelling. Configs written before the rename say `chrome`,
+        # and leaving it to fall through to "not recognised" would make the fix a guess.
+        raise CromError(
+            f"{source}: {where}.seed = 'chrome' — the seed names the Chrome profile now, "
+            f'not the browser. Write seed = "default".'
+        )
     if raw.startswith("chrome:"):
         return SeedChrome(profile=_parse_chrome_profile(raw.split(":", 1)[1], where, source))
     if raw[:1] in (".", "/", "~"):
         return SeedPath(_parse_seed_path(raw, where, source, config_dir))
     raise CromError(
-        f"{source}: {where}.seed = {raw!r} is not recognised. Use 'fresh', 'chrome', "
+        f"{source}: {where}.seed = {raw!r} is not recognised. Use 'fresh', 'default', "
         f"'chrome:<Profile Name>', or a path beginning with './', '/', or '~'."
     )
 

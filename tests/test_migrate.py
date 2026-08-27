@@ -294,7 +294,7 @@ class MigrateTest(unittest.TestCase):
         On one filesystem the move is a rename, so a kill here leaves the data whole in
         staging with `old_dir` already gone. The retry saw no `old_dir`, decided there
         was nothing to do, and left a complete profile in a hidden directory nothing ever
-        looked at again — and since these profiles are declared `seed = "chrome"`, the
+        looked at again — and since these profiles are declared `seed = "default"`, the
         next `crom up` rebuilt them from the real Chrome profile instead of the user's
         data. Silent substitution of someone else's browser state for your own.
 

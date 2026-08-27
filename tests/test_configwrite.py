@@ -54,7 +54,7 @@ class RenderSeedTest(unittest.TestCase):
 
     def test_the_other_seed_spellings_are_unchanged(self):
         self.assertEqual(configwrite.render_seed(SeedFresh(), self.base), "fresh")
-        self.assertEqual(configwrite.render_seed(SeedChrome(), self.base), "chrome")
+        self.assertEqual(configwrite.render_seed(SeedChrome(), self.base), "default")
         self.assertEqual(configwrite.render_seed(SeedChrome(profile="Work"), self.base), "chrome:Work")
 
 
