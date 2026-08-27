@@ -54,7 +54,7 @@ which appends to the same file and leaves your comments alone:
 namespace = "myapp"
 
 [defaults]
-seed = "chrome"
+seed = "default"
 flags = ["--window-size=1280,900"]
 
 [profiles.default]
@@ -80,7 +80,7 @@ file is always the `user` namespace and must not declare one.
 | `state_dir` | top level | Where profile directories go, relative to the config file. Defaults to `~/.local/state/crom/profiles`. Set it to `.crom/profiles` to keep a project's browser data inside the repo (and gitignore it). |
 | `flags` | `[defaults]`, `[profiles.X]` | Extra Chrome switches. Namespace defaults come first, then the profile's own. |
 | `env` | `[defaults]`, `[profiles.X]` | Environment variables for the Chrome process. |
-| `seed` | `[defaults]`, `[profiles.X]` | Where a new profile's data comes from: `fresh`, `chrome`, `chrome:<Profile Name>`, or a path to an existing user-data-dir. A profile with no `seed` key inherits `[defaults].seed`, which is `chrome` unless the config says otherwise. |
+| `seed` | `[defaults]`, `[profiles.X]` | Where a new profile's data comes from: `fresh`, `default`, `chrome:<Profile Name>`, or a path to an existing user-data-dir. A profile with no `seed` key inherits `[defaults].seed`, which is `default` unless the config says otherwise. |
 | `port` | `[profiles.X]` | Pin the CDP port. Leave it out and crom assigns a free one and remembers it. |
 
 Flags and env values can interpolate `${CROM_PROFILE_DIR}`, `${CROM_CONFIG_DIR}`,
@@ -206,7 +206,7 @@ its directory, and if `state_dir` points at `.crom/profiles` that copy lands ins
 working tree. Configs crom wrote itself are never in that position, because `crom init`
 always records a `[defaults].seed` for the profiles beneath it to inherit. Before it
 starts copying, `crom up` prints
-`Creating <ref> from seed 'chrome' …` on stderr, so the copy is announced rather than
+`Creating <ref> from seed 'default' …` on stderr, so the copy is announced rather than
 silent — and `seed = "fresh"`, on the profile or in `[defaults]`, gets you an empty one.
 
 ## Where things live

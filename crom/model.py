@@ -105,7 +105,7 @@ Seed = SeedFresh | SeedChrome | SeedPath
 # then `crom up` got a browser they could not use and no way to see why it differed from
 # the one they had yesterday. Both templates now render *this*, so they cannot drift again.
 #
-# `chrome` is the answer because a profile with no cookies and no extensions cannot do the
+# `default` — your default Chrome profile — is the answer because a profile with no cookies and no extensions cannot do the
 # job crom exists for: driving a real session. It costs one copy of one Chrome profile
 # directory at create time — `crom init --seed fresh` and `crom add --seed fresh` decline
 # it, and `crom up` names the seed on stderr before it starts copying.

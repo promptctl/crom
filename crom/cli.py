@@ -315,7 +315,7 @@ def _scopes_to_list(session: _Session, everything: bool) -> tuple[list[Scope], l
     "seed_text",
     default=None,
     help=(
-        "chrome | chrome:<Profile> | fresh | ./path — where this profile's data comes "
+        "default | chrome:<Profile> | fresh | ./path — where this profile's data comes "
         "from. Omit to inherit [defaults].seed from the config."
     ),
 )
@@ -500,8 +500,8 @@ def rm_cmd(session: _Session, ref: str, yes: bool, keep_data: bool):
     "seed_text",
     default=None,
     help=(
-        "chrome | chrome:<Profile> | fresh | ./path — what this project's profiles start "
-        "from. Written into [defaults].seed. Default: chrome, a copy of your real profile."
+        "default | chrome:<Profile> | fresh | ./path — what this project's profiles start "
+        "from. Written into [defaults].seed. Default: default, a copy of your default profile."
     ),
 )
 def init_cmd(namespace: str | None, seed_text: str | None):
