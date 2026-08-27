@@ -218,12 +218,17 @@ class ResolveTest(LedgerFixture):
         with self.assertRaisesRegex(CromError, "unknown namespace 'ghost'"):
             resolve.resolve(ProfileRef("ghost", "dev"), scope)
 
-    def test_a_renamed_namespace_is_reported_stale_not_silently_resolved(self):
+    def test_a_renamed_namespace_is_dropped_not_silently_resolved(self):
         """`remember_namespace` is additive, so renaming a namespace in place leaves the
         old name pointing at the same file. Loading it would return a Scope whose real
         namespace differs from the one asked for, and `resolve_spec` would then build a
         profile directory and port under the requested name — a plausible-looking profile
         belonging to nothing.
+
+        The old name is dropped here rather than reported with a `crom forget` to run:
+        the ledger entry is crom's own memory outliving what it remembered, and forgetting
+        it is both the only possible response and one crom can make itself. The name is
+        then simply unknown, which is what it now is.
         """
         other_source = self.root / "other" / ".crom.toml"
         other_source.parent.mkdir()
@@ -234,8 +239,33 @@ class ResolveTest(LedgerFixture):
         other_source.write_text('namespace = "other2"\n[profiles.dev]\n')
 
         here = self.scope(MINIMAL + "[profiles.dev]\n")
-        with self.assertRaisesRegex(CromError, "stale"):
+        with self.assertRaisesRegex(CromError, "unknown namespace 'other'"):
             resolve.resolve(ProfileRef("other", "dev"), here)
+
+        self.assertNotIn("other", registry.namespaces())
+
+    def test_a_namespace_whose_config_is_gone_is_dropped(self):
+        other_source = self.root / "other" / ".crom.toml"
+        other_source.parent.mkdir()
+        other_source.write_text('namespace = "other"\n[profiles.dev]\n')
+        registry.remember_namespace("other", other_source)
+        other_source.unlink()
+
+        here = self.scope(MINIMAL + "[profiles.dev]\n")
+        with self.assertRaisesRegex(CromError, "unknown namespace 'other'"):
+            resolve.resolve(ProfileRef("other", "dev"), here)
+
+        self.assertNotIn("other", registry.namespaces())
+
+    def test_an_undeclared_profile_is_declared_when_the_caller_means_to_use_it(self):
+        """`resolve_or_declare` is what every command that asks *where profile X is* uses.
+        The declaration it writes is bare, so `[defaults]` still governs the profile."""
+        scope = self.scope(MINIMAL + "[profiles.dev]\n")
+
+        profile = resolve.resolve_or_declare(ProfileRef("myapp", "nope"), scope, log=lambda _: None)
+
+        self.assertEqual(str(profile.ref), "myapp/nope")
+        self.assertIn("[profiles.nope]", scope.source.read_text())
 
     def test_a_remembered_namespace_resolves_from_a_foreign_scope(self):
         other_source = self.root / "other" / ".crom.toml"

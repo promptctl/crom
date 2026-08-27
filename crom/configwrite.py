@@ -7,8 +7,10 @@ everything crom did not explicitly change.
 """
 
 import os
+import shutil
 from collections.abc import Iterator
 from contextlib import contextmanager
+from itertools import count
 from pathlib import Path
 
 import tomlkit
@@ -180,14 +182,52 @@ def _save(path: Path, doc: tomlkit.TOMLDocument) -> None:
         os.replace(tmp, path)
 
 
-def init_project(path: Path, namespace: str, seed: Seed) -> None:
-    """Write a new project config, or refuse if one is already there.
+def default_text(*, namespace: str | None, seed: Seed, base: Path) -> str:
+    """The complete text of a fresh config for one scope — `None` names the user scope.
 
-    `seed` is written into `[defaults]` rather than defaulted in code, so the project's
-    answer to "where does a new profile's data come from" is visible in the file the
-    team commits. It arrives already parsed — `cli.init_cmd` runs `--seed` through
-    `config.parse_seed`, the same checkpoint a value read back from this file goes
-    through. [LAW:parse-dont-validate] there is no second spelling of the vocabulary here.
+    The single answer to "what does a config crom writes look like", because three
+    callers now need it and they must not each hold their own: `init_project` creates
+    one, `config._reset_unreadable` writes one over a file crom can no longer parse, and
+    `resolve._declare` creates one for a project whose config went missing. Two of those
+    are repairs, and a repair that produced a *slightly* different file from the one
+    `crom init` writes would be a second template drifting from the first.
+    [LAW:one-source-of-truth]
+
+    Both scopes get `[profiles.default]`, because every command that takes a ref defaults
+    to `default` — a config crom wrote in which crom's own default does not resolve would
+    be crom lying about its own contract.
+    """
+    if namespace is None:
+        document = tomlkit.parse(USER_CONFIG_HEADER)
+        document.setdefault("profiles", tomlkit.table(is_super_table=True))["default"] = (
+            _stanza(ProfileSpec(name="default", seed=seed), base)
+        )
+        return tomlkit.dumps(document)
+
+    return PROJECT_CONFIG_TEMPLATE.format(
+        # `namespace` needs no quoting: `validate_name` is its checkpoint and admits only
+        # `[a-z0-9._-]`, so a `ProfileRef`-legal namespace cannot carry a quote or a
+        # newline. [LAW:parse-dont-validate]
+        namespace=namespace,
+        # A seed carries no such stamp — `chrome:<Profile Name>` takes any Chrome profile
+        # name (only `/`, `~` and path components are refused) and `SeedPath` renders an
+        # arbitrary filesystem path, so both can contain a `"`. Interpolating one into
+        # `seed = "{seed}"` produced `seed = "chrome:My"Work"`: `crom init` reported
+        # success and exit 0, and every command afterwards died on `invalid TOML` —
+        # including the `crom init` and `crom rm` that might have repaired it.
+        #
+        # `tomlkit.item(...).as_string()` emits the value already quoted and escaped,
+        # which is why the template reads `seed = {seed}`. This is the same library
+        # `_declare` writes every other stanza through; `init_project` was the one path
+        # hand-rolling the serialization, and `crom add --seed 'chrome:My"Work'` was
+        # correct throughout. [LAW:single-enforcer] one thing knows how to spell a TOML
+        # string.
+        seed=tomlkit.item(render_seed(seed, base)).as_string(),
+    )
+
+
+def write_default(path: Path, *, namespace: str | None, seed: Seed) -> bool:
+    """Create `path` as a fresh default config; report whether this call created it.
 
     The refusal is the kernel's, not a check of ours: `O_CREAT | O_EXCL` creates the
     file only if it does not exist, atomically. An `exists()` test followed by a write
@@ -195,10 +235,10 @@ def init_project(path: Path, namespace: str, seed: Seed) -> None:
     the second would clobber the first's config — possibly with a different namespace —
     while both reported success.
 
-    `Conflict` rather than the bare `FileExistsError` the kernel hands back: this is the
-    exit-4 case the CLI contract promises. Raised here rather than translated at the call
-    site so no future caller can reintroduce the gap by forgetting a wrapper.
+    Returning a bool rather than raising leaves the meaning of "it was already there" to
+    the caller: `init_project` calls it a conflict, and the repair paths call it done.
     """
+    text = default_text(namespace=namespace, seed=seed, base=path.parent)
     # The `mkdir` sits inside the translation too, and the `FileExistsError` catch stays
     # scoped to `os.open` alone. `exist_ok=True` does not suppress a *non-directory* in a
     # path component, so `mkdir` has its own `FileExistsError` — one that means something
@@ -208,32 +248,63 @@ def init_project(path: Path, namespace: str, seed: Seed) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         try:
             fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-        except FileExistsError as e:
-            raise Conflict(f"{path} already exists") from e
+        except FileExistsError:
+            return False
         with os.fdopen(fd, "w") as handle:
-            handle.write(
-                PROJECT_CONFIG_TEMPLATE.format(
-                    # `namespace` needs no quoting: `validate_name` is its checkpoint and
-                    # admits only `[a-z0-9._-]`, so a `ProfileRef`-legal namespace cannot
-                    # carry a quote or a newline. [LAW:parse-dont-validate]
-                    namespace=namespace,
-                    # A seed carries no such stamp — `chrome:<Profile Name>` takes any
-                    # Chrome profile name (only `/`, `~` and path components are refused)
-                    # and `SeedPath` renders an arbitrary filesystem path, so both can
-                    # contain a `"`. Interpolating one into `seed = "{seed}"` produced
-                    # `seed = "chrome:My"Work"`: `crom init` reported success and exit 0,
-                    # and every command afterwards died on `invalid TOML` — including the
-                    # `crom init` and `crom rm` that might have repaired it.
-                    #
-                    # `tomlkit.item(...).as_string()` emits the value already quoted and
-                    # escaped, which is why the template now reads `seed = {seed}`. This
-                    # is the same library `_declare` writes every other stanza through;
-                    # `init_project` was the one path hand-rolling the serialization, and
-                    # `crom add --seed 'chrome:My"Work'` was correct throughout.
-                    # [LAW:single-enforcer] one thing knows how to spell a TOML string.
-                    seed=tomlkit.item(render_seed(seed, path.parent)).as_string(),
-                )
-            )
+            handle.write(text)
+    return True
+
+
+def init_project(path: Path, namespace: str, seed: Seed) -> None:
+    """Write a new project config, or refuse if one is already there.
+
+    `seed` is written into `[defaults]` rather than defaulted in code, so the project's
+    answer to "where does a new profile's data come from" is visible in the file the
+    team commits. It arrives already parsed — `cli.init_cmd` runs `--seed` through
+    `config.parse_seed`, the same checkpoint a value read back from this file goes
+    through. [LAW:parse-dont-validate] there is no second spelling of the vocabulary here.
+
+    `Conflict` rather than the bare `FileExistsError` the kernel hands back: this is the
+    exit-4 case the CLI contract promises. Raised here rather than translated at the call
+    site so no future caller can reintroduce the gap by forgetting a wrapper.
+    """
+    if not write_default(path, namespace=namespace, seed=seed):
+        raise Conflict(f"{path} already exists")
+
+
+def reset(path: Path, text: str) -> Path:
+    """Overwrite `path` with `text`, keeping what was there beside it; return the kept copy.
+
+    crom resets a config it cannot read rather than making the user repair it by hand,
+    and a reset that deleted their file would be crom destroying the one artifact that
+    says what they meant. So the displaced file is renamed, never removed, and the
+    caller reports where it went. [LAW:no-silent-failure]
+
+    The kept name is claimed with `O_CREAT | O_EXCL` and walked forward on collision, so
+    a second reset cannot overwrite the first reset's evidence — which would lose exactly
+    the data this function exists to preserve.
+
+    The old file is *copied* aside and the new one swapped in with a single `os.replace`,
+    so the config never stops existing. Renaming the original away and then writing the
+    replacement leaves a window with no config at all: `discover` takes no lock, so a
+    concurrent `crom up` in that project would fall through to the user scope and launch
+    the wrong profile — and a write that failed in that window (a full disk, a read-only
+    mount) would leave the project with nothing rather than with the file it started with.
+    """
+    with _writing(path):
+        for attempt in count(1):
+            kept = path.with_name(path.name + (".broken" if attempt == 1 else f".broken-{attempt}"))
+            try:
+                os.close(os.open(kept, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644))
+            except FileExistsError:
+                continue
+            shutil.copyfile(path, kept)
+            # Not `_save`: this is deliberately not a round-tripped edit of the user's
+            # document. The document is what could not be parsed.
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(text)
+            os.replace(tmp, path)
+            return kept
 
 
 def declares(path: Path, name: str) -> bool:
@@ -283,27 +354,34 @@ def _declare(path: Path, spec: ProfileSpec, header: str) -> bool:
         if spec.name in profiles:
             return False
 
-        # A stanza records what the user *stated*, and an unstated seed is a real value in
-        # this vocabulary rather than a missing one: TOML spells "inherit `[defaults]`" as
-        # the absence of the key, and `resolve_spec` already reads that absence as
-        # `scope.default_seed`. Writing a seed nobody chose would freeze one day's default
-        # into the file and leave `[defaults].seed` silently powerless over every profile
-        # `crom add` ever created — the config format promising an inheritance the writer
-        # quietly overrode. [LAW:dataflow-not-control-flow] every key is rendered the same
-        # way and its value decides whether it appears.
-        stated = {
-            "seed": None if spec.seed is None else render_seed(spec.seed, path.parent),
-            "flags": list(spec.flags),
-            "port": spec.port,
-            "env": dict(spec.env) or None,
-        }
-        table = tomlkit.table()
-        for key, value in stated.items():
-            if value is not None:
-                table[key] = value
-        profiles[spec.name] = table
+        profiles[spec.name] = _stanza(spec, path.parent)
         _save(path, doc)
         return True
+
+
+def _stanza(spec: ProfileSpec, base: Path) -> tomlkit.items.Table:
+    """A `[profiles.<name>]` table for `spec`, the only way one is ever built.
+
+    A stanza records what the user *stated*, and an unstated seed is a real value in this
+    vocabulary rather than a missing one: TOML spells "inherit `[defaults]`" as the
+    absence of the key, and `resolve_spec` already reads that absence as
+    `scope.default_seed`. Writing a seed nobody chose would freeze one day's default into
+    the file and leave `[defaults].seed` silently powerless over every profile `crom add`
+    ever created — the config format promising an inheritance the writer quietly
+    overrode. [LAW:dataflow-not-control-flow] every key is rendered the same way and its
+    value decides whether it appears.
+    """
+    stated = {
+        "seed": None if spec.seed is None else render_seed(spec.seed, base),
+        "flags": list(spec.flags),
+        "port": spec.port,
+        "env": dict(spec.env) or None,
+    }
+    table = tomlkit.table()
+    for key, value in stated.items():
+        if value is not None:
+            table[key] = value
+    return table
 
 
 def add_profile(path: Path, spec: ProfileSpec, *, header: str = "") -> None:

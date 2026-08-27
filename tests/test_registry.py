@@ -25,15 +25,38 @@ class LedgerTest(unittest.TestCase):
 
     # --- namespace ownership --------------------------------------------------------
 
-    def test_a_namespace_belongs_to_one_config_file(self):
+    def test_a_namespace_belongs_to_one_live_config_file(self):
         """Two projects picking the same namespace would share ports and profile dirs.
 
         That is the cross-project bleed namespaces exist to prevent — same ledger key,
-        same on-disk profile, so one project's cookies in the other's browser.
+        same on-disk profile, so one project's cookies in the other's browser. The
+        incumbent has to be a real file for that bleed to be possible, which is what
+        separates this from the stale entry below.
         """
-        registry.remember_namespace("app", Path("/one/.crom.toml"))
-        with self.assertRaisesRegex(Conflict, "already claimed by /one/.crom.toml"):
-            registry.remember_namespace("app", Path("/two/.crom.toml"))
+        incumbent = self.root / "one" / ".crom.toml"
+        incumbent.parent.mkdir(parents=True)
+        incumbent.write_text('namespace = "app"\n')
+
+        registry.remember_namespace("app", incumbent)
+        with self.assertRaisesRegex(Conflict, "already claimed by"):
+            registry.remember_namespace("app", self.root / "two" / ".crom.toml")
+
+    def test_a_claim_by_a_config_that_is_gone_passes_to_the_live_project(self):
+        """A recorded claimant whose file no longer exists is not a second project — it
+        is this ledger remembering a deleted one. Refusing on its behalf blocked every
+        command in the live project until the user ran `crom forget`, which was both the
+        only possible response and one crom can make itself.
+
+        The reservations stay: an absent file is not proof the project is gone, and a
+        released port is irreversible. Only `crom forget`, run deliberately, releases them.
+        """
+        registry.remember_namespace("app", Path("/gone/.crom.toml"))
+        before = registry.port_for(ProfileRef("app", "dev"), pinned=None, source=None)
+
+        registry.remember_namespace("app", Path("/live/.crom.toml"), log=lambda _: None)
+
+        self.assertEqual(registry.namespaces()["app"], Path("/live/.crom.toml"))
+        self.assertEqual(registry.reservations()["app/dev"].port, before)
 
     def test_remembering_the_same_config_again_is_not_a_conflict(self):
         registry.remember_namespace("app", Path("/one/.crom.toml"))

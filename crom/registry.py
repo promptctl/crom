@@ -19,6 +19,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import report
 from .locking import exclusive
 from .model import MAX_PORT, MIN_PORT, USER_NAMESPACE, Conflict, CromError, ProfileRef
 from .paths import registry_file
@@ -176,27 +177,61 @@ def namespaces() -> dict[str, Path]:
     return {name: Path(entry["config"]) for name, entry in data["namespaces"].items()}
 
 
-def remember_namespace(namespace: str, source: Path) -> None:
-    """Record which config file owns a namespace, refusing a second claimant.
+def remember_namespace(namespace: str, source: Path, log=report.to_stderr) -> None:
+    """Record which config file owns a namespace, refusing a second *live* claimant.
 
     A namespace is free text a user types, checked for legal characters and nothing
     else, so two unrelated projects can both pick `app`. Left unchecked they would share
     a `ProfileRef` — and therefore one ledger key and one profile directory, mixing two
     projects' cookies and logins in the same Chrome data dir. That is the exact bleed
-    namespaces exist to prevent, so the second claimant is refused by name rather than
+    namespaces exist to prevent, so a second claimant is refused by name rather than
     silently becoming the owner.
+
+    A recorded claimant whose config file is gone is not a second claimant at all — it is
+    this ledger remembering a project that has been deleted, moved, or renamed. Refusing
+    on its behalf blocked every command in the live project until the user ran `crom
+    forget`, which is the one thing they could have done and therefore the one thing crom
+    should not have needed to ask for. The reservations go with the name, so the takeover
+    is announced. [LAW:no-silent-failure]
     """
     with _locked() as path:
         data = _read(path)
         recorded = data["namespaces"].get(namespace, {}).get("config")
         if recorded is not None and recorded != str(source):
-            raise Conflict(
-                f"namespace '{namespace}' is already claimed by {recorded}.\n"
-                f"{source} cannot use it too — they would share profile directories and "
-                f"ports. Rename this project's `namespace`, or run "
-                f"`crom forget {namespace}` if {recorded} is gone."
+            if Path(recorded).is_file():
+                raise Conflict(
+                    f"namespace '{namespace}' is already claimed by {recorded}.\n"
+                    f"{source} cannot use it too — they would share profile directories "
+                    f"and ports. Rename this project's `namespace`."
+                )
+            # Only the mapping goes; the reservations stay. See `forget_mapping`.
+            data["namespaces"].pop(namespace, None)
+            log(
+                f"Namespace '{namespace}' was claimed by {recorded}, which is gone — "
+                f"gave the name to {source}."
             )
         data["namespaces"][namespace] = {"config": str(source)}
+        _write(path, data)
+
+
+def forget_mapping(namespace: str) -> None:
+    """Drop crom's record of *where* a namespace lives, keeping its port reservations.
+
+    The lighter half of `forget_namespace`, and the only one crom performs on its own. A
+    config file that is not there right now is not proof the project is gone: an
+    unmounted volume, a network share, a `git checkout` mid-flight all look identical
+    from here. Releasing the reservations on that evidence would be irreversible — the
+    ports get handed to other profiles, and every checked-in `.mcp.json` and `CDP_URL`
+    pointing at the old numbers breaks with no way to recover them.
+
+    Dropping only the mapping costs nothing and heals itself: the moment the project is
+    reachable again, `_Session.scope` re-records it and every profile resolves to the
+    port it always had. Releasing ports stays where it belongs — behind `crom forget`,
+    which a person runs deliberately about a project they know is gone.
+    """
+    with _locked() as path:
+        data = _read(path)
+        data["namespaces"].pop(namespace, None)
         _write(path, data)
 
 
