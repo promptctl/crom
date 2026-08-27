@@ -44,9 +44,13 @@ namespace = "{namespace}"
 # What every profile below inherits unless it says otherwise.
 #
 # `seed` is where a profile's data comes from the first time crom creates it:
-#   chrome                  a copy of your real Chrome profile — your logins, your
-#                           extensions, ready to use
-#   chrome:<Profile Name>   a copy of one named profile inside your Chrome
+#   chrome                  a copy of your everyday Chrome profile — the `Default`
+#                           directory — so this browser has your logins and extensions
+#   chrome:<dir>            a copy of a different profile directory inside your Chrome.
+#                           Name the DIRECTORY (`Default`, `Profile 1`, `Profile 2`),
+#                           not the label Chrome shows in its profile menu — a profile
+#                           whose directory is `Default` often displays as `Person 1`.
+#                           `chrome` and `chrome:Default` mean the same thing.
 #   fresh                   an empty profile; Chrome sets it up on first launch
 #   ./path/to/user-data-dir a copy of a directory you keep yourself
 #
@@ -217,7 +221,7 @@ def init_project(path: Path, namespace: str, seed: Seed) -> None:
                     # admits only `[a-z0-9._-]`, so a `ProfileRef`-legal namespace cannot
                     # carry a quote or a newline. [LAW:parse-dont-validate]
                     namespace=namespace,
-                    # A seed carries no such stamp — `chrome:<Profile Name>` takes any
+                    # A seed carries no such stamp — `chrome:<dir>` takes any
                     # Chrome profile name (only `/`, `~` and path components are refused)
                     # and `SeedPath` renders an arbitrary filesystem path, so both can
                     # contain a `"`. Interpolating one into `seed = "{seed}"` produced

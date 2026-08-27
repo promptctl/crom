@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest import mock
 
 from crom import config
+from crom.configwrite import render_seed
 from crom.paths import default_profiles_root
 from crom.model import DEFAULT_SEED, Conflict, CromError, Scope, SeedChrome, SeedFresh, SeedPath
 
@@ -169,6 +170,25 @@ class SeedTest(unittest.TestCase):
             with self.subTest(seed=text):
                 scope = parse(MINIMAL + f'[profiles.dev]\nseed = "{text}"\n')
                 self.assertEqual(scope.profiles["dev"].seed, expected)
+
+    def test_chrome_and_chrome_default_are_one_value_with_a_short_spelling(self):
+        """`chrome` names the `Default` directory — the two spellings are not siblings.
+
+        A user reading `chrome | chrome:<dir>` reasonably asks which profile the bare
+        word takes, and nothing in the vocabulary answered it: the equivalence lived in
+        `SeedChrome.profile`'s field default and in `render_seed`'s `SeedChrome(
+        profile="Default")` match arm, two places a reader has to find and put together.
+        Round-tripping both spellings pins it as one fact.
+        """
+        bare = parse(MINIMAL + '[profiles.dev]\nseed = "chrome"\n').profiles["dev"].seed
+        explicit = parse(MINIMAL + '[profiles.dev]\nseed = "chrome:Default"\n').profiles["dev"].seed
+
+        self.assertEqual(bare, explicit)
+        self.assertEqual(bare, SeedChrome(profile="Default"))
+        # And `chrome` is the spelling both render back to, so a config crom rewrites
+        # never grows a `chrome:Default` that reads as a different seed than it was.
+        self.assertEqual(render_seed(bare, Path("/proj")), "chrome")
+        self.assertEqual(render_seed(explicit, Path("/proj")), "chrome")
 
     def test_path_seed_resolves_against_the_config_file(self):
         scope = parse(MINIMAL + '[profiles.dev]\nseed = "./fixtures/prof"\n')

@@ -80,7 +80,7 @@ file is always the `user` namespace and must not declare one.
 | `state_dir` | top level | Where profile directories go, relative to the config file. Defaults to `~/.local/state/crom/profiles`. Set it to `.crom/profiles` to keep a project's browser data inside the repo (and gitignore it). |
 | `flags` | `[defaults]`, `[profiles.X]` | Extra Chrome switches. Namespace defaults come first, then the profile's own. |
 | `env` | `[defaults]`, `[profiles.X]` | Environment variables for the Chrome process. |
-| `seed` | `[defaults]`, `[profiles.X]` | Where a new profile's data comes from: `fresh`, `chrome`, `chrome:<Profile Name>`, or a path to an existing user-data-dir. A profile with no `seed` key inherits `[defaults].seed`, which is `chrome` unless the config says otherwise. |
+| `seed` | `[defaults]`, `[profiles.X]` | Where a new profile's data comes from: `fresh`, `chrome` (short for `chrome:Default`), `chrome:<dir>` for another of Chrome's profile directories, or a path to an existing user-data-dir. A profile with no `seed` key inherits `[defaults].seed`, which is `chrome` unless the config says otherwise. |
 | `port` | `[profiles.X]` | Pin the CDP port. Leave it out and crom assigns a free one and remembers it. |
 
 Flags and env values can interpolate `${CROM_PROFILE_DIR}`, `${CROM_CONFIG_DIR}`,
@@ -194,6 +194,12 @@ A new profile is a copy of your real Chrome profile by default, because a browse
 no logins and no extensions cannot do the work crom exists for — you would spend the
 first ten minutes of every new profile signing back into everything. An empty one is a
 word away: `--seed fresh` on `crom init` or `crom add`.
+
+"Your real Chrome profile" means the `Default` directory, which is what bare `chrome`
+selects; `chrome:<dir>` picks a different one. The argument names the directory on disk —
+Chrome calls them `Default`, `Profile 1`, `Profile 2` — not the label that profile carries
+in Chrome's own profile menu, which you chose yourself and which often shows `Default` as
+something like "Person 1".
 
 The copy is not free. A working Chrome profile runs to a few hundred megabytes, and
 that gets copied once per profile, when crom first creates its directory. After that

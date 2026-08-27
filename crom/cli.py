@@ -315,8 +315,9 @@ def _scopes_to_list(session: _Session, everything: bool) -> tuple[list[Scope], l
     "seed_text",
     default=None,
     help=(
-        "chrome | chrome:<Profile> | fresh | ./path — where this profile's data comes "
-        "from. Omit to inherit [defaults].seed from the config."
+        "chrome (your Default profile) | chrome:<dir> (another profile DIRECTORY, e.g. "
+        "'Profile 1') | fresh | ./path — where this profile's data comes from. Omit to "
+        "inherit [defaults].seed from the config."
     ),
 )
 @click.option("--flag", "flags", multiple=True, help="Chrome flag; repeatable.")
@@ -500,8 +501,9 @@ def rm_cmd(session: _Session, ref: str, yes: bool, keep_data: bool):
     "seed_text",
     default=None,
     help=(
-        "chrome | chrome:<Profile> | fresh | ./path — what this project's profiles start "
-        "from. Written into [defaults].seed. Default: chrome, a copy of your real profile."
+        "chrome (your Default profile) | chrome:<dir> (another profile DIRECTORY, e.g. "
+        "'Profile 1') | fresh | ./path — what this project's profiles start from. "
+        "Written into [defaults].seed. Default: chrome."
     ),
 )
 def init_cmd(namespace: str | None, seed_text: str | None):

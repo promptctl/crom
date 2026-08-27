@@ -111,9 +111,16 @@ def parse_env(raw, where: str, source: Path) -> dict[str, str]:
 def parse_seed(raw, where: str, source: Path, config_dir: Path) -> Seed:
     """Turn a seed string into one of the three real sources.
 
-    The vocabulary is closed: `fresh`, `chrome`, `chrome:<Profile Name>`, or a path
-    (which must start with `.`, `/`, or `~` so a typo'd keyword can never be mistaken
-    for a relative path that happens not to exist yet).
+    The vocabulary is closed: `fresh`, `chrome`, `chrome:<dir>`, or a path (which must
+    start with `.`, `/`, or `~` so a typo'd keyword can never be mistaken for a relative
+    path that happens not to exist yet).
+
+    `chrome` is `chrome:Default` — `SeedChrome.profile` defaults to the directory Chrome
+    gives everyone, and `configwrite.render_seed` collapses that variant back to the bare
+    word, so the pair is one value with a short spelling rather than two seeds that
+    happen to coincide. The argument names a *directory* under the user-data-dir; Chrome
+    displays the `Default` directory as "Person 1" in its own menu, so the label a user
+    reads there is not a name this vocabulary accepts.
     """
     if not isinstance(raw, str):
         raise CromError(f"{source}: {where}.seed must be a string")
@@ -127,7 +134,7 @@ def parse_seed(raw, where: str, source: Path, config_dir: Path) -> Seed:
         return SeedPath(_parse_seed_path(raw, where, source, config_dir))
     raise CromError(
         f"{source}: {where}.seed = {raw!r} is not recognised. Use 'fresh', 'chrome', "
-        f"'chrome:<Profile Name>', or a path beginning with './', '/', or '~'."
+        f"'chrome:<dir>', or a path beginning with './', '/', or '~'."
     )
 
 
@@ -183,7 +190,8 @@ def _parse_chrome_profile(which: str, where: str, source: Path) -> str:
     if not which:
         raise CromError(
             f"{source}: {where}.seed = 'chrome:' names no profile. Use 'chrome' for the "
-            f"default profile, or 'chrome:<Profile Name>' for a specific one."
+            f"Default profile, or 'chrome:<dir>' — naming a profile DIRECTORY such as "
+            f"'Profile 1', not the label Chrome shows in its profile menu."
         )
     # Each clause tests the representation it is actually about. Mixing them — a
     # normalized component count against a raw-string comparison — leaves a gap between
