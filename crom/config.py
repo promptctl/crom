@@ -1,19 +1,28 @@
-"""Discovers a project's crom config and parses any config file into a `Scope`.
+"""Discovers a project's crom config and turns any config file into a `Scope`.
 
 This module is the border checkpoint for everything a human writes on disk
 ([LAW:parse-dont-validate]): a config file goes in as untyped TOML and comes out as a
 `Scope` whose every field is already legal — names validated, seeds recognised, paths
 made absolute, reserved Chrome switches rejected. Nothing downstream re-checks a key,
 because downstream code only ever sees a `Scope`.
+
+`load_file` states the stronger theorem: a config file that exists yields a `Scope`,
+full stop. A file crom cannot read is reset to the default crom would have written and
+the original is kept beside it, because "repair this file by hand before any command
+will run" is a prerequisite the user should not be handed — and the file crom locks
+them out of is usually one crom wrote. `parse` remains the pure half and never writes.
 """
 
 import os
 import tomllib
 from pathlib import Path
 
+from . import configwrite, registry, report
 from .browser import find_chrome
+from .locking import exclusive
 from .model import (
     DEFAULT_SEED,
+    FALLBACK_NAMESPACE,
     MAX_PORT,
     MIN_PORT,
     USER_NAMESPACE,
@@ -26,6 +35,7 @@ from .model import (
     SeedChrome,
     SeedFresh,
     SeedPath,
+    slug_for,
     validate_name,
 )
 from .paths import (
@@ -394,10 +404,91 @@ def reject_duplicate_ports(profiles: dict[str, ProfileSpec], source: Path) -> No
         claimed[spec.port] = spec.name
 
 
-def load_file(source: Path, *, namespace: str | None = None) -> Scope:
+# --- loading, and the repair that makes it total -------------------------------------
+
+
+def load_file(source: Path, *, namespace: str | None = None, log=report.to_stderr) -> Scope:
+    """The `Scope` this config file declares, resetting the file if it declares none.
+
+    Every path that reads a config on disk comes through here — `load_ambient`,
+    `load_user_scope`, and `resolve.scope_for` — which is what lets the repair live in
+    one place instead of at each of them. [LAW:single-enforcer]
+    """
     if not source.is_file():
         raise NotFound(f"config file not found: {source}")
-    return parse(source.read_text(), source, namespace=namespace)
+    try:
+        return parse(source.read_text(), source, namespace=namespace)
+    except CromError as unreadable:
+        return _reset_unreadable(source, namespace, unreadable, log)
+
+
+def _reset_unreadable(source: Path, namespace: str | None, unreadable: CromError, log) -> Scope:
+    """Replace a config crom cannot parse with the default, and return what that declares.
+
+    An unparseable config is total: `parse` is strict, so a single bad line takes out
+    every command in the project — including `crom init` and `crom rm`, the two that
+    might have repaired it. The user is left with a tool that can only tell them it is
+    broken, which is the one situation where "fix it yourself first" is least useful.
+
+    The reset is proven rather than attempted. The default text is parsed *before*
+    anything on disk moves, so a failure that is not about this file survives it: a
+    `chrome_binary` that has been uninstalled, or no Chrome anywhere on the machine,
+    makes the default fail identically — and then the original error is re-raised and the
+    user's file is never touched. Resetting a config over a problem a reset cannot fix
+    would destroy their work and still leave crom broken. [LAW:no-silent-failure]
+
+    Under the same lock `configwrite` writes beneath, and re-parsing inside it, so two
+    crom processes meeting one broken file produce one reset and one no-op rather than
+    two resets — the second of which would set aside the first's freshly written default
+    and file the user's real config away one name further along.
+    """
+    with exclusive(source):
+        try:
+            return parse(source.read_text(), source, namespace=namespace)
+        except CromError:
+            pass
+
+        text = configwrite.default_text(
+            # `None` is the user scope, whose template carries no `namespace` key —
+            # `load_user_scope` passes `USER_NAMESPACE` in precisely because that file
+            # may not name itself.
+            namespace=None if namespace == USER_NAMESPACE else _namespace_for(source),
+            seed=DEFAULT_SEED,
+            base=source.parent,
+        )
+        try:
+            healed = parse(text, source, namespace=namespace)
+        except CromError:
+            raise unreadable from None
+
+        kept = configwrite.reset(source, text)
+        log(
+            f"{source} could not be read: {unreadable}\n"
+            f"crom reset it to the default; your original is kept at {kept}."
+        )
+        return healed
+
+
+def _namespace_for(source: Path) -> str:
+    """The namespace a reset project config should declare, when the file cannot say.
+
+    The registry is asked first because it is crom's own record of which file owns which
+    namespace, and it survives the file becoming unreadable. Keeping the old name keeps
+    the project's port reservations and profile directories, which are keyed on it — a
+    reset that renamed the namespace would silently hand the project a fresh set of both
+    and orphan everything already pointing at the old ports.
+
+    The directory name is the fallback, and it is the same rule `crom init` applies, so a
+    project crom has never recorded is reset to the name it would have been given.
+    [LAW:one-source-of-truth]
+    """
+    remembered = next((name for name, path in registry.namespaces().items() if path == source), None)
+    candidate = remembered or slug_for(source.parent.name)
+    # `parse` refuses `user` in a project file, which would make the default text fail to
+    # parse and send `_reset_unreadable` down its "not about this file" arm — leaving a
+    # directory literally named `user` unrepairable for a reason that has nothing to do
+    # with the user's config.
+    return FALLBACK_NAMESPACE if candidate == USER_NAMESPACE else candidate
 
 
 def load_user_scope() -> Scope:
