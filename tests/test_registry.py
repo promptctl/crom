@@ -45,14 +45,18 @@ class LedgerTest(unittest.TestCase):
         """A recorded claimant whose file no longer exists is not a second project — it
         is this ledger remembering a deleted one. Refusing on its behalf blocked every
         command in the live project until the user ran `crom forget`, which was both the
-        only possible response and one crom can make itself."""
+        only possible response and one crom can make itself.
+
+        The reservations stay: an absent file is not proof the project is gone, and a
+        released port is irreversible. Only `crom forget`, run deliberately, releases them.
+        """
         registry.remember_namespace("app", Path("/gone/.crom.toml"))
-        registry.port_for(ProfileRef("app", "dev"), pinned=None, source=None)
+        before = registry.port_for(ProfileRef("app", "dev"), pinned=None, source=None)
 
         registry.remember_namespace("app", Path("/live/.crom.toml"), log=lambda _: None)
 
         self.assertEqual(registry.namespaces()["app"], Path("/live/.crom.toml"))
-        self.assertNotIn("app/dev", registry.reservations())
+        self.assertEqual(registry.reservations()["app/dev"].port, before)
 
     def test_remembering_the_same_config_again_is_not_a_conflict(self):
         registry.remember_namespace("app", Path("/one/.crom.toml"))

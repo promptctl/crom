@@ -7,6 +7,7 @@ everything crom did not explicitly change.
 """
 
 import os
+import shutil
 from collections.abc import Iterator
 from contextlib import contextmanager
 from itertools import count
@@ -282,6 +283,13 @@ def reset(path: Path, text: str) -> Path:
     The kept name is claimed with `O_CREAT | O_EXCL` and walked forward on collision, so
     a second reset cannot overwrite the first reset's evidence — which would lose exactly
     the data this function exists to preserve.
+
+    The old file is *copied* aside and the new one swapped in with a single `os.replace`,
+    so the config never stops existing. Renaming the original away and then writing the
+    replacement leaves a window with no config at all: `discover` takes no lock, so a
+    concurrent `crom up` in that project would fall through to the user scope and launch
+    the wrong profile — and a write that failed in that window (a full disk, a read-only
+    mount) would leave the project with nothing rather than with the file it started with.
     """
     with _writing(path):
         for attempt in count(1):
@@ -290,10 +298,12 @@ def reset(path: Path, text: str) -> Path:
                 os.close(os.open(kept, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644))
             except FileExistsError:
                 continue
-            os.replace(path, kept)
+            shutil.copyfile(path, kept)
             # Not `_save`: this is deliberately not a round-tripped edit of the user's
             # document. The document is what could not be parsed.
-            path.write_text(text)
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(text)
+            os.replace(tmp, path)
             return kept
 
 

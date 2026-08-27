@@ -105,8 +105,12 @@ def scope_for(namespace: str, ambient: Scope, log=report.to_stderr) -> Scope:
     its own namespace, is crom's memory outliving the thing it remembered. Both used to
     end in "run `crom forget <namespace>`" — a chore handed to the user for a mess crom
     made, and the only possible response to it. So the forget happens here and the
-    namespace is simply reported unknown, which is what it now is. The release is
-    announced because it frees port reservations. [LAW:no-silent-failure]
+    namespace is simply reported unknown, which is what it now is.
+
+    `forget_mapping`, not `forget_namespace`: only crom's record of *where* the project
+    lives is dropped, never the ports reserved under it. An absent file is not proof the
+    project is gone — an unmounted volume looks the same — and released ports are
+    irreversible. See `registry.forget_mapping`.
     """
     if namespace == ambient.namespace:
         return ambient
@@ -117,8 +121,11 @@ def scope_for(namespace: str, ambient: Scope, log=report.to_stderr) -> Scope:
         case Scope() as scope:
             return scope
         case str() as stale:
-            released = registry.forget_namespace(namespace)
-            log(f"Forgot namespace '{namespace}': {stale} ({released} port reservation(s) released).")
+            registry.forget_mapping(namespace)
+            log(
+                f"Forgot where namespace '{namespace}' lives: {stale}. Its reserved ports "
+                f"are kept — `crom forget {namespace}` releases them if the project is gone."
+            )
 
     options = ", ".join(sorted({USER_NAMESPACE, ambient.namespace, *registry.namespaces()}))
     raise NotFound(f"unknown namespace '{namespace}'. Known namespaces: {options}")
@@ -132,6 +139,11 @@ def _remembered(namespace: str) -> Scope | str | None:
     three answers, so "both set" and "neither set but stale" would be expressible and
     every caller would have to know by convention that they never happen.
     [LAW:types-are-the-program]
+
+    `load_file`, deliberately not `load_ambient`'s repairing path: this reaches a config
+    belonging to a project the user is not standing in, and rewriting it from here meant
+    a single `crom list --all` could reset every registered project's `.crom.toml` on the
+    machine. A foreign config that will not parse is reported, not repaired.
     """
     source = registry.namespaces().get(namespace)
     if source is None:
