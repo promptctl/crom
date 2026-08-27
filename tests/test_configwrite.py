@@ -16,7 +16,6 @@ from unittest import mock
 from crom import config, configwrite, locking
 from crom.model import (
     DEFAULT_SEED,
-    Conflict,
     CromError,
     NotFound,
     ProfileSpec,
@@ -58,32 +57,33 @@ class RenderSeedTest(unittest.TestCase):
         self.assertEqual(configwrite.render_seed(SeedChrome(profile="Work"), self.base), "chrome:Work")
 
 
-class InitProjectTest(unittest.TestCase):
+class WriteDefaultTest(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp())
         self.target = self.root / ".crom.toml"
 
-    def test_refusing_an_existing_file_is_the_documented_conflict(self):
-        """A bare FileExistsError escaped the CLI's exit-code contract as a traceback."""
-        self.target.write_text("")
-        with self.assertRaises(Conflict):
-            configwrite.init_project(self.target, "myapp", DEFAULT_SEED)
+    def test_an_existing_file_is_left_alone_and_reported_as_not_written(self):
+        """The bool is the whole contract: `crom init` turns it into a verb, and the
+        repair paths in `config` and `resolve` ignore it. What none of them may get is a
+        clobbered file, so the existing bytes must survive untouched."""
+        self.target.write_text("mine\n")
+
+        self.assertFalse(
+            configwrite.write_default(self.target, namespace="myapp", seed=DEFAULT_SEED)
+        )
+        self.assertEqual(self.target.read_text(), "mine\n")
 
     def test_only_one_of_two_concurrent_inits_writes_the_config(self):
         """The refusal is the kernel's, via O_CREAT|O_EXCL, not a check of ours.
 
         An `exists()` test followed by a write is check-then-act: both callers could pass
         it and the second would clobber the first's config — possibly with a different
-        namespace — while both reported success.
+        namespace — while both reported True.
         """
-        results: list[str] = []
+        results: list[bool] = []
 
         def go(namespace: str):
-            try:
-                configwrite.init_project(self.target, namespace, DEFAULT_SEED)
-                results.append("wrote")
-            except Conflict:
-                results.append("refused")
+            results.append(configwrite.write_default(self.target, namespace=namespace, seed=DEFAULT_SEED))
 
         threads = [threading.Thread(target=go, args=(n,)) for n in ("alpha", "beta")]
         for t in threads:
@@ -91,10 +91,30 @@ class InitProjectTest(unittest.TestCase):
         for t in threads:
             t.join()
 
-        self.assertEqual(sorted(results), ["refused", "wrote"])
+        self.assertEqual(sorted(results), [False, True])
         # And the file belongs wholly to the winner — not a mix of both templates.
         written = self.target.read_text()
         self.assertEqual(written.count("namespace = "), 1)
+
+    def test_the_value_at_a_key_the_file_does_not_have_is_none(self):
+        """`crom init`'s convergence reads two facts back out of an existing file, and a
+        hand-written config need not carry either. A walk that assumed each level was a
+        table would raise `AttributeError` from a command whose job is to report that the
+        project is already configured."""
+        self.target.write_text('namespace = "myapp"\nprofiles = "typo"\n')
+
+        self.assertEqual(configwrite.value_at(self.target, "namespace"), "myapp")
+        self.assertIsNone(configwrite.value_at(self.target, "defaults", "seed"))
+        self.assertIsNone(configwrite.value_at(self.target, "profiles", "ci"))
+
+    def test_the_value_at_a_key_is_what_the_written_template_holds(self):
+        """Read back through `value_at` rather than compared to a spelling: `crom init`
+        reports these two values as the project's own, so what it reads must be what the
+        template writes."""
+        configwrite.write_default(self.target, namespace="myapp", seed=SeedFresh())
+
+        self.assertEqual(configwrite.value_at(self.target, "namespace"), "myapp")
+        self.assertEqual(configwrite.value_at(self.target, "defaults", "seed"), "fresh")
 
 
 class LockingTest(unittest.TestCase):
@@ -163,7 +183,7 @@ class ConcurrentDeclareTest(unittest.TestCase):
 
         def declare(name: str):
             try:
-                configwrite.add_profile(
+                configwrite.ensure_profile(
                     target,
                     ProfileSpec(name=name, seed=SeedFresh()),
                     header='namespace = "myapp"\n',
@@ -204,12 +224,6 @@ class HeaderInvariantTest(unittest.TestCase):
 
     def test_creating_a_config_without_a_header_is_refused(self):
         with self.assertRaisesRegex(CromError, "will not create a config without a header"):
-            configwrite.add_profile(self.target, ProfileSpec(name="ci", seed=SeedFresh()))
-        self.assertFalse(self.target.exists())
-
-    def test_the_same_refusal_applies_to_the_converging_twin(self):
-        """`ensure_profile` is the path migration takes, so it needs the rule too."""
-        with self.assertRaisesRegex(CromError, "will not create a config without a header"):
             configwrite.ensure_profile(self.target, ProfileSpec(name="ci", seed=SeedFresh()))
         self.assertFalse(self.target.exists())
 
@@ -217,14 +231,14 @@ class HeaderInvariantTest(unittest.TestCase):
         """The header is for creation only — an existing file owns its own preamble, and
         appending to one must never duplicate or displace it."""
         self.target.write_text('namespace = "myapp"\n')
-        configwrite.add_profile(self.target, ProfileSpec(name="ci", seed=SeedFresh()))
+        configwrite.ensure_profile(self.target, ProfileSpec(name="ci", seed=SeedFresh()))
 
         scope = config.parse(self.target.read_text(), self.target)
         self.assertEqual(sorted(scope.profiles), ["ci"])
         self.assertEqual(self.target.read_text().count("namespace = "), 1)
 
     def test_a_created_config_round_trips_through_the_parser(self):
-        configwrite.add_profile(
+        configwrite.ensure_profile(
             self.target,
             ProfileSpec(name="ci", seed=SeedFresh()),
             header='namespace = "myapp"\n',
@@ -260,7 +274,7 @@ class MalformedConfigTest(unittest.TestCase):
         raw TypeError rather than a CromError."""
         self.target.write_text('namespace = "myapp"\nprofiles = "typo"\n')
         with self.assertRaisesRegex(CromError, "`profiles` must be a table"):
-            configwrite.add_profile(self.target, ProfileSpec(name="ci", seed=SeedFresh()))
+            configwrite.ensure_profile(self.target, ProfileSpec(name="ci", seed=SeedFresh()))
 
     def test_a_profiles_key_that_is_not_a_table_cannot_answer_declares(self):
         """The quieter half of the same defect: `name in "typo"` is a *substring* test.
@@ -311,32 +325,37 @@ class WriteFailureTest(unittest.TestCase):
             Path, "write_text", side_effect=OSError(28, "No space left on device")
         ):
             with self.assertRaisesRegex(CromError, "No space left on device"):
-                configwrite.add_profile(self.target, ProfileSpec(name="ci", seed=SeedFresh()))
+                configwrite.ensure_profile(self.target, ProfileSpec(name="ci", seed=SeedFresh()))
 
-    def test_a_declaration_that_already_exists_is_still_a_plain_collision(self):
-        """The deliberate `FileExistsError` `add_profile` raises for the concurrent-add
-        race is raised outside `_declare`, so wrapping the write path must not capture
-        it — `add_cmd` distinguishes it from every other failure to decide whether
-        releasing the port reservation would strip a live profile of its port."""
-        configwrite.add_profile(
+    def test_a_declaration_that_already_exists_is_a_reported_no_op(self):
+        """Not a failure, and not silent either: the bool is how `crom add` chooses
+        between "Declared" and "Already declared", and how it knows the port reservation
+        belongs to a declaration that is already on disk rather than to a write of its own
+        that must be rolled back. A second call must also leave the first's stanza intact
+        rather than rewriting it with the new spec."""
+        configwrite.ensure_profile(
             self.target, ProfileSpec(name="ci", seed=SeedFresh()), header='namespace = "m"\n'
         )
-        with self.assertRaises(FileExistsError):
-            configwrite.add_profile(self.target, ProfileSpec(name="ci", seed=SeedFresh()))
+        before = self.target.read_text()
+
+        self.assertFalse(
+            configwrite.ensure_profile(self.target, ProfileSpec(name="ci", seed=SeedChrome()))
+        )
+        self.assertEqual(self.target.read_text(), before)
 
     def test_init_project_reports_an_unwritable_directory(self):
         """`os.open` raises `PermissionError`, which is an `OSError` but not a
         `FileExistsError`, so it fell straight through the narrow collision handler."""
         with mock.patch("crom.configwrite.os.open", side_effect=PermissionError(13, "denied")):
             with self.assertRaisesRegex(CromError, "denied"):
-                configwrite.init_project(self.target, "myapp", DEFAULT_SEED)
+                configwrite.write_default(self.target, namespace="myapp", seed=DEFAULT_SEED)
 
     def test_init_project_reports_a_failing_mkdir(self):
         """The `mkdir` sat above the `try` entirely — not merely unconverted, but outside
         the block written to handle this call's failures."""
         with mock.patch.object(Path, "mkdir", side_effect=PermissionError(13, "denied")):
             with self.assertRaisesRegex(CromError, "denied"):
-                configwrite.init_project(self.root / "sub" / "config.toml", "myapp", DEFAULT_SEED)
+                configwrite.write_default(self.root / "sub" / "config.toml", namespace="myapp", seed=DEFAULT_SEED)
 
     def test_the_template_records_the_seed_it_was_given(self):
         """`[defaults].seed` is written from the caller's value, never a literal.
@@ -346,7 +365,7 @@ class WriteFailureTest(unittest.TestCase):
         real browser outside a project and an empty one inside it. Rendering whatever it
         is handed is what keeps the two templates from disagreeing again.
         """
-        configwrite.init_project(self.target, "myapp", SeedChrome(profile="Work"))
+        configwrite.write_default(self.target, namespace="myapp", seed=SeedChrome(profile="Work"))
         self.assertIn('seed = "chrome:Work"', self.target.read_text())
 
     def test_a_seed_containing_a_quote_is_written_as_readable_toml(self):
@@ -362,19 +381,21 @@ class WriteFailureTest(unittest.TestCase):
         of a rule it already owns.
         """
         seed = SeedChrome(profile='My"Work')
-        configwrite.init_project(self.target, "myapp", seed)
+        configwrite.write_default(self.target, namespace="myapp", seed=seed)
 
         # Read back through crom's own parser, which is the property that actually
         # matters: the config crom writes is one crom can load on the next command.
         scope = config.parse(self.target.read_text(), self.target)
         self.assertEqual(scope.default_seed, seed)
 
-    def test_init_project_still_reports_an_existing_config_as_a_conflict(self):
-        """`Conflict` is a `CromError`, so the translation must pass it through with its
-        own meaning and its own exit code rather than flattening it."""
-        configwrite.init_project(self.target, "myapp", DEFAULT_SEED)
-        with self.assertRaises(Conflict):
-            configwrite.init_project(self.target, "myapp", DEFAULT_SEED)
+    def test_a_diagnosis_from_inside_the_write_keeps_its_own_message(self):
+        """`_writing` translates `OSError` into a `CromError` naming the file. A
+        `CromError` raised by something nested inside it is already the precise message,
+        and rewording it as a filesystem failure would send the reader to check the wrong
+        fact — so it must pass through untouched."""
+        with mock.patch.object(Path, "mkdir", side_effect=CromError("the precise reason")):
+            with self.assertRaisesRegex(CromError, "^the precise reason$"):
+                configwrite.write_default(self.target, namespace="myapp", seed=DEFAULT_SEED)
 
 
 if __name__ == "__main__":

@@ -17,7 +17,6 @@ import tomlkit
 
 from .locking import exclusive
 from .model import (
-    Conflict,
     CromError,
     NotFound,
     ProfileSpec,
@@ -159,8 +158,11 @@ def _writing(path: Path) -> Iterator[None]:
     `ensure_profile` before anything else in `main` and would therefore have produced
     that traceback on *every* command.
 
-    `CromError` passes through untouched so a `Conflict` raised inside — `init_project`
-    reporting a config that already exists — keeps its own meaning and its exit code.
+    `CromError` passes through untouched: anything nested that raises one has already
+    produced the precise diagnosis — the file it names, the key, the fix — and rewording
+    it as a filesystem failure would send the reader to check the wrong fact. The clause
+    guards the invariant rather than a known caller, which is what makes it safe to nest
+    a checkpoint inside a write later without discovering this by way of a bad message.
     """
     try:
         yield
@@ -236,7 +238,11 @@ def write_default(path: Path, *, namespace: str | None, seed: Seed) -> bool:
     while both reported success.
 
     Returning a bool rather than raising leaves the meaning of "it was already there" to
-    the caller: `init_project` calls it a conflict, and the repair paths call it done.
+    the caller. Every caller now reads it the same way — as done — and uses it only to
+    choose a verb: `crom init` says "wrote" or "already configures this project", and the
+    repair paths in `config` and `resolve` say nothing at all. It stays a bool rather than
+    becoming a silent no-op because "did this call create the file" is the one fact none
+    of them can recover afterwards.
     """
     text = default_text(namespace=namespace, seed=seed, base=path.parent)
     # The `mkdir` sits inside the translation too, and the `FileExistsError` catch stays
@@ -255,21 +261,25 @@ def write_default(path: Path, *, namespace: str | None, seed: Seed) -> bool:
     return True
 
 
-def init_project(path: Path, namespace: str, seed: Seed) -> None:
-    """Write a new project config, or refuse if one is already there.
+def value_at(path: Path, *keys: str) -> object | None:
+    """What the config at `path` records at `keys`, or None when it records nothing there.
 
-    `seed` is written into `[defaults]` rather than defaulted in code, so the project's
-    answer to "where does a new profile's data come from" is visible in the file the
-    team commits. It arrives already parsed — `cli.init_cmd` runs `--seed` through
-    `config.parse_seed`, the same checkpoint a value read back from this file goes
-    through. [LAW:parse-dont-validate] there is no second spelling of the vocabulary here.
+    The read behind `crom init`'s convergence: an already-initialised project is a
+    conflict only when its file already says something *other* than what the user asked
+    for, and answering that needs the file's own spelling of the facts `crom init` writes.
 
-    `Conflict` rather than the bare `FileExistsError` the kernel hands back: this is the
-    exit-4 case the CLI contract promises. Raised here rather than translated at the call
-    site so no future caller can reintroduce the gap by forgetting a wrapper.
+    Deliberately the raw TOML value rather than a parsed one. `config.parse` would reject
+    the whole file over an unrelated defect — an unknown key, a typo'd `chrome_binary` —
+    and `crom init` reporting one of those instead of "already initialised" would make
+    the convergence conditional on the rest of the file being perfect. Comparison is
+    against a string the caller renders, so no more than the raw value is needed.
     """
-    if not write_default(path, namespace=namespace, seed=seed):
-        raise Conflict(f"{path} already exists")
+    value: object = _load(path)
+    for key in keys:
+        if not isinstance(value, dict):
+            return None
+        value = value.get(key)
+    return value
 
 
 def reset(path: Path, text: str) -> Path:
@@ -384,19 +394,27 @@ def _stanza(spec: ProfileSpec, base: Path) -> tomlkit.items.Table:
     return table
 
 
-def add_profile(path: Path, spec: ProfileSpec, *, header: str = "") -> None:
-    """Declare a profile the user asked to create. A name already taken is a conflict."""
-    if not _declare(path, spec, header):
-        raise FileExistsError(f"{path}: profile '{spec.name}' is already declared")
-
-
 def ensure_profile(path: Path, spec: ProfileSpec, *, header: str = "") -> bool:
     """Declare a profile unless it is already declared; report whether we wrote it.
 
-    The converging twin of `add_profile`, for callers whose goal is that the declaration
-    *exist* rather than that they be the one to create it. Migration is the caller that
-    needs this: it re-runs from the top after a failed attempt, so a name it already
-    wrote must be a no-op rather than a collision.
+    Every caller's goal is that the declaration *exist*, not that they be the one to
+    create it, so a name already taken is a no-op rather than a failure. Migration needs
+    this because it re-runs from the top after a failed attempt; `_bootstrap_user_config`
+    needs it because two crom processes on a fresh machine both find no user config; and
+    `crom add` needs it because a user asking for a profile that is already there has
+    asked for a state the config is already in.
+
+    The raising twin this replaced — `add_profile`, which turned a taken name into a
+    `FileExistsError` for `crom add` to translate into exit 4 — made `crom add dev` twice
+    a failure on the second call. Whether *this* process wrote the stanza is a fact about
+    crom's plumbing, and it was being reported to the user as a fact about their project.
+    [LAW:no-silent-failure] cuts the other way here than it looks: the bool still carries
+    the difference, so `crom add` can say "Already declared" instead of "Declared", and
+    nothing is hidden — only the exit code stops lying about whether the request was met.
+
+    `crom add`'s check that the existing declaration *matches* what was asked for lives
+    in the CLI, where the knowledge of which options the user actually typed lives. This
+    is the writer; it has no opinion about that.
     """
     return _declare(path, spec, header)
 
