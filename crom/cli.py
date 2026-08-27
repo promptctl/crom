@@ -210,6 +210,13 @@ def main(ctx):
     to but never declared is declared, and a config file crom cannot read is
     reset to the default with your original kept beside it as `<name>.broken`.
     Both are reported on stderr as they happen.
+
+    Every command asks for a state, not a change, so asking twice is not an
+    error: `crom init` in a project that has a .crom.toml, `crom add` of a
+    profile already declared, and `crom up` of a browser already running all
+    report what is there and exit 0. Only a request for something *different*
+    from what exists is refused — `crom add dev --port 9500` when `dev` is
+    declared on another port names the difference and changes nothing.
     """
     migrate.run_if_needed()
     _bootstrap_user_config()
@@ -336,6 +343,35 @@ def _scopes_to_list(session: _Session, everything: bool) -> tuple[list[Scope], l
     return scopes, unavailable
 
 
+def _reject_restatement(
+    subject: str, facts: tuple[tuple[str, str | None, str | None], ...], remedy: str
+) -> None:
+    """Refuse to call a request already-done when it asks for something else.
+
+    crom converges: `crom init` in an initialised project and `crom add` of a profile that
+    already exists both report what is there and exit 0, because the state the user asked
+    for is the state the project is in. That is only honest while the existing thing *is*
+    what was asked for — accepting `crom add ci --port 9500` against a `ci` on 9401 and
+    reporting success would be crom claiming work it did not do, and the user finding out
+    at launch. [LAW:no-silent-failure] convergence reports a satisfied request; it does not
+    swallow an unsatisfiable one.
+
+    Each fact is `(label, declared, asked)` in the config file's own vocabulary, so the
+    message reads back in the spelling the user typed and the file holds. An `asked` of
+    None is a fact the user did not state and therefore cannot contradict: `crom add ci`
+    with no options asks only that `ci` exist. That convention is `ProfileSpec`'s — an
+    absent `seed` means "inherit `[defaults]`", not "seed is nothing" — so statedness is
+    read off the type rather than tracked alongside it. [LAW:types-are-the-program]
+    """
+    differing = [
+        f"  {label}: declared {declared or '(unset)'}, you asked for {asked}"
+        for label, declared, asked in facts
+        if asked is not None and declared != asked
+    ]
+    if differing:
+        raise Conflict("\n".join((subject, *differing, remedy)))
+
+
 @main.command("add")
 @click.argument("name")
 @click.option(
@@ -351,7 +387,7 @@ def _scopes_to_list(session: _Session, everything: bool) -> tuple[list[Scope], l
 @click.option("--port", type=int, default=None, help="Pin the CDP port instead of letting crom assign one.")
 @click.pass_obj
 def add_cmd(session: _Session, name: str, seed_text: str | None, flags: tuple[str, ...], port: int | None):
-    """Declare a new profile in the config governing this directory."""
+    """Declare a profile in the config governing this directory. Idempotent."""
     validate_name("profile name", name)
     scope = session.scope
     target = scope.source or user_config_file()
@@ -373,19 +409,6 @@ def add_cmd(session: _Session, name: str, seed_text: str | None, flags: tuple[st
         # one home; this path was bypassing it rather than needing a copy.
         port=parse_port(port, where, target),
     )
-    # Every reason to refuse this profile is checked before anything is persisted, and
-    # the two orderings that look equivalent are not:
-    #
-    # Writing before resolving would leave a refused profile in the file — a colliding
-    # pinned port is rejected during resolution, but its declaration would already be on
-    # disk, and the parser rejects such a file wholesale on the next load. Every command
-    # in the project, `crom rm` included, would then fail on the file the user needs crom
-    # to repair.
-    #
-    # Resolving before checking the name would persist a port for a profile that is about
-    # to be refused: resolution reserves one, so `crom add ci --port 9500` against an
-    # existing `ci` would move the real `ci` onto 9500 and break whatever already points
-    # at its old port — a failed command silently repointing a live profile.
     # `_declare` creates the file when it is missing, and the header it would write is
     # the *user* scope's — which carries no `namespace` key, because only the project
     # template has one. So recreating a vanished project config from it produces a file
@@ -402,10 +425,64 @@ def add_cmd(session: _Session, name: str, seed_text: str | None, flags: tuple[st
     ):
         click.echo(f"Recreated {target}, which had been removed since crom read it", err=True)
 
-    if configwrite.declares(target, name):
-        raise Conflict(f"{target}: profile '{name}' is already declared")
-    config.reject_duplicate_ports({**scope.profiles, name: spec}, target)
-    profile = resolver.resolve_spec(scope, spec)
+    # What the config already says about this name, or — when it says nothing — what this
+    # command is about to make it say. Defaulting to `spec` is what lets one path serve
+    # both cases: everything below resolves, reports and writes `declared`, and the
+    # restatement check compares `spec` against a declaration that is `spec` itself when
+    # the profile is new, so it can only fire on a profile that already exists.
+    # [LAW:dataflow-not-control-flow] the same operations run either way; only the values
+    # differ, and the verb at the end is the only thing that reads which case this was.
+    #
+    # Read from `scope` rather than re-read from disk: `scope` *is* this file, parsed at
+    # discovery, and it is what `reject_duplicate_ports` and `resolve_spec` below are
+    # already working from. A second read here would be a second picture of one file that
+    # could disagree with the first. [LAW:one-source-of-truth]
+    declared = scope.profiles.get(name, spec)
+
+    # Resolution comes before the refusal here, which the previous ordering could not
+    # afford: it resolved the user's `spec`, so `crom add ci --port 9500` against an
+    # existing `ci` would have moved the real `ci` onto 9500 before noticing the name was
+    # taken — a failed command silently repointing a live profile and breaking whatever
+    # already pointed at its old port. Resolving `declared` is that profile's own
+    # resolution, so it reserves nothing a refusal would have to take back, and it is
+    # where the *effective* seed and port come from: `[defaults].seed` inheritance lives
+    # in `resolve_spec`, and re-deriving it here to compare against would be a second copy
+    # of that rule. [LAW:one-source-of-truth]
+    config.reject_duplicate_ports({**scope.profiles, name: declared}, target)
+    profile = resolver.resolve_spec(scope, declared)
+    _reject_restatement(
+        f"{target}: profile '{name}' is already declared, and this asks to change it:",
+        (
+            (
+                "seed",
+                configwrite.render_seed(profile.seed, scope.config_dir),
+                None if spec.seed is None else configwrite.render_seed(spec.seed, scope.config_dir),
+            ),
+            # The pin, not the port the profile is on — the one fact here that `[defaults]`
+            # cannot supply. A seed or a flag inherited from `[defaults]` reaches the
+            # profile on every machine that checks the file out, so a profile whose
+            # effective seed is already `fresh` *is* the profile `--seed fresh` asked for.
+            # A port crom assigned is remembered in a machine-local ledger and nowhere in
+            # the file, so `--port 9224` against a profile crom happens to have put on 9224
+            # is asking for something the config does not yet promise. Comparing the
+            # effective port would have let that through as already-done.
+            (
+                "port",
+                str(declared.port)
+                if declared.port is not None
+                else f"(unpinned — crom assigned {profile.port})",
+                None if spec.port is None else str(spec.port),
+            ),
+            # An empty tuple is the only way `--flag` can go unmentioned, so emptiness is
+            # statedness here — unlike `seed` and `port`, which have a real `None`.
+            (
+                "flags",
+                " ".join((*scope.default_flags, *declared.flags)),
+                " ".join((*scope.default_flags, *spec.flags)) if spec.flags else None,
+            ),
+        ),
+        f"Edit {target} directly, or `crom rm {profile.ref}` and add it again.",
+    )
 
     # Resolution above already persisted a port reservation. If the declaration does not
     # land, that reservation is for a profile no config declares — unreachable by `crom
@@ -413,22 +490,20 @@ def add_cmd(session: _Session, name: str, seed_text: str | None, flags: tuple[st
     # later via `_reject_foreign_claim`. Any failure releases it, not only the
     # anticipated one: a permission error or a full disk strands it exactly the same way.
     try:
-        configwrite.add_profile(target, spec, header=header)
-    except FileExistsError as e:
-        # Deliberately no cleanup. `profile.ref` is the profile's shared identity, not
-        # this attempt's, and FileExistsError means a declaration for that name now
-        # exists — written by whichever concurrent `crom add` won. That declaration owns
-        # the reservation, so releasing it here would strip a live profile of its port
-        # and silently move it on the next resolve.
-        raise Conflict(str(e)) from e
+        # The converging write, so a name another `crom add` declared between this
+        # command's read of `scope` and this line is reported as declared rather than as a
+        # collision — and the port is left alone, because it belongs to the ref, which the
+        # winner and this caller share. The raising twin used to make that race an exit-4
+        # and needed a dedicated handler to keep from stripping the winner's port.
+        written = configwrite.ensure_profile(target, declared, header=header)
     except BaseException:
-        # The write failed for some other reason, so no declaration of ours landed. Only
-        # release the port if nothing else claimed the name in the meantime.
+        # The write failed, so no declaration of ours landed. Only release the port if
+        # nothing else claimed the name in the meantime.
         if not configwrite.declares(target, name):
             registry.forget(profile.ref)
         raise
 
-    click.echo(f"Declared {profile.ref} in {target}")
+    click.echo(f"{'Declared' if written else 'Already declared'} {profile.ref} in {target}")
     # The seed is reported even when it came from `[defaults]` rather than from `--seed`:
     # it decides whether the browser opens with the user's logins or empty, which is the
     # one thing about a new profile that surprises people, and inheriting it silently is
@@ -536,17 +611,24 @@ def rm_cmd(session: _Session, ref: str, yes: bool, keep_data: bool):
     ),
 )
 def init_cmd(namespace: str | None, seed_text: str | None):
-    """Create a .crom.toml here so this project gets its own namespace."""
+    """Give this project its own namespace by writing a .crom.toml here. Idempotent."""
     here = Path.cwd()
+    # The config this project already has, else the name a new one takes. Running `crom
+    # init` twice is not an error to report but a state to converge on, so the second run
+    # aims at the file the first one wrote — including under the `.crom/config.toml`
+    # spelling, which is a config crom must not shadow with a second one beside it.
     existing = next((here / c for c in PROJECT_CONFIG_CANDIDATES if (here / c).is_file()), None)
-    if existing:
-        raise Conflict(f"{existing} already exists")
+    target = existing or here / PROJECT_CONFIG_CANDIDATES[0]
 
-    namespace = validate_name("namespace", namespace or slug_for(here.name))
-    if namespace == USER_NAMESPACE:
+    # `namespace` stays as the user typed it — None when they typed nothing — because
+    # that absence is what makes a bare `crom init` in an initialised project a no-op
+    # instead of a rename: a namespace derived from the directory name is crom's guess,
+    # and a guess must not be able to contradict a name the project chose. Only the
+    # written value falls back. [LAW:no-silent-failure]
+    chosen_namespace = validate_name("namespace", namespace or slug_for(here.name))
+    if chosen_namespace == USER_NAMESPACE:
         raise Conflict(f'"{USER_NAMESPACE}" is reserved; pass a different namespace')
 
-    target = here / PROJECT_CONFIG_CANDIDATES[0]
     # Parsed here, before the file exists, through the same checkpoint that reads the
     # value back on the next command — so `crom init --seed chorme` fails naming the
     # vocabulary rather than writing a config that every later command rejects.
@@ -558,7 +640,7 @@ def init_cmd(namespace: str | None, seed_text: str | None):
     # AttributeError the first time someone adds a line that does.
     #
     # Anchored on `target.parent`, not on `here`: a relative seed path is parsed against
-    # the config's own directory everywhere else, and `init_project` renders it back with
+    # the config's own directory everywhere else, and `write_default` renders it back with
     # `render_seed(seed, path.parent)`. Those agree today only because
     # `PROJECT_CONFIG_CANDIDATES[0]` is the bare `.crom.toml`, so its parent *is* `here`.
     # Under the `.crom/config.toml` candidate they diverge, and `--seed ./fixtures` would
@@ -566,14 +648,68 @@ def init_cmd(namespace: str | None, seed_text: str | None):
     # machine's absolute path into a file meant to be committed — the exact outcome
     # `render_seed`'s docstring exists to prevent. [LAW:one-source-of-truth]
     base = target.parent
-    chosen_seed = DEFAULT_SEED if seed_text is None else parse_seed(seed_text, "[defaults]", target, base)
-    configwrite.init_project(target, namespace, chosen_seed)
-    click.echo(f"Wrote {target} (namespace '{namespace}')")
-    click.echo(
-        f"  profiles here start from seed "
-        f"'{configwrite.render_seed(chosen_seed, base)}' — change it in [defaults]"
+    stated_seed = None if seed_text is None else parse_seed(seed_text, "[defaults]", target, base)
+
+    # The refusal here is the kernel's `O_CREAT | O_EXCL`, not a check of ours, so two
+    # `crom init` calls racing in one directory produce one file rather than one clobbering
+    # the other. What changes is only what the loser does with the answer: it reads the
+    # winner's file back below and reports it, since a project that has the config it was
+    # asked for has had the request met.
+    wrote = configwrite.write_default(
+        target,
+        namespace=chosen_namespace,
+        seed=DEFAULT_SEED if stated_seed is None else stated_seed,
     )
-    click.echo(f"Run: crom up  # brings up {namespace}/default")
+
+    # Read back rather than echoed from the variables above, because on the converging
+    # path those variables are what crom *would* have written and the file is what the
+    # project actually declares — and reporting a guessed namespace as though it were the
+    # project's would be the same lie the comment above refuses to write. On the path that
+    # just created the file the two are identical, so one read serves both and doubles as
+    # a check on the write. [FRAMING:representation]
+    declared_namespace = configwrite.value_at(target, "namespace")
+    # Reading a fact obliges this command to handle every shape the file can hold it in.
+    # A hand-written `.crom.toml` with no `namespace`, or one holding a number, is a file
+    # that exists without configuring anything — so converging on it would print
+    # "namespace 'None'" and tell the user to run a `crom up` that `config.parse` is about
+    # to refuse. Said here instead, naming the fix. [LAW:parse-dont-validate] the full
+    # diagnosis stays `config.parse`'s; this is only the checkpoint for the value the
+    # three lines below are about to state as fact.
+    if not isinstance(declared_namespace, str):
+        raise CromError(
+            f"{target} exists but declares no usable `namespace` "
+            f"({declared_namespace!r}), so it does not configure this project.\n"
+            f'Add namespace = "{chosen_namespace}" to it, or delete it and run '
+            f"`crom init` again."
+        )
+    # An absent `[defaults].seed` is not a missing fact: `config.parse` reads that absence
+    # as `DEFAULT_SEED`, so this renders the same answer the next command will act on.
+    declared_seed = configwrite.value_at(target, "defaults", "seed")
+    if declared_seed is None:
+        declared_seed = configwrite.render_seed(DEFAULT_SEED, base)
+
+    _reject_restatement(
+        f"{target} already configures this project, and this asks to change it:",
+        (
+            ("namespace", declared_namespace, namespace),
+            (
+                "[defaults].seed",
+                str(declared_seed),
+                None if stated_seed is None else configwrite.render_seed(stated_seed, base),
+            ),
+        ),
+        f"Edit {target} directly — crom writes a project config once and leaves it "
+        f"yours after that. Changing the namespace also moves this project's ports and "
+        f"profile directories, which is why crom will not do it for you.",
+    )
+
+    click.echo(
+        f"Wrote {target} (namespace '{declared_namespace}')"
+        if wrote
+        else f"{target} already configures this project (namespace '{declared_namespace}')"
+    )
+    click.echo(f"  profiles here start from seed '{declared_seed}' — change it in [defaults]")
+    click.echo(f"Run: crom up  # brings up {declared_namespace}/default")
 
 
 @main.command("config")
