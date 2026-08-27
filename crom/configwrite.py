@@ -44,9 +44,9 @@ namespace = "{namespace}"
 # What every profile below inherits unless it says otherwise.
 #
 # `seed` is where a profile's data comes from the first time crom creates it:
-#   chrome                  a copy of your real Chrome profile — your logins, your
+#   default                 a copy of your default Chrome profile — your logins, your
 #                           extensions, ready to use
-#   chrome:<Profile Name>   a copy of one named profile inside your Chrome
+#   chrome:<Profile Name>   a copy of another named profile inside your Chrome
 #   fresh                   an empty profile; Chrome sets it up on first launch
 #   ./path/to/user-data-dir a copy of a directory you keep yourself
 #
@@ -80,7 +80,7 @@ def render_seed(seed: Seed, base: Path) -> str:
         case SeedFresh():
             return "fresh"
         case SeedChrome(profile="Default"):
-            return "chrome"
+            return "default"
         case SeedChrome(profile=which):
             return f"chrome:{which}"
         case SeedPath(path=path):

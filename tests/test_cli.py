@@ -84,7 +84,7 @@ class CliTest(unittest.TestCase):
     def test_first_run_declares_a_user_default_profile(self):
         self.crom("list")
         self.assertIn('[profiles.default]', user_config_file().read_text())
-        self.assertIn('seed = "chrome"', user_config_file().read_text())
+        self.assertIn('seed = "default"', user_config_file().read_text())
 
     def test_a_corrupt_user_config_is_an_error_not_a_traceback(self):
         """`main` runs `_bootstrap_user_config()` before anything else, on every command.
@@ -631,7 +631,7 @@ class CliTest(unittest.TestCase):
         self.crom("init")
         project = json.loads(self.crom("config", "default", "--json"))["resolved"]["seed"]
         personal = json.loads(self.crom("config", "user/default", "--json"))["resolved"]["seed"]
-        self.assertEqual(project, "chrome")
+        self.assertEqual(project, "default")
         self.assertEqual(project, personal)
 
     def test_an_added_profile_inherits_the_projects_seed(self):

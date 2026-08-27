@@ -204,7 +204,7 @@ def _move_staged(old_dir: Path, destination: Path) -> None:
     interruption between it and the commit leaves the data whole in staging with
     `old_dir` already gone. The retry then saw no `old_dir`, concluded there was nothing
     to do, and left a complete profile stranded in a hidden directory that no code path
-    ever looked at again — and because migration declares these profiles `seed = "chrome"`,
+    ever looked at again — and because migration declares these profiles `seed = "default"`,
     the next `crom up` silently rebuilt the profile from the real Chrome profile instead
     of the user's actual data. Worse, had this function been re-entered, its first act
     was to delete that staging directory as debris.
