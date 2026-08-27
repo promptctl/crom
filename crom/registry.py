@@ -19,6 +19,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import report
 from .locking import exclusive
 from .model import MAX_PORT, MIN_PORT, USER_NAMESPACE, Conflict, CromError, ProfileRef
 from .paths import registry_file
@@ -176,28 +177,56 @@ def namespaces() -> dict[str, Path]:
     return {name: Path(entry["config"]) for name, entry in data["namespaces"].items()}
 
 
-def remember_namespace(namespace: str, source: Path) -> None:
-    """Record which config file owns a namespace, refusing a second claimant.
+def remember_namespace(namespace: str, source: Path, log=report.to_stderr) -> None:
+    """Record which config file owns a namespace, refusing a second *live* claimant.
 
     A namespace is free text a user types, checked for legal characters and nothing
     else, so two unrelated projects can both pick `app`. Left unchecked they would share
     a `ProfileRef` — and therefore one ledger key and one profile directory, mixing two
     projects' cookies and logins in the same Chrome data dir. That is the exact bleed
-    namespaces exist to prevent, so the second claimant is refused by name rather than
+    namespaces exist to prevent, so a second claimant is refused by name rather than
     silently becoming the owner.
+
+    A recorded claimant whose config file is gone is not a second claimant at all — it is
+    this ledger remembering a project that has been deleted, moved, or renamed. Refusing
+    on its behalf blocked every command in the live project until the user ran `crom
+    forget`, which is the one thing they could have done and therefore the one thing crom
+    should not have needed to ask for. The reservations go with the name, so the takeover
+    is announced. [LAW:no-silent-failure]
     """
     with _locked() as path:
         data = _read(path)
         recorded = data["namespaces"].get(namespace, {}).get("config")
         if recorded is not None and recorded != str(source):
-            raise Conflict(
-                f"namespace '{namespace}' is already claimed by {recorded}.\n"
-                f"{source} cannot use it too — they would share profile directories and "
-                f"ports. Rename this project's `namespace`, or run "
-                f"`crom forget {namespace}` if {recorded} is gone."
+            if Path(recorded).is_file():
+                raise Conflict(
+                    f"namespace '{namespace}' is already claimed by {recorded}.\n"
+                    f"{source} cannot use it too — they would share profile directories "
+                    f"and ports. Rename this project's `namespace`."
+                )
+            # Dropped inline rather than through `forget_namespace`: that call takes this
+            # same lock on a second file descriptor, which `flock` treats as a distinct
+            # holder — so the process would block forever waiting for itself.
+            released = _drop_namespace(data, namespace)
+            log(
+                f"Namespace '{namespace}' was claimed by {recorded}, which is gone — "
+                f"released {released} port reservation(s) and gave the name to {source}."
             )
         data["namespaces"][namespace] = {"config": str(source)}
         _write(path, data)
+
+
+def _drop_namespace(data: dict, namespace: str) -> int:
+    """Remove a namespace and every port reserved under it from an open ledger; report
+    how many reservations went. The one spelling of what forgetting a namespace *is*,
+    shared by the command that does it deliberately and the takeover that does it as
+    cleanup. [LAW:one-source-of-truth]"""
+    prefix = f"{namespace}/"
+    released = [key for key in data["ports"] if key.startswith(prefix)]
+    for key in released:
+        del data["ports"][key]
+    data["namespaces"].pop(namespace, None)
+    return len(released)
 
 
 def forget_namespace(namespace: str) -> int:
@@ -216,15 +245,11 @@ def forget_namespace(namespace: str) -> int:
             f"cannot be forgotten — dropping it would release the ports they are using. "
             f"Remove individual profiles with `crom rm {USER_NAMESPACE}/<name>`."
         )
-    prefix = f"{namespace}/"
     with _locked() as path:
         data = _read(path)
-        released = [key for key in data["ports"] if key.startswith(prefix)]
-        for key in released:
-            del data["ports"][key]
-        data["namespaces"].pop(namespace, None)
+        released = _drop_namespace(data, namespace)
         _write(path, data)
-    return len(released)
+    return released
 
 
 def forget(ref: ProfileRef) -> None:

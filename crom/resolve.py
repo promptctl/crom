@@ -9,7 +9,7 @@ nothing about config files, discovery, or ports.
 import re
 from pathlib import Path
 
-from . import registry
+from . import configwrite, registry, report
 from .config import load_file, load_user_scope
 from .model import (
     USER_NAMESPACE,
@@ -23,6 +23,7 @@ from .model import (
     Scope,
     Seed,
 )
+from .paths import user_config_file
 from .policy import LAUNCH_POLICY_FLAGS
 
 # The closed vocabulary a config may interpolate into flags and env values. Closed on
@@ -97,23 +98,46 @@ def build_argv(
     )
 
 
-def scope_for(namespace: str, ambient: Scope) -> Scope:
-    """Load the scope that declares `namespace`, from anywhere on the machine."""
+def scope_for(namespace: str, ambient: Scope, log=report.to_stderr) -> Scope:
+    """Load the scope that declares `namespace`, from anywhere on the machine.
+
+    A registry entry pointing at a config that is gone, or at one that has since renamed
+    its own namespace, is crom's memory outliving the thing it remembered. Both used to
+    end in "run `crom forget <namespace>`" — a chore handed to the user for a mess crom
+    made, and the only possible response to it. So the forget happens here and the
+    namespace is simply reported unknown, which is what it now is. The release is
+    announced because it frees port reservations. [LAW:no-silent-failure]
+    """
     if namespace == ambient.namespace:
         return ambient
     if namespace == USER_NAMESPACE:
         return load_user_scope()
 
-    known = registry.namespaces()
-    source = known.get(namespace)
+    match _remembered(namespace):
+        case Scope() as scope:
+            return scope
+        case str() as stale:
+            released = registry.forget_namespace(namespace)
+            log(f"Forgot namespace '{namespace}': {stale} ({released} port reservation(s) released).")
+
+    options = ", ".join(sorted({USER_NAMESPACE, ambient.namespace, *registry.namespaces()}))
+    raise NotFound(f"unknown namespace '{namespace}'. Known namespaces: {options}")
+
+
+def _remembered(namespace: str) -> Scope | str | None:
+    """What the registry knows about `namespace`: the scope that owns it, a sentence
+    saying why its entry no longer holds, or None if crom has never heard the name.
+
+    Three outcomes, three types. A `(Scope | None, str | None)` pair has four states for
+    three answers, so "both set" and "neither set but stale" would be expressible and
+    every caller would have to know by convention that they never happen.
+    [LAW:types-are-the-program]
+    """
+    source = registry.namespaces().get(namespace)
     if source is None:
-        options = ", ".join(sorted({USER_NAMESPACE, ambient.namespace, *known}))
-        raise NotFound(f"unknown namespace '{namespace}'. Known namespaces: {options}")
+        return None
     if not source.is_file():
-        raise NotFound(
-            f"namespace '{namespace}' was declared in {source}, which no longer exists. "
-            f"Run `crom forget {namespace}` to drop it."
-        )
+        return f"{source} no longer exists"
 
     scope = load_file(source)
     if scope.namespace != namespace:
@@ -123,37 +147,80 @@ def scope_for(namespace: str, ambient: Scope) -> Scope:
         # happily and `resolve_spec` would build a profile directory and port under the
         # name that was asked for — a plausible-looking profile belonging to nothing.
         # [LAW:no-silent-failure]
-        raise NotFound(
-            f"namespace '{namespace}' is stale: {source} now declares "
-            f"'{scope.namespace}'. Run `crom forget {namespace}` to drop the old name."
-        )
+        return f"{source} now declares '{scope.namespace}'"
     return scope
 
 
 def spec_for(ref: ProfileRef, scope: Scope) -> ProfileSpec:
+    """The declaration `ref` names, for callers that must not create one.
+
+    `down` and `rm` converge a profile toward *not* running and *not* existing, so
+    declaring one on their behalf would be crom creating the thing it was asked to take
+    away. Every other caller goes through `resolve_or_declare`, which is why this message
+    no longer suggests `crom add`: the commands that reach it are the ones for which
+    adding the profile is not the repair.
+    """
     spec = scope.profiles.get(ref.name)
     if spec is None:
         declared = ", ".join(sorted(scope.profiles)) or "(none)"
         where = scope.source or "your user config"
-        # Names the way out, not just the fact. This is the error a bare `crom up` in a
-        # project whose only profile was removed produces, and "not declared" alone left
-        # the reader to work out both that `crom add` is the repair and that their
-        # personal profiles are still reachable from here under an explicit namespace.
-        hint = f"Declare it with `crom add {ref.name}`"
-        if not scope.is_user:
-            hint += f", or name a personal profile explicitly: `crom up {USER_NAMESPACE}/default`"
         raise NotFound(
-            f"profile '{ref}' is not declared in {where}.\n"
-            f"Declared there: {declared}\n"
-            f"{hint}."
+            f"profile '{ref}' is not declared in {where}.\nDeclared there: {declared}"
         )
     return spec
 
 
-def resolve(ref: ProfileRef, ambient: Scope) -> ResolvedProfile:
-    scope = scope_for(ref.namespace, ambient)
-    spec = spec_for(ref, scope)
-    return resolve_spec(scope, spec)
+def resolve(ref: ProfileRef, ambient: Scope, log=report.to_stderr) -> ResolvedProfile:
+    """Resolve a profile that must already be declared."""
+    scope = scope_for(ref.namespace, ambient, log)
+    return resolve_spec(scope, spec_for(ref, scope))
+
+
+def resolve_or_declare(ref: ProfileRef, ambient: Scope, log=report.to_stderr) -> ResolvedProfile:
+    """Resolve a profile, declaring it first if nothing declares it yet.
+
+    What `crom up`, `crom port`, `crom env`, `crom mcp` and `crom config <ref>` use:
+    each of them is being asked *where profile X is*, and a profile crom has not been
+    told about yet is not a different question, it is the same question one `crom add`
+    earlier. Naming that command back at the user was crom making them the courier for a
+    step it can take itself, and the case it fires in most is a bare `crom up` in a
+    project whose namespace declares no `default` — the profile every one of these
+    commands defaults to, and therefore the one crom's own contract promises resolves.
+
+    `down` and `rm` deliberately do not come through here; see `spec_for`.
+    """
+    scope = scope_for(ref.namespace, ambient, log)
+    spec = scope.profiles.get(ref.name)
+    return resolve_spec(scope, spec if spec is not None else _declare(ref, scope, log))
+
+
+def _declare(ref: ProfileRef, scope: Scope, log) -> ProfileSpec:
+    """Write the declaration `crom add <name>` would have written, and say so.
+
+    The spec is bare on purpose — no seed, no flags, no pinned port — because that is
+    exactly what `crom add <name>` with no options writes, and an absent `seed` key is
+    how the format spells "inherit `[defaults]`". Filling any of it in would give a
+    profile crom created on the user's behalf properties the user never chose, and freeze
+    the project's `[defaults]` out of it.
+
+    `write_default` first, because the config crom discovered can be gone by the time we
+    write to it — a `git clean`, another agent resetting the workspace — and
+    `configwrite._declare` will not create a project config out of a header that carries
+    no `namespace` key. Recreating it from the same template `crom init` uses is the only
+    write that leaves a file crom can read back.
+    """
+    target = scope.source or user_config_file()
+    configwrite.write_default(
+        target,
+        namespace=None if scope.is_user else scope.namespace,
+        seed=scope.default_seed,
+    )
+    spec = ProfileSpec(name=ref.name)
+    configwrite.ensure_profile(
+        target, spec, header=configwrite.USER_CONFIG_HEADER if scope.is_user else ""
+    )
+    log(f"Declared {ref} in {target} — it was not declared yet.")
+    return spec
 
 
 def resolve_spec(scope: Scope, spec: ProfileSpec) -> ResolvedProfile:
