@@ -50,30 +50,43 @@ def layer(texts: list[str] | tuple[str, ...], where: str) -> tuple[Flag, ...]:
 
 
 def _remedy(first: Flag, second: Flag) -> str:
-    """What to write instead, for each shape a duplicated switch can take.
+    """What to write instead, for each shape two occurrences of one switch can take.
 
-    Three shapes, and the count of occurrences carrying a value tells them apart — so
-    they are enumerated rather than papered over with one sentence. The single sentence
-    this replaced claimed "with its values comma-joined" for all three, which is a false
-    claim in two of them: `--no-pings --no-pings` joins nothing, and `--foo --foo=bar`
-    disagrees about whether `--foo` takes a value at all. crom cannot know which of those
-    two forms was meant — for a switch whose bare and valued spellings mean different
-    things, picking one and presenting it as what the author meant is a guess wearing a
-    suggestion's clothes. [LAW:no-silent-failure]
+    The domain, enumerated exhaustively — every pair of `Flag`s sharing a switch falls in
+    exactly one arm, and the arms are chosen so that none can be reached by a pair it was
+    not written for:
 
-    Comma-joining is the form Chrome accepts for every list-valued switch measured, which
-    is why it is the remedy whenever both occurrences carry values.
+    - **identical** (`--foo --foo`, `--foo=bar --foo=bar`) — a copy-paste, and the
+      author's own text is the answer. This also absorbs the two-valueless pair, which
+      cannot be distinct.
+    - **distinct, both valued** — the comma-joined rewrite. Comma-joining is the form
+      Chrome accepts for every list-valued switch measured, which is what makes single
+      emission cost no expressiveness.
+    - **distinct, kinds differ** (`--foo --foo=bar`) — the two disagree about whether the
+      switch takes a value at all. crom names the disagreement and stops: for a switch
+      whose bare and valued spellings mean different things, picking one and presenting
+      it as the author's intent is a guess wearing a suggestion's clothes.
+      [LAW:no-silent-failure]
+
+    Written this way after two rounds of review found remedies applied to shapes they
+    were not written for — first "with its values comma-joined" over a pair with nothing
+    to join, then `--foo=bar,bar` over a pair with nothing distinct to join. Both came
+    from a discriminator (how many occurrences carry a value) that did not separate the
+    shapes that actually differ. [LAW:types-are-the-program] name the domain first; the
+    remedies are residue.
     """
-    switch = first.switch
     values = [flag.value for flag in (first, second) if flag.value is not None]
-    return {
-        2: f"Write the switch once with its values comma-joined: {Flag(switch, ','.join(values))}",
-        1: (
-            f"These disagree about whether {switch} takes a value, so only you can say "
-            f"which was meant — write that one, or comma-join the values if you meant both."
-        ),
-        0: f"Write the switch once: {switch}",
-    }[len(values)]
+    if first == second:
+        return f"Write the switch once: {first}"
+    if len(values) == 2:
+        return (
+            f"Write the switch once with its values comma-joined: "
+            f"{Flag(first.switch, ','.join(values))}"
+        )
+    return (
+        f"These disagree about whether {first.switch} takes a value, so only you can say "
+        f"which was meant — write that one."
+    )
 
 
 def compose(*layers: tuple[Flag, ...]) -> tuple[Flag, ...]:

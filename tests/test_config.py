@@ -86,6 +86,12 @@ class ProfileTest(unittest.TestCase):
         with self.assertRaisesRegex(CromError, r"Write the switch once: --no-pings"):
             parse(MINIMAL + '[profiles.dev]\nflags = ["--no-pings", "--no-pings"]\n')
 
+    def test_a_switch_repeated_verbatim_is_told_to_write_it_once(self):
+        """A copy-paste duplicate has nothing distinct to join, so suggesting
+        `--foo=bar,bar` would present a redundant rewrite as the intended fix."""
+        with self.assertRaisesRegex(CromError, r"Write the switch once: --foo=bar"):
+            parse(MINIMAL + '[profiles.dev]\nflags = ["--foo=bar", "--foo=bar"]\n')
+
     def test_a_switch_given_both_a_value_and_none_is_not_guessed_at(self):
         """The two forms can mean different things, so crom names the disagreement rather
         than picking one and presenting it as what the author meant."""

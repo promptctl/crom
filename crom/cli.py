@@ -39,7 +39,6 @@ from .model import (
     validate_name,
 )
 from .paths import PROJECT_CONFIG_CANDIDATES, user_config_file
-from .policy import LAUNCH_POLICY_FLAGS
 
 EXIT_FAILURE = 1
 EXIT_NOT_FOUND = 3

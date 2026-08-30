@@ -225,6 +225,22 @@ class ResolveTest(LedgerFixture):
         profile = resolve.resolve(ProfileRef("myapp", "dev"), scope)
         self.assertEqual(profile.env["DEBUG_URL"], str(profile.port))
 
+    def test_an_unknown_variable_is_caught_even_in_a_flag_that_gets_overridden(self):
+        """The variable check reads every layer's text, not the composed result.
+
+        A `${TYPO}` in a `[defaults]` flag that this profile happens to override never
+        reaches argv, so checking only what is launched would report it for the profiles
+        that inherit it and stay silent for the ones that don't — a diagnostic that
+        depends on which stanza you were resolving. It is a typo either way.
+        """
+        scope = self.scope(
+            MINIMAL
+            + '[defaults]\nflags = ["--x=${CROM_NOPE}"]\n'
+            + '[profiles.dev]\nflags = ["--x=fine"]\n'
+        )
+        with self.assertRaisesRegex(CromError, "unknown variable"):
+            resolve.resolve(ProfileRef("myapp", "dev"), scope)
+
     def test_an_unknown_variable_is_an_error_not_an_empty_string(self):
         scope = self.scope(MINIMAL + '[profiles.dev]\nflags = ["--x=${CROM_NOPE}"]\n')
         with self.assertRaisesRegex(CromError, "unknown variable"):

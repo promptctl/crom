@@ -261,10 +261,14 @@ def resolve_spec(scope: Scope, spec: ProfileSpec) -> ResolvedProfile:
     ref = ProfileRef(scope.namespace, spec.name)
     profile_dir = scope.profiles_root / ref.namespace / ref.name
     where = str(scope.source or "user config")
-    # The one place the launch list is decided, and the same call `crom add` compares
-    # against. Composition is by switch name, so a profile's `--disable-features`
-    # replaces `[defaults]`'s and `[defaults]`'s replaces the policy's — the
-    # `profile > defaults > policy` rule every other key here already follows.
+    # The one place the launch list is decided. Composition is by switch name, so a
+    # profile's `--disable-features` replaces `[defaults]`'s and `[defaults]`'s replaces
+    # the policy's — the `profile > defaults > policy` rule every other key here follows.
+    #
+    # `crom add`'s restatement check goes through `flags.compose` too, but over two layers
+    # rather than three: it asks what this *config* states, and crom's launch policy is
+    # not in the config. Deliberately different layer sets, not a drift — see
+    # `cli._effective_flags`, which owns that reasoning.
     composed = flags.compose(LAUNCH_POLICY_FLAGS, scope.default_flags, spec.flags)
     raw_env = {**scope.default_env, **spec.env}
 
