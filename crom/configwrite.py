@@ -53,7 +53,9 @@ namespace = "{namespace}"
 #   ./path/to/user-data-dir a copy of a directory you keep yourself
 #
 # A flag here replaces crom's own setting for the same switch, and a profile's replaces
-# this one's — each switch reaches Chrome exactly once. Available in flags and env values:
+# this one's — each switch reaches Chrome exactly once. To remove a switch a layer below
+# set rather than replace it, name it in `drop_flags = ["--disable-sync"]`.
+# Available in flags and env values:
 # ${{CROM_PROFILE_DIR}}, ${{CROM_CONFIG_DIR}}, ${{CROM_PORT}}, ${{CROM_NAMESPACE}},
 # ${{CROM_PROFILE}}.
 [defaults]
@@ -385,7 +387,11 @@ def _stanza(spec: ProfileSpec, base: Path) -> tomlkit.items.Table:
     """
     stated = {
         "seed": None if spec.seed is None else render_seed(spec.seed, base),
-        "flags": list(flags.render(spec.flags)),
+        "flags": list(flags.render(spec.flags.sets)),
+        # Sorted, because a `Layer`'s drops are a set: any order this rendered would be
+        # an order the file did not ask for, and a stable one at least reads back the same
+        # way twice.
+        "drop_flags": sorted(spec.flags.drops) or None,
         "features": dict(spec.features) or None,
         "port": spec.port,
         "env": dict(spec.env) or None,

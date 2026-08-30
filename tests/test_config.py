@@ -68,8 +68,8 @@ class ProfileTest(unittest.TestCase):
         this one and `resolve_spec` — so the stanzas stay distinct all the way down.
         """
         scope = parse(MINIMAL + '[defaults]\nflags = ["--a"]\n[profiles.dev]\nflags = ["--b"]\n')
-        self.assertEqual(flags.render(scope.default_flags), ("--a",))
-        self.assertEqual(flags.render(scope.profiles["dev"].flags), ("--b",))
+        self.assertEqual(flags.render(scope.default_flags.sets), ("--a",))
+        self.assertEqual(flags.render(scope.profiles["dev"].flags.sets), ("--b",))
 
     def test_one_stanza_may_not_set_the_same_switch_twice(self):
         """One list disagreeing with itself, which single emission gives no meaning.
@@ -108,6 +108,59 @@ class ProfileTest(unittest.TestCase):
         A diagnostic whose remedy does not work is worse than none."""
         with self.assertRaisesRegex(CromError, "crom owns it"):
             parse(MINIMAL + '[profiles.dev]\nflags = ["--user-data-dir=/a", "--user-data-dir=/b"]\n')
+
+    def test_a_stanza_keeps_its_drops_beside_the_flags_they_travel_with(self):
+        scope = parse(
+            MINIMAL
+            + '[defaults]\ndrop_flags = ["--disable-sync"]\n'
+            + '[profiles.dev]\nflags = ["--b"]\ndrop_flags = ["--no-pings", "--a"]\n'
+        )
+        self.assertEqual(scope.default_flags.drops, frozenset({"--disable-sync"}))
+        self.assertEqual(scope.profiles["dev"].flags.drops, frozenset({"--no-pings", "--a"}))
+
+    def test_a_drop_entry_carrying_a_value_is_refused_rather_than_truncated(self):
+        """A drop removes the switch whatever value it inherited, so the value could not
+        be honoured — and honouring the rest of the entry silently would let the file say
+        something crom does not do."""
+        with self.assertRaisesRegex(CromError, r"(?s)carries a value.*'--disable-sync'"):
+            parse(MINIMAL + '[profiles.dev]\ndrop_flags = ["--disable-sync=false"]\n')
+
+    def test_a_switch_dropped_twice_is_refused_like_one_set_twice(self):
+        with self.assertRaisesRegex(CromError, r"--no-pings is named twice"):
+            parse(MINIMAL + '[profiles.dev]\ndrop_flags = ["--no-pings", "--no-pings"]\n')
+
+    def test_a_stanza_may_not_both_set_and_drop_one_switch(self):
+        """Setting it here already replaces whatever was inherited, so the drop could not
+        mean anything — and which of the two the author meant is only theirs to say."""
+        with self.assertRaisesRegex(CromError, r"both sets and drops --headless"):
+            parse(
+                MINIMAL
+                + '[profiles.dev]\nflags = ["--headless=new"]\ndrop_flags = ["--headless"]\n'
+            )
+
+    def test_the_switches_crom_owns_are_refused_in_drop_flags_too(self):
+        """Reserved is a fact about the switch, not about which list named it: a config
+        that could drop `--user-data-dir` would leave crom unable to name the profile."""
+        for switch in ("--user-data-dir", "--remote-debugging-port", "--remote-debugging-pipe"):
+            with self.subTest(switch=switch), self.assertRaisesRegex(CromError, "crom owns it"):
+                parse(MINIMAL + f'[profiles.dev]\ndrop_flags = ["{switch}"]\n')
+
+    def test_dropping_a_feature_switch_is_answered_in_the_polarity_it_was_meant(self):
+        """Dropping `--disable-features` means "stop turning X off", which is `X = true` —
+        the opposite polarity from *setting* the same switch. Answering with the switch's
+        own polarity would send the author to write the entry they already have."""
+        for switch, entry in (
+            ("--disable-features", "FeatureName = true"),
+            ("--enable-features", "FeatureName = false"),
+        ):
+            with self.subTest(switch=switch), self.assertRaises(CromError) as caught:
+                parse(MINIMAL + f'[profiles.dev]\ndrop_flags = ["{switch}"]\n')
+            self.assertIn("[profiles.dev].features", str(caught.exception))
+            self.assertIn(entry, str(caught.exception))
+
+    def test_drop_flags_must_be_a_list_of_strings(self):
+        with self.assertRaisesRegex(CromError, r"drop_flags must be a list of switch names"):
+            parse(MINIMAL + "[profiles.dev]\ndrop_flags = 3\n")
 
     def test_unknown_keys_are_refused_rather_than_ignored(self):
         with self.assertRaisesRegex(CromError, "unknown key"):

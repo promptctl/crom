@@ -868,6 +868,22 @@ class CliTest(unittest.TestCase):
         self.assertEqual(argv[-1], f"--remote-debugging-port={payload['resolved']['port']}")
         self.assertIn("--no-first-run", argv)
 
+    def test_config_names_a_dropped_switch_rather_than_leaving_it_missing(self):
+        """A dropped switch is absent from argv and indistinguishable there from one
+        nobody ever set. `crom config` is where a reader goes to find out what crom is
+        doing, so the removal has to be something the listing shows."""
+        self.crom("init")
+        # The template ends inside `[profiles.default]`, so this lands in that stanza.
+        path = self.project / ".crom.toml"
+        path.write_text(path.read_text() + 'drop_flags = ["--disable-sync"]\n')
+
+        human = self.crom("config", "default")
+        payload = json.loads(self.crom("config", "default", "--json"))
+
+        self.assertNotIn("--disable-sync", payload["resolved"]["argv"])
+        self.assertEqual(payload["resolved"]["dropped"], ["--disable-sync"])
+        self.assertIn("(dropped --disable-sync)", human)
+
     def test_list_json_describes_every_addressable_profile(self):
         self.crom("init")
         self.crom("add", "ci")
