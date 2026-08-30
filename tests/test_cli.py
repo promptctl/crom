@@ -11,12 +11,13 @@ import os
 import shlex
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
 from click.testing import CliRunner
 
-from crom import cli
+from crom import cli, config, configwrite
 from crom.config import load_ambient
 from crom.model import CromError
 from crom.paths import state_home, user_config_file
@@ -214,12 +215,97 @@ class CliTest(unittest.TestCase):
         self.crom("init")
         self.assertIn('namespace = "myproj"', (self.project / ".crom.toml").read_text())
 
-    def test_init_refuses_to_clobber_an_existing_config(self):
+    def test_init_in_an_initialised_project_reports_it_and_succeeds(self):
+        """`crom init` asks for a state, not a change. Refusing the second call made the
+        user's own project a reason for a non-zero exit, and made every setup script that
+        runs `crom init` unconditionally need a guard around it."""
         self.crom("init")
-        self.crom("init", expect=4)
+        before = (self.project / ".crom.toml").read_text()
+
+        output = self.crom("init")
+
+        self.assertIn("already configures this project", output)
+        self.assertIn("myproj", output)
+        self.assertEqual((self.project / ".crom.toml").read_text(), before)
+
+    def test_init_reports_the_namespace_the_file_declares_not_the_one_it_would_guess(self):
+        """The second `crom init` derives `myproj` from the directory name, which is a
+        guess. Echoing that back as the project's namespace would tell someone whose
+        project is called something else that it is called `myproj`."""
+        self.crom("init", "chosen")
+
+        output = self.crom("init")
+
+        self.assertIn("(namespace 'chosen')", output)
+        self.assertIn("chosen/default", output)
+
+    def test_init_refuses_to_rename_a_project_that_already_has_a_namespace(self):
+        """Converging reports a request that is already met; it must not report one that
+        cannot be. Accepting this would exit 0 having done nothing, and the user would
+        find out when `crom up other/default` said the profile was not declared."""
+        self.crom("init", "chosen")
+
+        output = self.crom("init", "other", expect=4)
+
+        self.assertIn("declared chosen", output)
+        self.assertIn("you asked for other", output)
+        self.assertIn("chosen", (self.project / ".crom.toml").read_text())
+
+    def test_init_refuses_to_restate_a_different_seed(self):
+        self.crom("init", "--seed", "fresh")
+
+        output = self.crom("init", "--seed", "default", expect=4)
+
+        self.assertIn("[defaults].seed", output)
+        self.assertIn('seed = "fresh"', (self.project / ".crom.toml").read_text())
+
+    def test_init_over_a_config_that_declares_no_namespace_says_so(self):
+        """A file that exists without configuring anything is not an initialised project.
+        Converging on it would print "namespace 'None'" and point at a `crom up` that the
+        parser is about to refuse."""
+        (self.project / ".crom.toml").write_text("[defaults]\n")
+
+        output = self.crom("init", expect=1)
+
+        self.assertIn("declares no usable `namespace`", output)
 
     def test_init_refuses_the_reserved_namespace(self):
         self.crom("init", "user", expect=4)
+
+    def test_init_refuses_the_reserved_namespace_guessed_from_the_directory(self):
+        """The guess can still reach the file on the path that creates it, so it is still
+        refused there. Falling back to another name instead would hand the project a
+        namespace nobody chose."""
+        here = self.root / "user"
+        here.mkdir()
+
+        self.crom("init", cwd=here, expect=4)
+
+    def test_init_converges_in_a_directory_named_after_the_reserved_namespace(self):
+        """The reserved name is refused for a namespace the command claims, not for one it
+        is about to throw away. A project that chose `myproj` is named `myproj` whatever
+        its directory is called, and the second `crom init` states no namespace at all —
+        so crom's guess has nothing to contradict, and once had it exiting 4 over a value
+        the user never typed and the file never held."""
+        here = self.root / "user"
+        here.mkdir()
+        self.crom("init", "myproj", cwd=here)
+
+        output = self.crom("init", cwd=here)
+
+        self.assertIn("(namespace 'myproj')", output)
+        self.assertIn('namespace = "myproj"', (here / ".crom.toml").read_text())
+
+    def test_add_converges_in_a_directory_named_after_the_reserved_namespace(self):
+        """The same directory, reached through the command that has to keep working in it
+        after `crom init` did."""
+        here = self.root / "user"
+        here.mkdir()
+        self.crom("init", "myproj", cwd=here)
+
+        output = self.crom("add", "ci", cwd=here)
+
+        self.assertIn("Declared myproj/ci", output)
 
     def test_a_project_config_shadows_the_user_namespace(self):
         self.crom("init")
@@ -239,10 +325,112 @@ class CliTest(unittest.TestCase):
         self.assertIn("[profiles.ci]", text)
         self.assertIn("--headless=new", text)
 
-    def test_add_refuses_a_duplicate_name(self):
+    def test_adding_a_profile_that_already_exists_reports_it_and_succeeds(self):
+        """`crom add ci` asks that `ci` exist. Twice is the same request, so the second
+        call reports the profile — port and directory included, the same summary the first
+        printed — rather than making a script that provisions profiles idempotently need a
+        guard crom is perfectly able to apply itself."""
+        self.crom("init")
+        first = self.crom("add", "ci")
+        before = (self.project / ".crom.toml").read_text()
+
+        second = self.crom("add", "ci")
+
+        self.assertIn("Already declared myproj/ci", second)
+        self.assertIn(f"port {self.crom('port', 'ci').strip()}", second)
+        self.assertIn("Declared myproj/ci", first)
+        self.assertEqual((self.project / ".crom.toml").read_text(), before)
+
+    def test_adding_a_profile_again_with_the_same_options_is_still_the_same_request(self):
+        """Statedness is what decides, not silence: restating exactly what the config
+        already says asks for nothing new."""
+        self.crom("init")
+        self.crom("add", "ci", "--seed", "fresh", "--port", "9500")
+
+        self.assertIn(
+            "Already declared", self.crom("add", "ci", "--seed", "fresh", "--port", "9500")
+        )
+
+    def test_adding_a_profile_again_with_a_different_seed_is_refused(self):
+        """The other half of converging. Reporting success here would have crom claim it
+        had given `ci` a fresh profile while the config still says otherwise, and the user
+        would find out at launch — with their real Chrome logins in a browser they asked
+        to be empty."""
         self.crom("init")
         self.crom("add", "ci")
-        self.crom("add", "ci", expect=4)
+
+        output = self.crom("add", "ci", "--seed", "fresh", expect=4)
+
+        self.assertIn("declared default", output)
+        self.assertIn("you asked for fresh", output)
+        self.assertNotIn('seed = "fresh"', (self.project / ".crom.toml").read_text())
+
+    def test_pinning_the_port_a_profile_was_merely_assigned_is_refused(self):
+        """The exception to comparing effective values. A seed or flag inherited from
+        `[defaults]` reaches the profile on every checkout of the file, so inheriting it
+        satisfies a request for it. An assigned port lives in a machine-local ledger and
+        nowhere in the config, so asking to pin the number crom happens to have handed out
+        is asking for something the file does not yet promise — and reporting that as
+        already-done would leave a fresh clone free to land somewhere else."""
+        self.crom("init")
+        self.crom("add", "ci")
+        assigned = self.crom("port", "ci").strip()
+
+        output = self.crom("add", "ci", "--port", assigned, expect=4)
+
+        self.assertIn(f"unpinned — crom assigned {assigned}", output)
+        # Read back through the parser rather than grepped: the template's own comments
+        # mention `port = 9401`, so a substring test would answer about the prose.
+        self.assertIsNone(load_ambient(self.project).profiles["ci"].port)
+
+    def test_a_seed_reached_through_defaults_satisfies_a_request_for_it(self):
+        """`[defaults].seed` is committed alongside the profile, so a profile that
+        inherits `fresh` *is* the profile `--seed fresh` asked for. Comparing the key the
+        file happens to spell it in rather than the value the profile resolves to would
+        refuse a request the project already meets."""
+        self.crom("init", "--seed", "fresh")
+        self.crom("add", "ci")
+
+        self.assertIn("Already declared", self.crom("add", "ci", "--seed", "fresh"))
+
+    def test_adding_a_profile_again_with_a_flag_it_already_inherits_is_the_same_request(self):
+        """Flags are judged on effective values, exactly as the seed is.
+
+        A flag reaching the profile from `[defaults]` reaches it on every machine that
+        checks the file out, so a profile already running `--headless` *is* the profile
+        `--flag --headless` asked for. Concatenating the stated flag onto the defaults
+        compared `--headless` against `--headless --headless` and exited 4 — refusing over
+        a difference the comparison had invented, and reporting the doubled list back as
+        what the user had asked for.
+        """
+        self.crom("init")
+        config_path = self.project / ".crom.toml"
+        config_path.write_text(config_path.read_text().replace("flags = []", 'flags = ["--headless"]', 1))
+        self.crom("add", "ci")
+
+        output = self.crom("add", "ci", "--flag", "--headless")
+
+        self.assertIn("Already declared myproj/ci", output)
+
+    def test_adding_a_profile_again_with_its_flags_reordered_is_the_same_request(self):
+        """Order is not a fact about the profile, so restating the same flags in another
+        order is not a change to it."""
+        self.crom("init")
+        self.crom("add", "ci", "--flag", "--headless", "--flag", "--no-sandbox")
+
+        output = self.crom("add", "ci", "--flag", "--no-sandbox", "--flag", "--headless")
+
+        self.assertIn("Already declared myproj/ci", output)
+
+    def test_adding_a_profile_again_with_different_flags_is_refused(self):
+        self.crom("init")
+        self.crom("add", "ci")
+
+        output = self.crom("add", "ci", "--flag", "--headless", expect=4)
+
+        self.assertIn("flags", output)
+        self.assertIn("--headless", output)
+        self.assertNotIn("--headless", (self.project / ".crom.toml").read_text())
 
     def test_a_refused_add_writes_nothing_and_leaves_the_project_usable(self):
         # A rejected profile that still reached the file would be rejected again on the
@@ -305,33 +493,110 @@ class CliTest(unittest.TestCase):
         self.crom("init")
         target = self.project / ".crom.toml"
 
-        with mock.patch("crom.configwrite.add_profile", side_effect=OSError("disk full")):
+        # Scoped to the profile under test: `_bootstrap_user_config` reaches
+        # `ensure_profile` before every command, so an unconditional stub fails the
+        # bootstrap instead of the declaration this is about.
+        real_ensure = configwrite.ensure_profile
+
+        def fail_for_ci(path, spec, **kwargs):
+            if spec.name == "ci":
+                raise OSError("disk full")
+            return real_ensure(path, spec, **kwargs)
+
+        with mock.patch("crom.configwrite.ensure_profile", fail_for_ci):
             self.crom("add", "ci", expect=1)
 
         self.assertNotIn("ci", target.read_text())
         reserved = json.loads((state_home() / "registry.json").read_text())["ports"]
         self.assertNotIn("myproj/ci", reserved)
 
-    def test_losing_a_concurrent_add_leaves_the_winners_port_alone(self):
+    def test_losing_a_concurrent_add_converges_and_leaves_the_winners_port_alone(self):
         """`profile.ref` is the profile's shared identity, not one attempt's.
 
-        Two `crom add ci` calls resolve the same ref and the same reserved port. When the
-        loser's write raises FileExistsError, the declaration that now exists is the
-        *winner's* and it owns that reservation — releasing it here silently moved a live
-        profile to a new port on its next resolve.
+        Two `crom add ci` calls resolve the same ref and reserve the same port. The loser
+        read the config before the winner wrote to it, so it believes the name is free and
+        goes all the way to the write — where the declaration it finds is the *winner's*,
+        and owns that reservation. Releasing it there silently moved a live profile to a
+        new port on its next resolve; refusing with exit 4 told the user their profile
+        could not be created when it plainly exists. Converging does neither.
 
-        The race is reproduced deterministically: `declares` is stubbed False so the
-        pre-check passes as it would for the loser, and `add_profile` then raises for
-        real because the name is genuinely already declared.
+        The race is reproduced deterministically by staling the *discovery* read — the
+        scope is parsed without `ci`, exactly the picture a process that read the file a
+        moment too early would hold — over a file that genuinely declares it.
         """
         self.crom("init")
         self.crom("add", "ci")
         winners_port = self.crom("port", "ci")
 
-        with mock.patch("crom.configwrite.declares", return_value=False):
-            self.crom("add", "ci", expect=4)
+        with self.losing_the_race_for("ci"):
+            output = self.crom("add", "ci")
 
+        self.assertIn("Already declared myproj/ci", output)
         self.assertEqual(self.crom("port", "ci"), winners_port)
+
+    @contextlib.contextmanager
+    def losing_the_race_for(self, name: str):
+        """One `crom add`'s view of a config another `crom add` is writing to.
+
+        Only the *first* read that would have seen `name` is staled. A loser reads the
+        file at discovery, a moment before the winner writes, and reads the true file
+        every time after — so staling every read would model a process that can never see
+        the file at all, which is not this race. It would also pin `add` to reading the
+        config exactly once, which is plumbing, not the contract.
+        [LAW:behavior-not-structure]
+        """
+        real_parse = config.parse
+        before_the_winner_wrote = [True]
+
+        def parse(text, source, **kwargs):
+            scope = real_parse(text, source, **kwargs)
+            if name in scope.profiles and before_the_winner_wrote[0]:
+                before_the_winner_wrote[0] = False
+                return replace(
+                    scope, profiles={n: s for n, s in scope.profiles.items() if n != name}
+                )
+            return scope
+
+        with mock.patch("crom.config.parse", parse):
+            yield
+
+    def test_losing_a_concurrent_add_is_judged_against_the_winners_declaration(self):
+        """The loser states a fact; the winner's declaration is what it must be judged on.
+
+        `add` proposes its own spec for a name its scope does not show, which on this path
+        is the loser's own request — so comparing that proposal against itself could never
+        refuse anything, and the report stated it as the project's fact. `crom add ci
+        --seed fresh` exited 0 announcing `seed fresh` over a file that gives `ci` the
+        user's real Chrome profile: the find-out-at-launch failure
+        `test_adding_a_profile_again_with_a_different_seed_is_refused` exists to prevent,
+        reached by the one path that skipped the check.
+        """
+        self.crom("init")
+        self.crom("add", "ci")  # winner states no seed, so `ci` inherits `default`
+
+        with self.losing_the_race_for("ci"):
+            output = self.crom("add", "ci", "--seed", "fresh", expect=4)
+
+        self.assertIn("seed", output)
+        self.assertIn("fresh", output)
+        # The winner's declaration is untouched: no `seed` key, still inheriting.
+        target = self.project / ".crom.toml"
+        self.assertIsNone(config.parse(target.read_text(), target).profiles["ci"].seed)
+
+    def test_losing_a_concurrent_add_reports_the_winners_values_not_its_own(self):
+        """Converging still converges — on the file's facts. The loser asks for nothing
+        the winner's declaration does not already satisfy, so this is a met request; every
+        fact printed has to come from the file rather than from the loser's proposal."""
+        self.crom("init")
+        self.crom("add", "ci", "--seed", "fresh")
+        winners_port = self.crom("port", "ci").strip()
+
+        with self.losing_the_race_for("ci"):
+            output = self.crom("add", "ci")
+
+        self.assertIn("Already declared myproj/ci", output)
+        self.assertIn("seed fresh", output)
+        self.assertIn(f"port {winners_port}", output)
 
     def test_add_recreates_a_project_config_that_vanished_after_discovery(self):
         """`_declare` creates a missing file from a header that carries no `namespace`
