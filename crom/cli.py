@@ -348,7 +348,7 @@ def _effective_flags(scope: Scope, stanza: tuple[Flag, ...]) -> str:
     """The flags a profile declaring `stanza` would have, as one comparable fact.
 
     Through `flags.compose`, the same call `resolve_spec` makes, so a profile's
-    `--disable-features` and `[defaults]`'s are seen as two answers to one question
+    `--disable-blink-features` and `[defaults]`'s are seen as two answers to one question
     rather than two unrelated strings. [LAW:one-source-of-truth]
 
     The launch policy is deliberately not a layer here, though it is one at launch. The

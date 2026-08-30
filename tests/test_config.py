@@ -138,12 +138,31 @@ class ProfileTest(unittest.TestCase):
             with self.subTest(table=table), self.assertRaisesRegex(CromError, "true/false"):
                 parse(MINIMAL + f"[profiles.dev]\n[profiles.dev.features]\n{table}\n")
 
-    def test_a_feature_name_that_cannot_survive_comma_joining_is_refused(self):
-        """The names ride one comma-separated switch, so a name carrying a comma would
-        reach Chrome as two features while the config shows one entry."""
-        for name in ('"A,B"', '""'):
-            with self.subTest(name=name), self.assertRaisesRegex(CromError, "one entry per feature"):
+    def test_a_feature_name_that_would_not_reach_chrome_as_written_is_refused(self):
+        """Every one of these reaches Chrome meaning something other than what the config
+        shows, and Chrome ignores names it does not know — so without the checkpoint the
+        toggle silently does nothing. Refused rather than repaired: stripping `" Foo"`
+        would make crom disagree with the file about the feature's name."""
+        for name, fault in (
+            ('""', "is empty"),
+            ('"   "', "is empty"),
+            ('" Foo"', "whitespace"),
+            ('"Foo "', "whitespace"),
+            ('"A,B"', "comma"),
+            ('"${CROM_PROFILE}Foo"', "interpolates a variable"),
+            ('"${UNCLOSED"', "interpolates a variable"),
+        ):
+            with self.subTest(name=name), self.assertRaisesRegex(CromError, fault):
                 parse(MINIMAL + f"[profiles.dev]\n[profiles.dev.features]\n{name} = false\n")
+
+    def test_a_feature_name_chrome_parameterizes_is_left_alone(self):
+        """crom holds no table of Chrome's feature grammar, for the same reason it holds no
+        table of which switches merge. A name it cannot break is a name it passes through."""
+        scope = parse(
+            MINIMAL
+            + '[profiles.dev]\n[profiles.dev.features]\n"Feature:param/value" = true\n'
+        )
+        self.assertEqual(scope.profiles["dev"].features, {"Feature:param/value": True})
 
     def test_features_are_read_from_both_defaults_and_a_profile(self):
         scope = parse(

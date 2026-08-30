@@ -16,6 +16,7 @@ files and a reset would destroy the good declarations along with the bad line.
 
 import os
 import tomllib
+from collections.abc import Callable
 from pathlib import Path
 
 from . import configwrite, flags, registry, report
@@ -162,18 +163,55 @@ def parse_flags(raw, where: str, source: Path) -> tuple[Flag, ...]:
     return flags.layer(raw, f"{source}: {where}.flags")
 
 
+# What a feature name may not be, and how to say so — the four ways a name can fail to
+# survive crom's own machinery, enumerated rather than accumulated. Order is the order
+# they are diagnosed in, so the emptier fault is named before the subtler one: "   " is
+# empty *and* surrounded by whitespace, and "is empty" is the more useful thing to say.
+#
+# Every one of these is a name that would reach Chrome meaning something other than what
+# the config shows — silently, because Chrome ignores feature names it does not know.
+# [LAW:no-silent-failure] Anything not listed here (`Feature:param/value`, `Feature<Trial`)
+# passes through verbatim and means to Chrome exactly what was written; crom holds no
+# table of Chrome's feature grammar, for the same reason it holds no table of which
+# switches merge.
+_ILLEGAL_FEATURE_NAMES: tuple[tuple[Callable[[str], bool], str], ...] = (
+    (lambda name: not name.strip(), "is empty"),
+    (
+        lambda name: name != name.strip(),
+        "has leading or trailing whitespace that Chrome does not trim",
+    ),
+    (
+        lambda name: "," in name,
+        "contains a comma, the separator crom joins the names with",
+    ),
+    (
+        lambda name: "${" in name,
+        "interpolates a variable, and a feature name is a literal",
+    ),
+)
+
+
 def parse_features(raw, where: str, source: Path) -> dict[str, bool]:
     """The border for a `features` table — the config's say over Chrome's features.
 
-    [LAW:parse-dont-validate] a `dict[str, bool]` that exists here is already known to be
-    renderable: `flags.features` comma-joins the names into one switch and never asks
-    again whether a name can survive that.
+    [LAW:parse-dont-validate] a `dict[str, bool]` that exists here is already known to
+    reach Chrome as written: `flags.features` comma-joins the names into one switch and
+    never asks again whether a name can survive that, and nothing downstream rewrites one.
 
-    An empty or comma-bearing name is refused rather than escaped, because there is no
-    escaping to do — a comma *is* the separator Chrome reads, so `"A,B" = false` would
-    reach Chrome as two features while the config shows one entry, and no later reader
-    could tell which was meant. [LAW:no-silent-failure] the author writes one entry per
-    feature, which is the only spelling that means what it looks like.
+    A name is refused rather than repaired. Stripping the whitespace off `" Foo"` would
+    make crom quietly disagree with the file about what the feature is called, so the
+    config would stop reading back as written — which is the property these checks exist
+    to protect, not a cost to pay for them.
+
+    Names are literal, and `${VAR}` is refused rather than expanded. That is a deliberate
+    absence: every name in the interpolation vocabulary is a fact about *this deployment*
+    — a port, a directory, a namespace — while a Chrome feature name is a constant in
+    Chrome's own source, so the two never legitimately meet. Expanding them would also put
+    the fold in `flags.features` on a different footing from Chrome, keying feature
+    identity on the raw text while Chrome sees the expanded text — two representations of
+    one identity, free to diverge, which is how `"${CROM_NAMESPACE}Foo" = true` in one
+    layer and `"appFoo" = false` in another would both survive and reach Chrome as a
+    collision that crom exists to never emit. [LAW:one-source-of-truth]
     """
     if not isinstance(raw, dict) or not all(isinstance(v, bool) for v in raw.values()):
         raise CromError(
@@ -181,13 +219,13 @@ def parse_features(raw, where: str, source: Path) -> dict[str, bool]:
             f"(true turns the feature on, false turns it off; a name you omit is left alone)"
         )
     for name in raw:
-        if not name.strip() or "," in name:
-            raise CromError(
-                f"{source}: {where}.features names a feature {name!r}, which crom cannot "
-                f"emit: it joins the names with commas into a single switch, so an empty "
-                f"name or one containing a comma would not read back as written. Write "
-                f"one entry per feature."
-            )
+        for is_illegal, fault in _ILLEGAL_FEATURE_NAMES:
+            if is_illegal(name):
+                raise CromError(
+                    f"{source}: {where}.features names a feature {name!r}, which {fault}.\n"
+                    f"crom passes each name to Chrome exactly as written, so it has to be "
+                    f"the literal feature name — e.g. SharedStorageAPI."
+                )
     return dict(raw)
 
 

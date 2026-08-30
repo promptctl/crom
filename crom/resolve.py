@@ -262,8 +262,10 @@ def resolve_spec(scope: Scope, spec: ProfileSpec) -> ResolvedProfile:
     profile_dir = scope.profiles_root / ref.namespace / ref.name
     where = str(scope.source or "user config")
     # The one place the launch list is decided. Composition is by switch name, so a
-    # profile's `--disable-features` replaces `[defaults]`'s and `[defaults]`'s replaces
-    # the policy's — the `profile > defaults > policy` rule every other key here follows.
+    # profile's `--disable-blink-features` replaces `[defaults]`'s and `[defaults]`'s
+    # replaces the policy's — the `profile > defaults > policy` rule every other key here
+    # follows. (`--disable-features` cannot stand as the example any more: `features` owns
+    # that switch, and a layer contributes to it rather than replacing it.)
     #
     # `crom add`'s restatement check goes through `flags.compose` too, but over two layers
     # rather than three: it asks what this *config* states, and crom's launch policy is
@@ -293,19 +295,12 @@ def resolve_spec(scope: Scope, spec: ProfileSpec) -> ResolvedProfile:
     # and reporting it only for the profiles that don't override it would make the
     # diagnostic depend on which stanza you were resolving. [LAW:no-silent-failure]
     #
-    # The features layers are rendered one at a time for that same reason, and included at
-    # all because `_expand` runs over the *composed* list — feature names reach it like any
-    # other flag text, so a `${TYPO}` in one is a failure this checkpoint owns. Left out,
-    # it would raise below instead, after `port_for` had already reserved a port for a
-    # profile that never resolves.
+    # Features are absent from this check because they cannot fail it: `parse_features`
+    # refuses a `${` in a feature name outright, so a feature carries no variable to be
+    # unknown. That refusal is what keeps `flags.features` folding on the same text Chrome
+    # is given, rather than on a pre-expansion spelling of it.
     _reject_unknown_variables(
-        (
-            *flags.render(scope.default_flags),
-            *flags.render(spec.flags),
-            *flags.render(flags.features(scope.default_features)),
-            *flags.render(flags.features(spec.features)),
-            *raw_env.values(),
-        ),
+        (*flags.render(scope.default_flags), *flags.render(spec.flags), *raw_env.values()),
         _variables(ref, profile_dir, scope.config_dir, None),
         where,
     )

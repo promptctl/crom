@@ -217,7 +217,7 @@ class ProfileSpec:
     name: str
     # `Flag`, not `str`: the stanza's flags have been through `config.parse_flags`, which
     # is where a list naming one switch twice is refused, and carrying the parsed form is
-    # what lets `flags.compose` see that this profile's `--disable-features` and
+    # what lets `flags.compose` see that this profile's `--disable-blink-features` and
     # `[defaults]`'s are two answers to one question. [LAW:parse-dont-validate]
     flags: tuple[Flag, ...] = ()
     # Which Chrome features this stanza turns on or off. A table rather than two lists,
