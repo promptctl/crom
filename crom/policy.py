@@ -8,12 +8,16 @@ trailing --disable-features entries are the version-fragile part: Chrome silentl
 ignores feature names it no longer knows, so new promo/upsell surfaces get suppressed
 by adding a name there, not by touching any code.
 
-A config's `flags` are appended *after* this list, so a profile that genuinely needs a
-different setting can override it the way Chrome itself resolves conflicts: last wins.
+This is the first layer `flags.compose` resolves, so a config that names one of these
+switches replaces crom's entry for it rather than following it — the same
+`profile > defaults > policy` rule every other config key obeys. crom relies on none of
+Chrome's own conflict rules, because each switch is emitted exactly once.
 `crom config <profile>` prints the fully composed argv, so the policy is never invisible.
 """
 
-LAUNCH_POLICY_FLAGS: tuple[str, ...] = (
+from .flags import Flag, layer
+
+_POLICY_TEXTS: tuple[str, ...] = (
     # "Don't check for default browser" — suppress the default-browser nag.
     "--no-default-browser-check",
 
@@ -41,3 +45,8 @@ LAUNCH_POLICY_FLAGS: tuple[str, ...] = (
     # Quiet UI — chrome-only nags, invisible to web content.
     "--disable-session-crashed-bubble",  # no "Chrome didn't shut down correctly" bubble
 )
+
+# Through the same checkpoint a user's `flags` list goes through, so crom's own list is
+# held to the rule it enforces: naming a switch twice above is a bug that fails loudly at
+# import rather than silently dropping the earlier entry. [LAW:single-enforcer]
+LAUNCH_POLICY_FLAGS: tuple[Flag, ...] = layer(_POLICY_TEXTS, "crom's launch policy")

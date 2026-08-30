@@ -15,6 +15,7 @@ from pathlib import Path
 
 import tomlkit
 
+from . import flags
 from .locking import exclusive
 from .model import (
     CromError,
@@ -51,7 +52,8 @@ namespace = "{namespace}"
 #   fresh                   an empty profile; Chrome sets it up on first launch
 #   ./path/to/user-data-dir a copy of a directory you keep yourself
 #
-# Flags are appended after crom's launch policy. Available in flags and env values:
+# A flag here replaces crom's own setting for the same switch, and a profile's replaces
+# this one's — each switch reaches Chrome exactly once. Available in flags and env values:
 # ${{CROM_PROFILE_DIR}}, ${{CROM_CONFIG_DIR}}, ${{CROM_PORT}}, ${{CROM_NAMESPACE}},
 # ${{CROM_PROFILE}}.
 [defaults]
@@ -383,7 +385,7 @@ def _stanza(spec: ProfileSpec, base: Path) -> tomlkit.items.Table:
     """
     stated = {
         "seed": None if spec.seed is None else render_seed(spec.seed, base),
-        "flags": list(spec.flags),
+        "flags": list(flags.render(spec.flags)),
         "port": spec.port,
         "env": dict(spec.env) or None,
     }

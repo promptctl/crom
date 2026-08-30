@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from crom import config, registry, resolve
+from crom import config, flags, registry, resolve
 from crom.model import (
     CromError,
     FailedProfile,
@@ -14,7 +14,6 @@ from crom.model import (
     ResolvedProfile,
     parse_ref,
 )
-from crom.policy import LAUNCH_POLICY_FLAGS
 
 MINIMAL = 'namespace = "myapp"\n'
 
@@ -78,9 +77,36 @@ class ArgvTest(unittest.TestCase):
         self.assertEqual(argv[-2:], ("--user-data-dir=/data", "--remote-debugging-port=9300"))
         self.assertLess(argv.index("--headless=new"), argv.index("--user-data-dir=/data"))
 
-    def test_launch_policy_precedes_configured_flags(self):
-        argv = resolve.build_argv(Path("/chrome"), Path("/data"), 9300, ("--headless=new",))
-        self.assertLess(argv.index(LAUNCH_POLICY_FLAGS[0]), argv.index("--headless=new"))
+
+class ComposeTest(unittest.TestCase):
+    """The layering rule itself, without a config file or a port ledger in the way."""
+
+    def flags(self, *texts: str) -> tuple:
+        return flags.layer(texts, "test")
+
+    def test_a_later_layer_replaces_an_earlier_layers_value_for_the_same_switch(self):
+        composed = flags.compose(
+            self.flags("--disable-features=A"), self.flags("--disable-features=B")
+        )
+        self.assertEqual(flags.render(composed), ("--disable-features=B",))
+
+    def test_a_switch_only_one_layer_names_survives_untouched(self):
+        composed = flags.compose(self.flags("--a"), self.flags("--b=1"))
+        self.assertEqual(flags.render(composed), ("--a", "--b=1"))
+
+    def test_an_overridden_switch_keeps_the_position_it_was_introduced_at(self):
+        """Order is stable across runs, and overriding one early switch must not shuffle
+        the rest of the list out from under a reader of `crom config`."""
+        composed = flags.compose(self.flags("--a=1", "--b"), self.flags("--a=2"))
+        self.assertEqual(flags.render(composed), ("--a=2", "--b"))
+
+    def test_a_valueless_switch_is_not_the_same_as_an_empty_value(self):
+        composed = flags.compose(self.flags("--a"), self.flags("--a="))
+        self.assertEqual(flags.render(composed), ("--a=",))
+
+    def test_only_the_first_equals_sign_splits_switch_from_value(self):
+        composed = flags.compose(self.flags("--host-resolver-rules=MAP a b=1.2.3.4"))
+        self.assertEqual(flags.render(composed), ("--host-resolver-rules=MAP a b=1.2.3.4",))
 
 
 class LedgerFixture(unittest.TestCase):
@@ -156,6 +182,37 @@ class ResolveTest(LedgerFixture):
         profile = resolve.resolve(ProfileRef("myapp", "dev"), scope)
         self.assertTrue(str(profile.profile_dir).startswith(str(self.root / ".crom" / "profiles")))
 
+    def test_a_profile_flag_replaces_the_defaults_entry_for_the_same_switch(self):
+        """The defect this composition exists for: two `--disable-features` switches
+        reached Chrome, which silently discards all but the last — so a project setting
+        the switch for its own reasons deleted whatever `[defaults]` had set."""
+        scope = self.scope(
+            MINIMAL
+            + '[defaults]\nflags = ["--disable-features=FromDefaults"]\n'
+            + '[profiles.dev]\nflags = ["--disable-features=FromProfile"]\n'
+        )
+        argv = resolve.resolve(ProfileRef("myapp", "dev"), scope).argv
+        self.assertEqual(
+            [a for a in argv if a.startswith("--disable-features=")],
+            ["--disable-features=FromProfile"],
+        )
+
+    def test_a_profile_flag_replaces_the_launch_policys_entry_for_the_same_switch(self):
+        scope = self.scope(MINIMAL + '[profiles.dev]\nflags = ["--no-default-browser-check=0"]\n')
+        argv = resolve.resolve(ProfileRef("myapp", "dev"), scope).argv
+        self.assertIn("--no-default-browser-check=0", argv)
+        self.assertNotIn("--no-default-browser-check", argv)
+
+    def test_every_switch_reaches_chrome_exactly_once(self):
+        scope = self.scope(
+            MINIMAL
+            + '[defaults]\nflags = ["--disable-features=A", "--window-size=800,600"]\n'
+            + '[profiles.dev]\nflags = ["--disable-features=B", "--no-pings"]\n'
+        )
+        argv = resolve.resolve(ProfileRef("myapp", "dev"), scope).argv[1:]
+        switches = [a.split("=", 1)[0] for a in argv]
+        self.assertEqual(sorted(switches), sorted(set(switches)))
+
     def test_variables_expand_in_flags(self):
         scope = self.scope(
             MINIMAL + '[profiles.dev]\nflags = ["--load-extension=${CROM_CONFIG_DIR}/ext"]\n'
@@ -167,6 +224,22 @@ class ResolveTest(LedgerFixture):
         scope = self.scope(MINIMAL + '[profiles.dev]\nenv = { DEBUG_URL = "${CROM_PORT}" }\n')
         profile = resolve.resolve(ProfileRef("myapp", "dev"), scope)
         self.assertEqual(profile.env["DEBUG_URL"], str(profile.port))
+
+    def test_an_unknown_variable_is_caught_even_in_a_flag_that_gets_overridden(self):
+        """The variable check reads every layer's text, not the composed result.
+
+        A `${TYPO}` in a `[defaults]` flag that this profile happens to override never
+        reaches argv, so checking only what is launched would report it for the profiles
+        that inherit it and stay silent for the ones that don't — a diagnostic that
+        depends on which stanza you were resolving. It is a typo either way.
+        """
+        scope = self.scope(
+            MINIMAL
+            + '[defaults]\nflags = ["--x=${CROM_NOPE}"]\n'
+            + '[profiles.dev]\nflags = ["--x=fine"]\n'
+        )
+        with self.assertRaisesRegex(CromError, "unknown variable"):
+            resolve.resolve(ProfileRef("myapp", "dev"), scope)
 
     def test_an_unknown_variable_is_an_error_not_an_empty_string(self):
         scope = self.scope(MINIMAL + '[profiles.dev]\nflags = ["--x=${CROM_NOPE}"]\n')

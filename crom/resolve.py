@@ -9,7 +9,7 @@ nothing about config files, discovery, or ports.
 import re
 from pathlib import Path
 
-from . import configwrite, registry, report
+from . import configwrite, flags, registry, report
 from .config import load_file, load_user_scope
 from .model import (
     USER_NAMESPACE,
@@ -80,19 +80,23 @@ def build_argv(
     chrome_binary: Path,
     profile_dir: Path,
     port: int,
-    flags: tuple[str, ...],
+    launch_flags: tuple[str, ...],
 ) -> tuple[str, ...]:
-    """Compose the complete Chrome command line.
+    """Compose the complete Chrome command line from already-resolved flags.
 
-    crom's own switches go last so no configured flag can displace them: they carry the
+    `launch_flags` arrives composed — crom's launch policy is a layer `flags.compose`
+    resolved, not a prefix this function prepends, so a profile that names a policy switch
+    replaces crom's entry for it instead of trailing behind it. [LAW:one-source-of-truth]
+    the launch list is decided in one place, and this function only frames it.
+
+    crom's own switches still go last, and they are not layer input: they carry the
     profile's identity (`--user-data-dir`, which is also how `chrome.find_pids` knows
     what is running) and its CDP contract. `config.RESERVED_SWITCHES` already rejects a
     config that tries; ordering means even a bug there cannot corrupt crom's map.
     """
     return (
         str(chrome_binary),
-        *LAUNCH_POLICY_FLAGS,
-        *flags,
+        *launch_flags,
         f"--user-data-dir={profile_dir}",
         f"--remote-debugging-port={port}",
     )
@@ -257,15 +261,28 @@ def resolve_spec(scope: Scope, spec: ProfileSpec) -> ResolvedProfile:
     ref = ProfileRef(scope.namespace, spec.name)
     profile_dir = scope.profiles_root / ref.namespace / ref.name
     where = str(scope.source or "user config")
-    raw_flags = (*scope.default_flags, *spec.flags)
+    # The one place the launch list is decided. Composition is by switch name, so a
+    # profile's `--disable-features` replaces `[defaults]`'s and `[defaults]`'s replaces
+    # the policy's — the `profile > defaults > policy` rule every other key here follows.
+    #
+    # `crom add`'s restatement check goes through `flags.compose` too, but over two layers
+    # rather than three: it asks what this *config* states, and crom's launch policy is
+    # not in the config. Deliberately different layer sets, not a drift — see
+    # `cli._effective_flags`, which owns that reasoning.
+    composed = flags.compose(LAUNCH_POLICY_FLAGS, scope.default_flags, spec.flags)
     raw_env = {**scope.default_env, **spec.env}
 
     # [LAW:effects-at-boundaries] Every way this resolution can fail runs first, while
     # it is still pure. `port_for` writes a reservation into the machine-wide ledger the
     # moment it is called, so a failure after it would leave that reservation behind
     # with no profile and no way for the user to reclaim the port.
+    #
+    # Every layer's text is checked, not just the composed result: a `${CROM_PROFIL_DIR}`
+    # typo in a `[defaults]` flag that this profile happens to override is still a typo,
+    # and reporting it only for the profiles that don't override it would make the
+    # diagnostic depend on which stanza you were resolving. [LAW:no-silent-failure]
     _reject_unknown_variables(
-        (*raw_flags, *raw_env.values()),
+        (*flags.render(scope.default_flags), *flags.render(spec.flags), *raw_env.values()),
         _variables(ref, profile_dir, scope.config_dir, None),
         where,
     )
@@ -273,7 +290,7 @@ def resolve_spec(scope: Scope, spec: ProfileSpec) -> ResolvedProfile:
     port = registry.port_for(ref, pinned=spec.port, source=scope.source)
 
     variables = _variables(ref, profile_dir, scope.config_dir, port)
-    flags = tuple(_expand(f, variables, where) for f in raw_flags)
+    launch_flags = tuple(_expand(f, variables, where) for f in flags.render(composed))
     env = {k: _expand(v, variables, where) for k, v in raw_env.items()}
 
     seed: Seed = spec.seed if spec.seed is not None else scope.default_seed
@@ -283,7 +300,7 @@ def resolve_spec(scope: Scope, spec: ProfileSpec) -> ResolvedProfile:
         port=port,
         profile_dir=profile_dir,
         chrome_binary=scope.chrome_binary,
-        argv=build_argv(scope.chrome_binary, profile_dir, port, flags),
+        argv=build_argv(scope.chrome_binary, profile_dir, port, launch_flags),
         env=env,
         seed=seed,
         source=scope.source,
