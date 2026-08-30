@@ -21,7 +21,7 @@ from stat import S_ISREG
 
 import click
 
-from . import chrome, config, configwrite, mcp, migrate, registry, resolve as resolver, seed
+from . import chrome, config, configwrite, flags, mcp, migrate, registry, resolve as resolver, seed
 from .config import discover, load_ambient, load_user_scope, parse_flags, parse_port, parse_seed
 from .model import (
     DEFAULT_SEED,
@@ -29,6 +29,7 @@ from .model import (
     Conflict,
     CromError,
     FailedProfile,
+    Flag,
     NotFound,
     ProfileSpec,
     ResolvedProfile,
@@ -38,6 +39,7 @@ from .model import (
     validate_name,
 )
 from .paths import PROJECT_CONFIG_CANDIDATES, user_config_file
+from .policy import LAUNCH_POLICY_FLAGS
 
 EXIT_FAILURE = 1
 EXIT_NOT_FOUND = 3
@@ -343,6 +345,38 @@ def _scopes_to_list(session: _Session, everything: bool) -> tuple[list[Scope], l
     return scopes, unavailable
 
 
+def _flag_difference(
+    scope: Scope, declared: tuple[Flag, ...], asked: tuple[Flag, ...]
+) -> tuple[str, str | None]:
+    """What two declarations of the same profile disagree about, each side's part of it.
+
+    Both sides go through `flags.compose` — the same call `resolve_spec` makes — so the
+    question being asked is "would these two launch the same browser?" and it is answered
+    by the one function that decides what a profile launches with.
+    [LAW:one-source-of-truth]
+
+    What is *returned* is only the part they differ on, and that is a rendering choice,
+    not a second comparison: two composed lists are equal exactly when neither has a flag
+    the other lacks, so an empty pair here means the same thing an equality test would
+    have meant. Returning the whole composed list instead printed crom's dozen launch
+    policy flags twice per refusal, leaving the user to spot the one switch that moved in
+    the middle of two near-identical walls of text — a message that names everything
+    except where to look.
+
+    Order and repetition are not facts about a profile: the same flags typed in another
+    order are the same request. Composition already absorbed repetition, so the set
+    arithmetic here only adds order-insensitivity.
+    """
+    left = set(flags.render(flags.compose(LAUNCH_POLICY_FLAGS, scope.default_flags, declared)))
+    right = set(flags.render(flags.compose(LAUNCH_POLICY_FLAGS, scope.default_flags, asked)))
+    # An empty `asked` is the only way `--flag` can go unmentioned, so emptiness is
+    # statedness here — unlike `seed` and `port`, which have a real `None`. A request that
+    # says nothing about flags cannot contradict the file, which `_reject_restatement`
+    # spells `None`; without it, `crom add ci` on a profile that has flags would read as
+    # asking for a profile with none.
+    return " ".join(sorted(left - right)), " ".join(sorted(right - left)) if asked else None
+
+
 def _reject_restatement(
     subject: str, facts: tuple[tuple[str, str | None, str | None], ...], remedy: str
 ) -> None:
@@ -383,10 +417,10 @@ def _reject_restatement(
         "from. Omit to inherit [defaults].seed from the config."
     ),
 )
-@click.option("--flag", "flags", multiple=True, help="Chrome flag; repeatable.")
+@click.option("--flag", "flag_texts", multiple=True, help="Chrome flag; repeatable.")
 @click.option("--port", type=int, default=None, help="Pin the CDP port instead of letting crom assign one.")
 @click.pass_obj
-def add_cmd(session: _Session, name: str, seed_text: str | None, flags: tuple[str, ...], port: int | None):
+def add_cmd(session: _Session, name: str, seed_text: str | None, flag_texts: tuple[str, ...], port: int | None):
     """Declare a profile in the config governing this directory. Idempotent."""
     validate_name("profile name", name)
     scope = session.scope
@@ -394,7 +428,7 @@ def add_cmd(session: _Session, name: str, seed_text: str | None, flags: tuple[st
     where = f"[profiles.{name}]"
     spec = ProfileSpec(
         name=name,
-        flags=parse_flags(list(flags), where, target),
+        flags=parse_flags(list(flag_texts), where, target),
         # None when `--seed` was not given, which `configwrite` writes as no `seed` key
         # and `resolve_spec` reads as `scope.default_seed`. The old `default="fresh"`
         # meant every added profile carried an explicit `seed = "fresh"` nobody had asked
@@ -500,27 +534,15 @@ def add_cmd(session: _Session, name: str, seed_text: str | None, flags: tuple[st
                 else f"(unpinned — crom assigned {profile.port})",
                 None if spec.port is None else str(spec.port),
             ),
-            # An empty tuple is the only way `--flag` can go unmentioned, so emptiness is
-            # statedness here — unlike `seed` and `port`, which have a real `None`.
-            #
-            # Effective, and as a set, for the reason the seed fact is effective: a flag
-            # reaching the profile from `[defaults]` reaches it on every machine that
-            # checks the file out, so a profile already running `--headless` *is* the
-            # profile `--flag --headless` asked for. Concatenating the stated flags onto
-            # the defaults instead compared `--headless` against `--headless --headless`
-            # and refused — naming a difference that was an artifact of the comparison
-            # rather than a fact about the project, and printing the doubled list back at
-            # the user as what they had asked for. A set because order and repetition are
-            # not facts about the profile either: the same flags typed in another order
-            # are the same request, and refusing over that is the spurious refusal this
-            # command exists to stop making. [LAW:one-source-of-truth] `[defaults]`
-            # inheritance decides both sides here exactly as `resolve_spec` decides it for
-            # the seed.
-            (
-                "flags",
-                " ".join(sorted({*scope.default_flags, *declared.flags})),
-                " ".join(sorted({*scope.default_flags, *spec.flags})) if spec.flags else None,
-            ),
+            # Effective flags, for the reason the seed fact is effective: a flag reaching
+            # the profile from `[defaults]` or from crom's launch policy reaches it on
+            # every machine that checks the file out, so a profile already running
+            # `--headless` *is* the profile `--flag --headless` asked for. This comparison
+            # used to build its own set-union of the defaults and the declared flags,
+            # which was a second, independent statement of what flags a profile has — and
+            # it disagreed with the launcher the moment either layer overrode a switch
+            # rather than adding one. [LAW:one-source-of-truth]
+            ("flags", *_flag_difference(scope, declared.flags, spec.flags)),
         ),
         f"Edit {target} directly, or `crom rm {profile.ref}` and add it again.",
     )

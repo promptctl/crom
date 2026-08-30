@@ -422,6 +422,36 @@ class CliTest(unittest.TestCase):
 
         self.assertIn("Already declared myproj/ci", output)
 
+    def test_adding_a_profile_again_with_a_launch_policy_flag_is_the_same_request(self):
+        """The policy is a layer like `[defaults]`, so a switch crom already sets is a
+        switch the profile already has — asking for it again asks for nothing new."""
+        self.crom("init")
+        self.crom("add", "ci")
+
+        output = self.crom("add", "ci", "--flag", "--no-pings")
+
+        self.assertIn("Already declared myproj/ci", output)
+
+    def test_restating_one_switch_with_a_different_value_is_refused(self):
+        """The override case the old set-of-strings comparison could not see: both sides
+        name `--disable-features`, so a set union found nothing in common to compare."""
+        self.crom("init")
+        self.crom("add", "ci", "--flag", "--disable-features=A")
+
+        output = self.crom("add", "ci", "--flag", "--disable-features=B", expect=4)
+
+        self.assertIn("flags", output)
+        self.assertIn("--disable-features=B", output)
+
+    def test_adding_a_profile_that_states_one_switch_twice_is_refused(self):
+        self.crom("init")
+
+        output = self.crom(
+            "add", "ci", "--flag", "--disable-features=A", "--flag", "--disable-features=B", expect=1
+        )
+
+        self.assertIn("--disable-features=A,B", output)
+
     def test_adding_a_profile_again_with_different_flags_is_refused(self):
         self.crom("init")
         self.crom("add", "ci")

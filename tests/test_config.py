@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from crom import config
+from crom import config, flags
 from crom.paths import default_profiles_root
 from crom.model import DEFAULT_SEED, Conflict, CromError, Scope, SeedChrome, SeedFresh, SeedPath
 
@@ -61,10 +61,25 @@ class NamespaceTest(unittest.TestCase):
 
 
 class ProfileTest(unittest.TestCase):
-    def test_profiles_inherit_default_flags_before_their_own(self):
+    def test_each_stanza_keeps_its_own_flags_for_composition_to_resolve(self):
+        """Parsing separates the layers; `flags.compose` is what resolves between them.
+
+        A parser that merged them here would decide the layering rule in two places —
+        this one and `resolve_spec` — so the stanzas stay distinct all the way down.
+        """
         scope = parse(MINIMAL + '[defaults]\nflags = ["--a"]\n[profiles.dev]\nflags = ["--b"]\n')
-        self.assertEqual(scope.default_flags, ("--a",))
-        self.assertEqual(scope.profiles["dev"].flags, ("--b",))
+        self.assertEqual(flags.render(scope.default_flags), ("--a",))
+        self.assertEqual(flags.render(scope.profiles["dev"].flags), ("--b",))
+
+    def test_one_stanza_may_not_set_the_same_switch_twice(self):
+        """One list disagreeing with itself, which single emission gives no meaning.
+
+        Not an override refusal — a profile overriding `[defaults]` is the feature. This
+        is the case where the earlier entry could not reach Chrome under any reading, so
+        the message names the comma-joined form that expresses what was meant.
+        """
+        with self.assertRaisesRegex(CromError, r"--disable-features=A,B"):
+            parse(MINIMAL + '[profiles.dev]\nflags = ["--disable-features=A", "--disable-features=B"]\n')
 
     def test_unknown_keys_are_refused_rather_than_ignored(self):
         with self.assertRaisesRegex(CromError, "unknown key"):

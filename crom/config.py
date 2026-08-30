@@ -18,7 +18,7 @@ import os
 import tomllib
 from pathlib import Path
 
-from . import configwrite, registry, report
+from . import configwrite, flags, registry, report
 from .browser import find_chrome
 from .locking import exclusive
 from .model import (
@@ -29,6 +29,7 @@ from .model import (
     USER_NAMESPACE,
     Conflict,
     CromError,
+    Flag,
     NotFound,
     ProfileSpec,
     Scope,
@@ -100,17 +101,25 @@ def _reject_unknown(table: dict, allowed: frozenset[str], where: str, source: Pa
         )
 
 
-def parse_flags(raw, where: str, source: Path) -> tuple[str, ...]:
+def parse_flags(raw, where: str, source: Path) -> tuple[Flag, ...]:
+    """The border for everything a config — or `crom add --flag` — says about flags.
+
+    Returns parsed flags rather than the strings that came in, so `flags.compose` and
+    `configwrite` both work from the switch/value split instead of each re-deriving it.
+    `flags.layer` refuses a list that names one switch twice; the reserved check runs
+    after it, on the same parsed flags rather than on a second split of its own.
+    [LAW:one-source-of-truth]
+    """
     if not isinstance(raw, list) or not all(isinstance(f, str) for f in raw):
         raise CromError(f"{source}: {where}.flags must be a list of strings")
-    for flag in raw:
-        switch = flag.split("=", 1)[0]
-        if switch in RESERVED_SWITCHES:
+    parsed = flags.layer(raw, f"{source}: {where}.flags")
+    for flag in parsed:
+        if flag.switch in RESERVED_SWITCHES:
             raise CromError(
-                f"{source}: {where}.flags may not set {switch} — crom owns it "
+                f"{source}: {where}.flags may not set {flag.switch} — crom owns it "
                 f"(it defines the profile's data directory and CDP port)"
             )
-    return tuple(raw)
+    return parsed
 
 
 def parse_env(raw, where: str, source: Path) -> dict[str, str]:
