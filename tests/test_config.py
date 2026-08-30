@@ -158,6 +158,16 @@ class ProfileTest(unittest.TestCase):
             self.assertIn("[profiles.dev].features", str(caught.exception))
             self.assertIn(entry, str(caught.exception))
 
+    def test_a_reserved_drop_carrying_a_value_is_refused_as_reserved_not_for_the_value(self):
+        """Same load-bearing order as the `flags` sibling: "an entry here is a switch name"
+        would send the author to write `--enable-features`, which fails again on the next
+        load, because no occurrence of a reserved switch is allowed however it is spelled.
+        A diagnostic whose remedy does not work is worse than none."""
+        with self.assertRaises(CromError) as caught:
+            parse(MINIMAL + '[profiles.dev]\ndrop_flags = ["--enable-features=X"]\n')
+        self.assertIn("FeatureName = false", str(caught.exception))
+        self.assertNotIn("carries a value", str(caught.exception))
+
     def test_drop_flags_must_be_a_list_of_strings(self):
         with self.assertRaisesRegex(CromError, r"drop_flags must be a list of switch names"):
             parse(MINIMAL + "[profiles.dev]\ndrop_flags = 3\n")
