@@ -344,8 +344,8 @@ def _scopes_to_list(session: _Session, everything: bool) -> tuple[list[Scope], l
     return scopes, unavailable
 
 
-def _effective_flags(scope: Scope, stanza: Layer) -> str:
-    """The flags a profile declaring `stanza` would have, as one comparable fact.
+def _effective_flags(scope: Scope, *stanzas: Layer) -> str:
+    """The flags a profile declaring `stanzas` would have, as one comparable fact.
 
     Through `flags.compose`, the same call `resolve_spec` makes, so a profile's
     `--disable-blink-features` and `[defaults]`'s are seen as two answers to one question
@@ -368,7 +368,9 @@ def _effective_flags(scope: Scope, stanza: Layer) -> str:
     that is right there in the file. [FRAMING:representation] the fact has one rendering,
     and it is the one the template promises.
     """
-    return " ".join(sorted(flags.render(flags.compose(scope.default_flags, stanza).flags)))
+    return " ".join(
+        sorted(flags.render(flags.compose(scope.default_flags, *stanzas).flags))
+    )
 
 
 def _reject_restatement(
@@ -544,8 +546,30 @@ def add_cmd(session: _Session, name: str, seed_text: str | None, flag_texts: tup
             # one. [LAW:one-source-of-truth]
             (
                 "flags",
+                # Both sides are resolved under the *same* drop policy — the declaration's
+                # — because `--flag` cannot express `drop_flags`, so a request is silent
+                # about drops rather than asserting there are none. Composed beside the
+                # declaration instead, the asked side kept a `[defaults]` switch the
+                # profile drops, and a restatement identical to the file exited 4 citing a
+                # flag the user never typed.
+                #
+                # The drops arrive as their own layer under the request's flags, which is
+                # the layering rule applied to the two speakers: the file's policy governs
+                # the switches the command is silent about, and the command answers for the
+                # ones it names. So asking for a switch the profile drops still differs
+                # from the declaration and is still refused — that is a real disagreement
+                # between the command and the file — while asking for nothing new converges.
+                #
+                # Not composed *on top of* the whole declaration, which would have hidden
+                # the other half of this comparison's job: a request that omits a declared
+                # flag asks for a profile without it, and a superset laid over the
+                # declaration can never differ from it.
                 _effective_flags(scope, declared.flags),
-                _effective_flags(scope, spec.flags) if spec.flags.sets else None,
+                (
+                    _effective_flags(scope, Layer(drops=declared.flags.drops), spec.flags)
+                    if spec.flags.sets
+                    else None
+                ),
             ),
         ),
         f"Edit {target} directly, or `crom rm {profile.ref}` and add it again.",
