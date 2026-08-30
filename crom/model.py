@@ -141,6 +141,37 @@ Seed = SeedFresh | SeedChrome | SeedPath
 DEFAULT_SEED: Seed = SeedChrome()
 
 
+# --- flags ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Flag:
+    """One Chrome switch and the value it carries, if it carries one.
+
+    A flag is not a string: it is an answer to a question — `--disable-features` asks
+    "which features are off?" — and only a type that names the question can see that a
+    profile and `[defaults]` are answering the same one. `flags.compose` is where that
+    is acted on; this is the type it acts on. [LAW:types-are-the-program]
+
+    Split at the *first* `=`, because a value may contain more of them
+    (`--host-resolver-rules=MAP a.test b.test=1.2.3.4`). `value is None` is a switch
+    that takes no value (`--no-pings`), which is a different thing from `value == ""`
+    (`--foo=`), a switch given an empty one; `__str__` preserves both, so a flag written
+    in a config round-trips back into argv exactly as typed.
+    """
+
+    switch: str
+    value: str | None
+
+    @classmethod
+    def parse(cls, text: str) -> "Flag":
+        switch, separator, value = text.partition("=")
+        return cls(switch, value if separator else None)
+
+    def __str__(self) -> str:
+        return self.switch if self.value is None else f"{self.switch}={self.value}"
+
+
 # --- declarations ------------------------------------------------------------------
 
 
@@ -184,7 +215,11 @@ class ProfileSpec:
     """
 
     name: str
-    flags: tuple[str, ...] = ()
+    # `Flag`, not `str`: the stanza's flags have been through `config.parse_flags`, which
+    # is where a list naming one switch twice is refused, and carrying the parsed form is
+    # what lets `flags.compose` see that this profile's `--disable-features` and
+    # `[defaults]`'s are two answers to one question. [LAW:parse-dont-validate]
+    flags: tuple[Flag, ...] = ()
     env: dict[str, str] = field(default_factory=dict)
     seed: Seed | None = None
     port: int | None = None
@@ -220,7 +255,7 @@ class Scope:
     source: Path | None
     profiles_root: Path
     chrome_binary: Path
-    default_flags: tuple[str, ...] = ()
+    default_flags: tuple[Flag, ...] = ()
     default_env: dict[str, str] = field(default_factory=dict)
     # `DEFAULT_SEED`, not a literal — this dataclass default is the sixth answer to the
     # question that constant exists to answer, and it sat 80 lines below the comment

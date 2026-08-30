@@ -18,7 +18,7 @@ import os
 import tomllib
 from pathlib import Path
 
-from . import configwrite, registry, report
+from . import configwrite, flags, registry, report
 from .browser import find_chrome
 from .locking import exclusive
 from .model import (
@@ -29,6 +29,7 @@ from .model import (
     USER_NAMESPACE,
     Conflict,
     CromError,
+    Flag,
     NotFound,
     ProfileSpec,
     Scope,
@@ -100,17 +101,30 @@ def _reject_unknown(table: dict, allowed: frozenset[str], where: str, source: Pa
         )
 
 
-def parse_flags(raw, where: str, source: Path) -> tuple[str, ...]:
+def parse_flags(raw, where: str, source: Path) -> tuple[Flag, ...]:
+    """The border for everything a config — or `crom add --flag` — says about flags.
+
+    Returns parsed flags rather than the strings that came in, so `flags.compose` and
+    `configwrite` both work from the switch/value split instead of each re-deriving it.
+    [LAW:one-source-of-truth] `Flag.parse` is the only thing here that knows a switch is
+    the text before the first `=`.
+
+    The reserved check runs *before* `flags.layer`'s duplicate rule, and the order is
+    load-bearing: `flags = ["--user-data-dir=/a", "--user-data-dir=/b"]` is both a
+    duplicate and a reserved switch, and the duplicate message would tell the user to
+    write `--user-data-dir=/a,/b` — advice that fails again on the next load, because no
+    occurrence of a reserved switch is allowed however it is spelled. A diagnostic whose
+    remedy does not work is worse than none. [LAW:no-silent-failure]
+    """
     if not isinstance(raw, list) or not all(isinstance(f, str) for f in raw):
         raise CromError(f"{source}: {where}.flags must be a list of strings")
-    for flag in raw:
-        switch = flag.split("=", 1)[0]
-        if switch in RESERVED_SWITCHES:
+    for flag in (Flag.parse(text) for text in raw):
+        if flag.switch in RESERVED_SWITCHES:
             raise CromError(
-                f"{source}: {where}.flags may not set {switch} — crom owns it "
+                f"{source}: {where}.flags may not set {flag.switch} — crom owns it "
                 f"(it defines the profile's data directory and CDP port)"
             )
-    return tuple(raw)
+    return flags.layer(raw, f"{source}: {where}.flags")
 
 
 def parse_env(raw, where: str, source: Path) -> dict[str, str]:
