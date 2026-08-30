@@ -43,23 +43,37 @@ def layer(texts: list[str] | tuple[str, ...], where: str) -> tuple[Flag, ...]:
             raise CromError(
                 f"{where}: {flag.switch} is set twice, as {str(first)!r} and {str(flag)!r}.\n"
                 f"crom emits each Chrome switch exactly once, so one of these would simply "
-                f"be discarded. Write the switch once with its values comma-joined: "
-                f"{_joined(first, flag)}"
+                f"be discarded. {_remedy(first, flag)}"
             )
         seen[flag.switch] = flag
     return tuple(seen.values())
 
 
-def _joined(*duplicates: Flag) -> str:
-    """The single flag the author of a duplicated switch probably meant.
+def _remedy(first: Flag, second: Flag) -> str:
+    """What to write instead, for each shape a duplicated switch can take.
 
-    Comma-joining is the form Chrome accepts for every list-valued switch measured, and
-    for a valueless switch repeated (`--no-pings --no-pings`) there is nothing to join —
-    the same sentence, "write the switch once", is already the whole fix, and this
-    renders it. [LAW:dataflow-not-control-flow] one suggestion, computed from the values.
+    Three shapes, and the count of occurrences carrying a value tells them apart — so
+    they are enumerated rather than papered over with one sentence. The single sentence
+    this replaced claimed "with its values comma-joined" for all three, which is a false
+    claim in two of them: `--no-pings --no-pings` joins nothing, and `--foo --foo=bar`
+    disagrees about whether `--foo` takes a value at all. crom cannot know which of those
+    two forms was meant — for a switch whose bare and valued spellings mean different
+    things, picking one and presenting it as what the author meant is a guess wearing a
+    suggestion's clothes. [LAW:no-silent-failure]
+
+    Comma-joining is the form Chrome accepts for every list-valued switch measured, which
+    is why it is the remedy whenever both occurrences carry values.
     """
-    values = [flag.value for flag in duplicates if flag.value is not None]
-    return str(Flag(duplicates[0].switch, ",".join(values) if values else None))
+    switch = first.switch
+    values = [flag.value for flag in (first, second) if flag.value is not None]
+    return {
+        2: f"Write the switch once with its values comma-joined: {Flag(switch, ','.join(values))}",
+        1: (
+            f"These disagree about whether {switch} takes a value, so only you can say "
+            f"which was meant — write that one, or comma-join the values if you meant both."
+        ),
+        0: f"Write the switch once: {switch}",
+    }[len(values)]
 
 
 def compose(*layers: tuple[Flag, ...]) -> tuple[Flag, ...]:

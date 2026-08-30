@@ -345,36 +345,31 @@ def _scopes_to_list(session: _Session, everything: bool) -> tuple[list[Scope], l
     return scopes, unavailable
 
 
-def _flag_difference(
-    scope: Scope, declared: tuple[Flag, ...], asked: tuple[Flag, ...]
-) -> tuple[str, str | None]:
-    """What two declarations of the same profile disagree about, each side's part of it.
+def _effective_flags(scope: Scope, stanza: tuple[Flag, ...]) -> str:
+    """The flags a profile declaring `stanza` would have, as one comparable fact.
 
-    Both sides go through `flags.compose` — the same call `resolve_spec` makes — so the
-    question being asked is "would these two launch the same browser?" and it is answered
-    by the one function that decides what a profile launches with.
-    [LAW:one-source-of-truth]
+    Through `flags.compose`, the same call `resolve_spec` makes, so a profile's
+    `--disable-features` and `[defaults]`'s are seen as two answers to one question
+    rather than two unrelated strings. [LAW:one-source-of-truth]
 
-    What is *returned* is only the part they differ on, and that is a rendering choice,
-    not a second comparison: two composed lists are equal exactly when neither has a flag
-    the other lacks, so an empty pair here means the same thing an equality test would
-    have meant. Returning the whole composed list instead printed crom's dozen launch
-    policy flags twice per refusal, leaving the user to spot the one switch that moved in
-    the middle of two near-identical walls of text — a message that names everything
-    except where to look.
+    The launch policy is deliberately not a layer here, though it is one at launch. The
+    doctrine that makes an inherited flag *already* what the user asked for is about the
+    config file every checkout shares: a `[defaults]` flag reaches the profile on every
+    machine that reads the file, so restating it asks for nothing new. crom's launch
+    policy is not in the file at all — it is crom's own behavior, which a crom upgrade
+    can change — so `crom add ci --flag --no-pings` is asking for something this config
+    does not yet say, exactly as `--port` is judged on the pin rather than on the port
+    crom happened to assign.
 
-    Order and repetition are not facts about a profile: the same flags typed in another
-    order are the same request. Composition already absorbed repetition, so the set
-    arithmetic here only adds order-insensitivity.
+    Whole values, not the part the two sides differ on. `_reject_restatement` renders
+    every fact as "declared X, you asked for Y" and spells an empty X `(unset)` — a
+    vocabulary of full values, which a difference does not speak: a profile declaring
+    `--a=1` asked to also take `--b=2` has nothing unique on its declared side, and
+    reported as a difference that read `declared (unset)`, flatly denying the `--a=1`
+    that is right there in the file. [FRAMING:representation] the fact has one rendering,
+    and it is the one the template promises.
     """
-    left = set(flags.render(flags.compose(LAUNCH_POLICY_FLAGS, scope.default_flags, declared)))
-    right = set(flags.render(flags.compose(LAUNCH_POLICY_FLAGS, scope.default_flags, asked)))
-    # An empty `asked` is the only way `--flag` can go unmentioned, so emptiness is
-    # statedness here — unlike `seed` and `port`, which have a real `None`. A request that
-    # says nothing about flags cannot contradict the file, which `_reject_restatement`
-    # spells `None`; without it, `crom add ci` on a profile that has flags would read as
-    # asking for a profile with none.
-    return " ".join(sorted(left - right)), " ".join(sorted(right - left)) if asked else None
+    return " ".join(sorted(flags.render(flags.compose(scope.default_flags, stanza))))
 
 
 def _reject_restatement(
@@ -534,15 +529,22 @@ def add_cmd(session: _Session, name: str, seed_text: str | None, flag_texts: tup
                 else f"(unpinned — crom assigned {profile.port})",
                 None if spec.port is None else str(spec.port),
             ),
-            # Effective flags, for the reason the seed fact is effective: a flag reaching
-            # the profile from `[defaults]` or from crom's launch policy reaches it on
-            # every machine that checks the file out, so a profile already running
-            # `--headless` *is* the profile `--flag --headless` asked for. This comparison
-            # used to build its own set-union of the defaults and the declared flags,
-            # which was a second, independent statement of what flags a profile has — and
-            # it disagreed with the launcher the moment either layer overrode a switch
-            # rather than adding one. [LAW:one-source-of-truth]
-            ("flags", *_flag_difference(scope, declared.flags, spec.flags)),
+            # An empty tuple is the only way `--flag` can go unmentioned, so emptiness is
+            # statedness here — unlike `seed` and `port`, which have a real `None`.
+            #
+            # Effective, for the reason the seed fact is effective: a flag reaching the
+            # profile from `[defaults]` reaches it on every machine that checks the file
+            # out, so a profile already running `--headless` *is* the profile
+            # `--flag --headless` asked for. This comparison used to build its own
+            # set-union of the defaults and the declared flags, which was a second,
+            # independent statement of what flags a profile has — and it disagreed with
+            # the launcher the moment either layer overrode a switch rather than adding
+            # one. [LAW:one-source-of-truth]
+            (
+                "flags",
+                _effective_flags(scope, declared.flags),
+                _effective_flags(scope, spec.flags) if spec.flags else None,
+            ),
         ),
         f"Edit {target} directly, or `crom rm {profile.ref}` and add it again.",
     )

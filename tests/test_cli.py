@@ -422,15 +422,45 @@ class CliTest(unittest.TestCase):
 
         self.assertIn("Already declared myproj/ci", output)
 
-    def test_adding_a_profile_again_with_a_launch_policy_flag_is_the_same_request(self):
-        """The policy is a layer like `[defaults]`, so a switch crom already sets is a
-        switch the profile already has — asking for it again asks for nothing new."""
+    def test_asking_for_a_launch_policy_flag_the_config_does_not_state_is_refused(self):
+        """The launch policy is a layer at launch but not a fact about this config.
+
+        What makes an inherited flag *already* what the user asked for is that it lives in
+        the file every checkout shares. crom's policy does not — it is crom's own
+        behavior, which an upgrade can change — so asking the file to state `--no-pings`
+        is asking for something it does not yet say, exactly as `--port` is judged on the
+        pin rather than on the port crom happened to assign.
+        """
         self.crom("init")
         self.crom("add", "ci")
 
-        output = self.crom("add", "ci", "--flag", "--no-pings")
+        output = self.crom("add", "ci", "--flag", "--no-pings", expect=4)
 
-        self.assertIn("Already declared myproj/ci", output)
+        self.assertIn("--no-pings", output)
+
+    def test_a_refusal_names_the_profiles_whole_effective_flag_list(self):
+        """Both sides are full values, in the vocabulary `_reject_restatement` promises.
+
+        Reporting only what the two sides differ on read `declared (unset)` for a profile
+        that had flags — the wording that means "nothing is set" for seed and port —
+        denying a declaration sitting in the file the message names.
+        """
+        self.crom("init")
+        self.crom("add", "ci", "--flag", "--a=1")
+
+        output = self.crom("add", "ci", "--flag", "--a=1", "--flag", "--b=2", expect=4)
+
+        self.assertIn("declared --a=1,", output)
+        self.assertNotIn("(unset)", output)
+
+    def test_dropping_a_declared_flag_is_refused_without_trailing_off(self):
+        """The asked side has no `(unset)` fallback, so it must never render empty."""
+        self.crom("init")
+        self.crom("add", "ci", "--flag", "--a=1", "--flag", "--b=1")
+
+        output = self.crom("add", "ci", "--flag", "--a=1", expect=4)
+
+        self.assertIn("you asked for --a=1", output)
 
     def test_restating_one_switch_with_a_different_value_is_refused(self):
         """The override case the old set-of-strings comparison could not see: both sides

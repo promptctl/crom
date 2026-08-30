@@ -106,20 +106,25 @@ def parse_flags(raw, where: str, source: Path) -> tuple[Flag, ...]:
 
     Returns parsed flags rather than the strings that came in, so `flags.compose` and
     `configwrite` both work from the switch/value split instead of each re-deriving it.
-    `flags.layer` refuses a list that names one switch twice; the reserved check runs
-    after it, on the same parsed flags rather than on a second split of its own.
-    [LAW:one-source-of-truth]
+    [LAW:one-source-of-truth] `Flag.parse` is the only thing here that knows a switch is
+    the text before the first `=`.
+
+    The reserved check runs *before* `flags.layer`'s duplicate rule, and the order is
+    load-bearing: `flags = ["--user-data-dir=/a", "--user-data-dir=/b"]` is both a
+    duplicate and a reserved switch, and the duplicate message would tell the user to
+    write `--user-data-dir=/a,/b` — advice that fails again on the next load, because no
+    occurrence of a reserved switch is allowed however it is spelled. A diagnostic whose
+    remedy does not work is worse than none. [LAW:no-silent-failure]
     """
     if not isinstance(raw, list) or not all(isinstance(f, str) for f in raw):
         raise CromError(f"{source}: {where}.flags must be a list of strings")
-    parsed = flags.layer(raw, f"{source}: {where}.flags")
-    for flag in parsed:
+    for flag in (Flag.parse(text) for text in raw):
         if flag.switch in RESERVED_SWITCHES:
             raise CromError(
                 f"{source}: {where}.flags may not set {flag.switch} — crom owns it "
                 f"(it defines the profile's data directory and CDP port)"
             )
-    return parsed
+    return flags.layer(raw, f"{source}: {where}.flags")
 
 
 def parse_env(raw, where: str, source: Path) -> dict[str, str]:

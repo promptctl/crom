@@ -81,6 +81,24 @@ class ProfileTest(unittest.TestCase):
         with self.assertRaisesRegex(CromError, r"--disable-features=A,B"):
             parse(MINIMAL + '[profiles.dev]\nflags = ["--disable-features=A", "--disable-features=B"]\n')
 
+    def test_a_duplicated_valueless_switch_is_not_told_to_join_values(self):
+        """There is nothing to comma-join, and saying otherwise is a false claim."""
+        with self.assertRaisesRegex(CromError, r"Write the switch once: --no-pings"):
+            parse(MINIMAL + '[profiles.dev]\nflags = ["--no-pings", "--no-pings"]\n')
+
+    def test_a_switch_given_both_a_value_and_none_is_not_guessed_at(self):
+        """The two forms can mean different things, so crom names the disagreement rather
+        than picking one and presenting it as what the author meant."""
+        with self.assertRaisesRegex(CromError, r"disagree about whether --foo takes a value"):
+            parse(MINIMAL + '[profiles.dev]\nflags = ["--foo", "--foo=bar"]\n')
+
+    def test_a_duplicated_reserved_switch_is_refused_as_reserved_not_as_a_duplicate(self):
+        """The duplicate remedy — write it once, comma-joined — fails again on the next
+        load, because no occurrence of a reserved switch is allowed however it is spelled.
+        A diagnostic whose remedy does not work is worse than none."""
+        with self.assertRaisesRegex(CromError, "crom owns it"):
+            parse(MINIMAL + '[profiles.dev]\nflags = ["--user-data-dir=/a", "--user-data-dir=/b"]\n')
+
     def test_unknown_keys_are_refused_rather_than_ignored(self):
         with self.assertRaisesRegex(CromError, "unknown key"):
             parse(MINIMAL + "[profiles.dev]\nfalgs = []\n")
