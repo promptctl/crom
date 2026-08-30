@@ -464,23 +464,30 @@ class CliTest(unittest.TestCase):
 
     def test_restating_one_switch_with_a_different_value_is_refused(self):
         """The override case the old set-of-strings comparison could not see: both sides
-        name `--disable-features`, so a set union found nothing in common to compare."""
+        name `--disable-blink-features`, so a set union found nothing in common to
+        compare."""
         self.crom("init")
-        self.crom("add", "ci", "--flag", "--disable-features=A")
+        self.crom("add", "ci", "--flag", "--disable-blink-features=A")
 
-        output = self.crom("add", "ci", "--flag", "--disable-features=B", expect=4)
+        output = self.crom("add", "ci", "--flag", "--disable-blink-features=B", expect=4)
 
         self.assertIn("flags", output)
-        self.assertIn("--disable-features=B", output)
+        self.assertIn("--disable-blink-features=B", output)
 
     def test_adding_a_profile_that_states_one_switch_twice_is_refused(self):
         self.crom("init")
 
         output = self.crom(
-            "add", "ci", "--flag", "--disable-features=A", "--flag", "--disable-features=B", expect=1
+            "add",
+            "ci",
+            "--flag",
+            "--disable-blink-features=A",
+            "--flag",
+            "--disable-blink-features=B",
+            expect=1,
         )
 
-        self.assertIn("--disable-features=A,B", output)
+        self.assertIn("--disable-blink-features=A,B", output)
 
     def test_adding_a_profile_again_with_different_flags_is_refused(self):
         self.crom("init")

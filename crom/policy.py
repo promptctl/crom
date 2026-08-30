@@ -1,18 +1,31 @@
-"""crom's fixed launch policy — the flags every managed Chrome gets, whoever launches it.
+"""crom's fixed launch policy — what every managed Chrome gets, whoever launches it.
 
 [LAW:one-source-of-truth] this list is the sole owner of that policy;
 [LAW:dataflow-not-control-flow] it is data spread into argv, not branches in a launcher.
 
-The top-level switches are long-stable Chrome/Chromium command-line switches. The
-trailing --disable-features entries are the version-fragile part: Chrome silently
-ignores feature names it no longer knows, so new promo/upsell surfaces get suppressed
-by adding a name there, not by touching any code.
+The policy has two halves because Chrome has two kinds of switch here. `_POLICY_TEXTS`
+holds long-stable command-line switches, each a whole answer on its own.
+`LAUNCH_POLICY_FEATURES` holds Chrome *features*, which are the version-fragile part:
+Chrome silently ignores feature names it no longer knows, so new promo/upsell surfaces
+get suppressed by adding a name there, not by touching any code.
 
-This is the first layer `flags.compose` resolves, so a config that names one of these
-switches replaces crom's entry for it rather than following it — the same
-`profile > defaults > policy` rule every other config key obeys. crom relies on none of
-Chrome's own conflict rules, because each switch is emitted exactly once.
-`crom config <profile>` prints the fully composed argv, so the policy is never invisible.
+The split is not cosmetic. Two `--disable-features` switches do not merge — Chrome
+discards the earlier one — so crom's feature suppression cannot survive as a *string* in
+the flag list: any config that set `--disable-features` for its own reasons would replace
+it wholesale. As a table it survives as a union, because `flags.features` folds every
+layer's features into the single switch crom emits.
+
+Both halves are layers beneath `[defaults]` and the profile, obeying the
+`profile > defaults > policy` rule every other config key obeys — but they are overridden
+at different grains, because they are answers to differently-sized questions. A config
+naming one of the switches above *replaces* crom's entry for it, a whole answer for a
+whole answer. A config naming one of the features below moves that single feature and
+leaves crom's others in place, because the switch they share is composed from every
+layer's table rather than taken from the last one to speak.
+
+crom relies on none of Chrome's own conflict rules either way, because each switch is
+emitted exactly once. `crom config <profile>` prints the fully composed argv, so the
+policy is never invisible.
 """
 
 from .flags import Flag, layer
@@ -37,10 +50,9 @@ _POLICY_TEXTS: tuple[str, ...] = (
     "--no-first-run",
     "--disable-sync",
 
-    # "Don't try to sell me things" — the upsell surfaces. --disable-search-engine-choice-screen
-    # kills the search-engine chooser; ChromeWhatsNewUI is the post-update "What's New" promo tab.
+    # "Don't try to sell me things" — the upsell surfaces. The search-engine chooser is a
+    # switch of its own; the rest of this category lives in LAUNCH_POLICY_FEATURES below.
     "--disable-search-engine-choice-screen",
-    "--disable-features=ChromeWhatsNewUI",
 
     # Quiet UI — chrome-only nags, invisible to web content.
     "--disable-session-crashed-bubble",  # no "Chrome didn't shut down correctly" bubble
@@ -50,3 +62,11 @@ _POLICY_TEXTS: tuple[str, ...] = (
 # held to the rule it enforces: naming a switch twice above is a bug that fails loudly at
 # import rather than silently dropping the earlier entry. [LAW:single-enforcer]
 LAUNCH_POLICY_FLAGS: tuple[Flag, ...] = layer(_POLICY_TEXTS, "crom's launch policy")
+
+# The features crom turns off for every managed Chrome, in the same vocabulary a config's
+# `features` table uses — crom's policy is the first layer of that table, not a privileged
+# form of it, which is what lets a project say `ChromeWhatsNewUI = true` and be obeyed.
+LAUNCH_POLICY_FEATURES: dict[str, bool] = {
+    # The post-update "What's New" promo tab.
+    "ChromeWhatsNewUI": False,
+}

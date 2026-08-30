@@ -24,7 +24,7 @@ from .model import (
     Seed,
 )
 from .paths import user_config_file
-from .policy import LAUNCH_POLICY_FLAGS
+from .policy import LAUNCH_POLICY_FEATURES, LAUNCH_POLICY_FLAGS
 
 # The closed vocabulary a config may interpolate into flags and env values. Closed on
 # purpose: an unknown ${...} is an error, never an empty string silently spliced into a
@@ -262,14 +262,27 @@ def resolve_spec(scope: Scope, spec: ProfileSpec) -> ResolvedProfile:
     profile_dir = scope.profiles_root / ref.namespace / ref.name
     where = str(scope.source or "user config")
     # The one place the launch list is decided. Composition is by switch name, so a
-    # profile's `--disable-features` replaces `[defaults]`'s and `[defaults]`'s replaces
-    # the policy's — the `profile > defaults > policy` rule every other key here follows.
+    # profile's `--disable-blink-features` replaces `[defaults]`'s and `[defaults]`'s
+    # replaces the policy's — the `profile > defaults > policy` rule every other key here
+    # follows. (`--disable-features` cannot stand as the example any more: `features` owns
+    # that switch, and a layer contributes to it rather than replacing it.)
     #
     # `crom add`'s restatement check goes through `flags.compose` too, but over two layers
     # rather than three: it asks what this *config* states, and crom's launch policy is
     # not in the config. Deliberately different layer sets, not a drift — see
     # `cli._effective_flags`, which owns that reasoning.
-    composed = flags.compose(LAUNCH_POLICY_FLAGS, scope.default_flags, spec.flags)
+    #
+    # The features layer is composed last, and its position carries no conflict to
+    # resolve: `config.RESERVED_SWITCHES` refuses `--enable-features` and
+    # `--disable-features` inside any `flags` list, so those two switches can reach
+    # `compose` from nowhere else and land wherever this layer is placed. Last is simply
+    # where a reader of `crom config` finds them.
+    composed = flags.compose(
+        LAUNCH_POLICY_FLAGS,
+        scope.default_flags,
+        spec.flags,
+        flags.features(LAUNCH_POLICY_FEATURES, scope.default_features, spec.features),
+    )
     raw_env = {**scope.default_env, **spec.env}
 
     # [LAW:effects-at-boundaries] Every way this resolution can fail runs first, while
@@ -281,6 +294,11 @@ def resolve_spec(scope: Scope, spec: ProfileSpec) -> ResolvedProfile:
     # typo in a `[defaults]` flag that this profile happens to override is still a typo,
     # and reporting it only for the profiles that don't override it would make the
     # diagnostic depend on which stanza you were resolving. [LAW:no-silent-failure]
+    #
+    # Features are absent from this check because they cannot fail it: `parse_features`
+    # refuses a `${` in a feature name outright, so a feature carries no variable to be
+    # unknown. That refusal is what keeps `flags.features` folding on the same text Chrome
+    # is given, rather than on a pre-expansion spelling of it.
     _reject_unknown_variables(
         (*flags.render(scope.default_flags), *flags.render(spec.flags), *raw_env.values()),
         _variables(ref, profile_dir, scope.config_dir, None),
