@@ -247,6 +247,18 @@ class HeaderInvariantTest(unittest.TestCase):
         self.assertEqual(scope.namespace, "myapp")
         self.assertEqual(sorted(scope.profiles), ["ci"])
 
+    def test_a_declared_features_table_survives_the_write(self):
+        """`_stanza` promises to record what the user stated, so a field `ProfileSpec`
+        carries and the writer drops would be a lie the file tells about the spec. Written
+        and read back through the parser, because the pair is what has to agree."""
+        configwrite.ensure_profile(
+            self.target,
+            ProfileSpec(name="ci", features={"SharedStorageAPI": False}),
+            header='namespace = "myapp"\n',
+        )
+        scope = config.parse(self.target.read_text(), self.target)
+        self.assertEqual(scope.profiles["ci"].features, {"SharedStorageAPI": False})
+
 
 
 

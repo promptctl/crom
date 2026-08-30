@@ -78,8 +78,12 @@ class ProfileTest(unittest.TestCase):
         is the case where the earlier entry could not reach Chrome under any reading, so
         the message names the comma-joined form that expresses what was meant.
         """
-        with self.assertRaisesRegex(CromError, r"--disable-features=A,B"):
-            parse(MINIMAL + '[profiles.dev]\nflags = ["--disable-features=A", "--disable-features=B"]\n')
+        with self.assertRaisesRegex(CromError, r"--disable-blink-features=A,B"):
+            parse(
+                MINIMAL
+                + '[profiles.dev]\n'
+                + 'flags = ["--disable-blink-features=A", "--disable-blink-features=B"]\n'
+            )
 
     def test_a_duplicated_valueless_switch_is_not_told_to_join_values(self):
         """There is nothing to comma-join, and saying otherwise is a false claim."""
@@ -113,6 +117,61 @@ class ProfileTest(unittest.TestCase):
         for flag in ("--user-data-dir=/tmp/x", "--remote-debugging-port=1234"):
             with self.subTest(flag=flag), self.assertRaisesRegex(CromError, "crom owns it"):
                 parse(MINIMAL + f'[profiles.dev]\nflags = ["{flag}"]\n')
+
+    def test_a_feature_switch_in_flags_is_refused_and_points_at_the_features_table(self):
+        """crom composes these two switches itself, so a flag naming one would be replaced
+        rather than merged — the exact defect `features` exists to fix. The message has to
+        name the key that *does* work, in the polarity the author reached for."""
+        for flag, entry in (
+            ("--disable-features=SharedStorageAPI", "FeatureName = false"),
+            ("--enable-features=SharedStorageAPI", "FeatureName = true"),
+        ):
+            with self.subTest(flag=flag), self.assertRaises(CromError) as caught:
+                parse(MINIMAL + f'[profiles.dev]\nflags = ["{flag}"]\n')
+            self.assertIn("[profiles.dev].features", str(caught.exception))
+            self.assertIn(entry, str(caught.exception))
+
+    def test_features_must_be_a_table_of_booleans(self):
+        """`false` is a state, `"false"` is a string that would render into the switch as
+        a feature name — so the table takes booleans and says so."""
+        for table in ('SharedStorageAPI = "false"', "SharedStorageAPI = 0"):
+            with self.subTest(table=table), self.assertRaisesRegex(CromError, "true/false"):
+                parse(MINIMAL + f"[profiles.dev]\n[profiles.dev.features]\n{table}\n")
+
+    def test_a_feature_name_that_would_not_reach_chrome_as_written_is_refused(self):
+        """Every one of these reaches Chrome meaning something other than what the config
+        shows, and Chrome ignores names it does not know — so without the checkpoint the
+        toggle silently does nothing. Refused rather than repaired: stripping `" Foo"`
+        would make crom disagree with the file about the feature's name."""
+        for name, fault in (
+            ('""', "is empty"),
+            ('"   "', "is empty"),
+            ('" Foo"', "whitespace"),
+            ('"Foo "', "whitespace"),
+            ('"A,B"', "comma"),
+            ('"${CROM_PROFILE}Foo"', "interpolates a variable"),
+            ('"${UNCLOSED"', "interpolates a variable"),
+        ):
+            with self.subTest(name=name), self.assertRaisesRegex(CromError, fault):
+                parse(MINIMAL + f"[profiles.dev]\n[profiles.dev.features]\n{name} = false\n")
+
+    def test_a_feature_name_chrome_parameterizes_is_left_alone(self):
+        """crom holds no table of Chrome's feature grammar, for the same reason it holds no
+        table of which switches merge. A name it cannot break is a name it passes through."""
+        scope = parse(
+            MINIMAL
+            + '[profiles.dev]\n[profiles.dev.features]\n"Feature:param/value" = true\n'
+        )
+        self.assertEqual(scope.profiles["dev"].features, {"Feature:param/value": True})
+
+    def test_features_are_read_from_both_defaults_and_a_profile(self):
+        scope = parse(
+            MINIMAL
+            + "[defaults.features]\nFromDefaults = false\n"
+            + "[profiles.dev]\n[profiles.dev.features]\nFromProfile = true\n"
+        )
+        self.assertEqual(scope.default_features, {"FromDefaults": False})
+        self.assertEqual(scope.profiles["dev"].features, {"FromProfile": True})
 
     def test_two_profiles_may_not_pin_the_same_port(self):
         with self.assertRaisesRegex(CromError, "both pin port"):

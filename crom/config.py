@@ -16,6 +16,7 @@ files and a reset would destroy the good declarations along with the bad line.
 
 import os
 import tomllib
+from collections.abc import Callable
 from pathlib import Path
 
 from . import configwrite, flags, registry, report
@@ -46,21 +47,55 @@ from .paths import (
     user_config_file,
 )
 
-# Switches crom owns: they carry the profile's identity and its CDP contract, and
-# `chrome.find_pids` matches on --user-data-dir to decide what is running. A config
-# that set them would make crom's map of reality wrong, so the checkpoint rejects them.
-# [LAW:single-enforcer] this is the one place that decision is made.
-RESERVED_SWITCHES = frozenset(
-    {
-        "--user-data-dir",
-        "--remote-debugging-port",
-        "--remote-debugging-pipe",
-    }
-)
+# Switches a `flags` list may not name, each mapped to why — a template the refusal
+# finishes with the stanza it was found in. [LAW:single-enforcer] this is the one place
+# that decision is made, and holding the reason beside the switch is what lets two
+# families of reserved switch share one enforcer without the enforcer branching on which
+# family it is looking at. [LAW:dataflow-not-control-flow]
+#
+# The stanza is spliced by name rather than by `str.format`: these are sentences written
+# for a human, and a future editor who puts a brace in one would otherwise turn the
+# refusal itself into a KeyError — a crash on the path whose whole job is explaining a
+# mistake. A plain substitution cannot be broken by the prose around it.
+_STANZA = "{where}"
+_OWNED_BY_CROM = "crom owns it (it defines the profile's data directory and CDP port)"
+
+
+def _owned_by_features(state: bool) -> str:
+    """Why a feature switch is refused, in the polarity of the switch that was written.
+
+    Named back in the vocabulary the author was reaching for: someone who typed
+    `--disable-features=X` wants X off, and `X = false` is how this config says that. The
+    switch itself cannot be honoured as written, because crom folds every layer's features
+    into one occurrence and a raw switch would be replaced rather than merged — which is
+    the exact defect the `features` table exists to fix, so accepting the switch quietly
+    would reintroduce it. [LAW:no-silent-failure]
+    """
+    return (
+        f"crom composes that switch from `features` tables so Chrome is given it exactly "
+        f"once, and a flag naming it would be replaced rather than merged.\n"
+        f"Say it in {_STANZA}.features instead, one entry per name: "
+        f"FeatureName = {str(state).lower()}"
+    )
+
+
+# Identity switches carry the profile's identity and its CDP contract, and
+# `chrome.find_pids` matches on --user-data-dir to decide what is running; a config that
+# set one would make crom's map of reality wrong. The feature switches are reserved for a
+# different reason and get a different answer — see `_owned_by_features`.
+RESERVED_SWITCHES: dict[str, str] = {
+    "--user-data-dir": _OWNED_BY_CROM,
+    "--remote-debugging-port": _OWNED_BY_CROM,
+    "--remote-debugging-pipe": _OWNED_BY_CROM,
+    **{
+        switch: _owned_by_features(state)
+        for state, switch in flags.FEATURE_SWITCHES.items()
+    },
+}
 
 _SCOPE_KEYS = frozenset({"namespace", "chrome_binary", "state_dir", "defaults", "profiles"})
-_DEFAULTS_KEYS = frozenset({"flags", "env", "seed"})
-_PROFILE_KEYS = frozenset({"flags", "env", "seed", "port"})
+_DEFAULTS_KEYS = frozenset({"flags", "features", "env", "seed"})
+_PROFILE_KEYS = frozenset({"flags", "features", "env", "seed", "port"})
 
 
 # --- discovery ---------------------------------------------------------------------
@@ -119,12 +154,79 @@ def parse_flags(raw, where: str, source: Path) -> tuple[Flag, ...]:
     if not isinstance(raw, list) or not all(isinstance(f, str) for f in raw):
         raise CromError(f"{source}: {where}.flags must be a list of strings")
     for flag in (Flag.parse(text) for text in raw):
-        if flag.switch in RESERVED_SWITCHES:
+        reason = RESERVED_SWITCHES.get(flag.switch)
+        if reason is not None:
             raise CromError(
-                f"{source}: {where}.flags may not set {flag.switch} — crom owns it "
-                f"(it defines the profile's data directory and CDP port)"
+                f"{source}: {where}.flags may not set {flag.switch} — "
+                + reason.replace(_STANZA, where)
             )
     return flags.layer(raw, f"{source}: {where}.flags")
+
+
+# What a feature name may not be, and how to say so — the four ways a name can fail to
+# survive crom's own machinery, enumerated rather than accumulated. Order is the order
+# they are diagnosed in, so the emptier fault is named before the subtler one: "   " is
+# empty *and* surrounded by whitespace, and "is empty" is the more useful thing to say.
+#
+# Every one of these is a name that would reach Chrome meaning something other than what
+# the config shows — silently, because Chrome ignores feature names it does not know.
+# [LAW:no-silent-failure] Anything not listed here (`Feature:param/value`, `Feature<Trial`)
+# passes through verbatim and means to Chrome exactly what was written; crom holds no
+# table of Chrome's feature grammar, for the same reason it holds no table of which
+# switches merge.
+_ILLEGAL_FEATURE_NAMES: tuple[tuple[Callable[[str], bool], str], ...] = (
+    (lambda name: not name.strip(), "is empty"),
+    (
+        lambda name: name != name.strip(),
+        "has leading or trailing whitespace that Chrome does not trim",
+    ),
+    (
+        lambda name: "," in name,
+        "contains a comma, the separator crom joins the names with",
+    ),
+    (
+        lambda name: "${" in name,
+        "interpolates a variable, and a feature name is a literal",
+    ),
+)
+
+
+def parse_features(raw, where: str, source: Path) -> dict[str, bool]:
+    """The border for a `features` table — the config's say over Chrome's features.
+
+    [LAW:parse-dont-validate] a `dict[str, bool]` that exists here is already known to
+    reach Chrome as written: `flags.features` comma-joins the names into one switch and
+    never asks again whether a name can survive that, and nothing downstream rewrites one.
+
+    A name is refused rather than repaired. Stripping the whitespace off `" Foo"` would
+    make crom quietly disagree with the file about what the feature is called, so the
+    config would stop reading back as written — which is the property these checks exist
+    to protect, not a cost to pay for them.
+
+    Names are literal, and `${VAR}` is refused rather than expanded. That is a deliberate
+    absence: every name in the interpolation vocabulary is a fact about *this deployment*
+    — a port, a directory, a namespace — while a Chrome feature name is a constant in
+    Chrome's own source, so the two never legitimately meet. Expanding them would also put
+    the fold in `flags.features` on a different footing from Chrome, keying feature
+    identity on the raw text while Chrome sees the expanded text — two representations of
+    one identity, free to diverge, which is how `"${CROM_NAMESPACE}Foo" = true` in one
+    layer and `"appFoo" = false` in another would both survive and reach Chrome as a
+    collision that crom exists to never emit. [LAW:one-source-of-truth]
+    """
+    if not isinstance(raw, dict) or not all(isinstance(v, bool) for v in raw.values()):
+        raise CromError(
+            f"{source}: {where}.features must be a table of feature name = true/false "
+            f"(true turns the feature on, false turns it off; a name you omit is left alone)"
+        )
+    for name in raw:
+        for is_illegal, fault in _ILLEGAL_FEATURE_NAMES:
+            if is_illegal(name):
+                raise CromError(
+                    f"{source}: {where}.features names a feature {name!r}, which {fault}.\n"
+                    f"crom passes each name to Chrome exactly as written, so it has to be "
+                    f"the literal feature name — e.g. SharedStorageAPI."
+                )
+    return dict(raw)
 
 
 def parse_env(raw, where: str, source: Path) -> dict[str, str]:
@@ -377,6 +479,7 @@ def parse(text: str, source: Path, *, namespace: str | None = None) -> Scope:
         profiles[name] = ProfileSpec(
             name=name,
             flags=parse_flags(raw.get("flags", []), where, source),
+            features=parse_features(raw.get("features", {}), where, source),
             env=parse_env(raw.get("env", {}), where, source),
             seed=parse_seed(raw["seed"], where, source, config_dir) if "seed" in raw else None,
             port=parse_port(raw.get("port"), where, source),
@@ -390,6 +493,7 @@ def parse(text: str, source: Path, *, namespace: str | None = None) -> Scope:
         profiles_root=profiles_root,
         chrome_binary=binary,
         default_flags=parse_flags(defaults.get("flags", []), "[defaults]", source),
+        default_features=parse_features(defaults.get("features", {}), "[defaults]", source),
         default_env=parse_env(defaults.get("env", {}), "[defaults]", source),
         default_seed=default_seed,
         profiles=profiles,

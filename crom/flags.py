@@ -1,11 +1,15 @@
-"""How a list of flag texts becomes a layer, and how layers resolve into one launch list.
+"""How a stanza becomes a layer, and how layers resolve into one launch list.
+
+Two things a stanza can say become a layer here — a `flags` list of copy-pasteable
+Chrome strings, and a `features` table of name -> on/off — and `compose` resolves
+whatever it is handed without knowing which produced it. [LAW:composability]
 
 crom emits each Chrome switch exactly once and never lets Chrome resolve a conflict,
 because Chrome's rules are per-switch and not inferable. Measured against Google Chrome
 151.0.7922.175: `--disable-features` given twice silently discards the first, while
 `--disable-blink-features` — one word apart in name — is additive across repetitions.
-No table crom could hold would stay true for the switches nobody has tested, so crom
-holds no table. It relies instead on the one fact that is universal: anything
+No table of *which switches merge* could stay true for the switches nobody has tested, so
+crom holds no such table. It relies instead on the one fact that is universal: anything
 expressible as two occurrences of a switch is expressible as one comma-joined
 occurrence, so emitting once costs no expressiveness.
 
@@ -87,6 +91,45 @@ def _remedy(first: Flag, second: Flag) -> str:
         f"These disagree about whether {first.switch} takes a value, so only you can say "
         f"which was meant — write that one."
     )
+
+
+# Which switch carries a feature in each state, and the only place those two switch
+# names are written. `config.RESERVED_SWITCHES` reads them from here rather than
+# spelling them again, so the switches `features` owns and the switches a `flags` list
+# is refused for naming cannot come apart. [LAW:one-source-of-truth]
+FEATURE_SWITCHES: dict[bool, str] = {True: "--enable-features", False: "--disable-features"}
+
+
+def features(*tables: dict[str, bool]) -> tuple[Flag, ...]:
+    """Fold feature tables into the at-most-two switches that carry them.
+
+    A feature is in one of three states — on, off, or unmentioned — and a table of
+    name -> bool is exactly that domain: the two switches are a *rendering* of one fact,
+    not two facts. This is what makes the measured Chrome behavior disappear rather than
+    get implemented. `--disable-features=X` beats `--enable-features=X` in either order,
+    so a naive pair of lists would have to encode that precedence; here the state selects
+    the switch, so a name reaches exactly one of them and crom never emits the collision
+    whose rule it would otherwise have to model. [LAW:types-are-the-program]
+
+    Layers fold later-wins for the same reason `compose` does, and by the same mechanism
+    — a dict assignment — so `profile > defaults > policy` holds for a feature exactly as
+    it holds for a flag. A profile writing `ChromeWhatsNewUI = true` takes effect by
+    *removing* the name from the disable list, which is the only way it could take effect
+    at all: an added `--enable-features` would lose to the disable that was still there.
+
+    The result is a layer like any other, so `compose` needs no case for it. Each switch
+    is omitted when no feature is in its state — an `--enable-features=` with an empty
+    value is a switch Chrome is given and told nothing by, which is a different claim
+    from the one crom means.
+    """
+    resolved: dict[str, bool] = {}
+    for table in tables:
+        resolved.update(table)
+
+    named: dict[str, list[str]] = {switch: [] for switch in FEATURE_SWITCHES.values()}
+    for name, state in resolved.items():
+        named[FEATURE_SWITCHES[state]].append(name)
+    return tuple(Flag(switch, ",".join(names)) for switch, names in named.items() if names)
 
 
 def compose(*layers: tuple[Flag, ...]) -> tuple[Flag, ...]:
