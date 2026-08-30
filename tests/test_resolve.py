@@ -9,6 +9,7 @@ from crom import config, flags, registry, resolve
 from crom.model import (
     CromError,
     FailedProfile,
+    Flag,
     Layer,
     ProfileRef,
     ProfileSpec,
@@ -108,6 +109,13 @@ class ComposeTest(unittest.TestCase):
     def test_only_the_first_equals_sign_splits_switch_from_value(self):
         composed = flags.compose(self.layer("--host-resolver-rules=MAP a b=1.2.3.4"))
         self.assertEqual(flags.render(composed.flags), ("--host-resolver-rules=MAP a b=1.2.3.4",))
+
+    def test_a_layer_may_not_both_set_and_drop_one_switch(self):
+        """The constructor is what makes `Layer`'s disjointness true, not the care of the
+        one parser that happens to build them — a test or a future caller reaching the type
+        directly would otherwise construct the state the docstring says cannot exist."""
+        with self.assertRaisesRegex(CromError, "both sets and drops --headless"):
+            Layer(sets=(Flag("--headless", "new"),), drops=frozenset({"--headless"}))
 
     def test_a_later_layer_removes_a_switch_it_drops(self):
         composed = flags.compose(self.layer("--a=1", "--b"), self.layer(drops=("--a",)))

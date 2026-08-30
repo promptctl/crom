@@ -69,9 +69,13 @@ _REPLACED_NOT_MERGED = (
     "a flag naming it would replace that composition rather than join it, which is the "
     "exact defect `features` exists to fix"
 )
-_DISCARDS_EVERY_LAYER = (
-    "dropping it would discard every layer's features at once, crom's own included, "
-    "rather than the one you mean"
+# Says only what is true. It first claimed a drop "would discard every layer's features at
+# once" — an effect that cannot occur: the features layer is composed last, a layer's drops
+# reach only what earlier layers left behind, so the drop would be a silent no-op. A
+# refusal message whose whole job is explaining a mistake is the last place to make one.
+# [FRAMING:representation]
+_NO_LAYER_SUPPLIES_IT = (
+    "no layer supplies it for a drop to remove, so dropping it would quietly do nothing"
 )
 
 
@@ -122,7 +126,7 @@ RESERVED_SWITCHES: dict[str, Reserved] = {
     **{
         switch: Reserved(
             setting=_owned_by_features(state=state, consequence=_REPLACED_NOT_MERGED),
-            dropping=_owned_by_features(state=not state, consequence=_DISCARDS_EVERY_LAYER),
+            dropping=_owned_by_features(state=not state, consequence=_NO_LAYER_SUPPLIES_IT),
         )
         for state, switch in flags.FEATURE_SWITCHES.items()
     },
@@ -205,15 +209,15 @@ def parse_layer(raw_flags, raw_drops, where: str, source: Path) -> Layer:
 
     sets = flags.layer(raw_flags, f"{source}: {where}.flags")
     drops = flags.drops(raw_drops, f"{source}: {where}.drop_flags")
-    both = sorted(drops & {flag.switch for flag in sets})
-    if both:
-        raise CromError(
-            f"{source}: {where} both sets and drops {', '.join(both)}.\n"
-            f"A drop removes a switch this stanza inherits, and setting it here already "
-            f"replaces whatever was inherited — so one of the two cannot mean anything. "
-            f"Keep the flag to override the switch, or the drop to remove it."
-        )
-    return Layer(sets=sets, drops=drops)
+    try:
+        return Layer(sets=sets, drops=drops)
+    except CromError as fault:
+        # `Layer` owns the rule; this owns the location. Re-raised with strictly more
+        # information than it caught, never less — the alternative was a second copy of
+        # the check here, written only to reach the file and stanza names, and a rule
+        # spelled in two places is one that eventually disagrees with itself.
+        # [LAW:one-source-of-truth]
+        raise CromError(f"{source}: {where} {fault}") from fault
 
 
 def _reject_reserved(

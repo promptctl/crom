@@ -187,13 +187,31 @@ class Layer:
     lands in argv. `drops` is a set because a drop names a switch and says nothing else
     about it, so neither order nor multiplicity could carry meaning.
 
-    The two are disjoint: `config.parse_layer` refuses a stanza that both sets and drops
-    one switch, so nothing downstream has to decide which of them wins.
-    [LAW:parse-dont-validate]
+    The two are disjoint, and this constructor is what makes that true rather than
+    `config.parse_layer` being careful: a layer that both sets and drops one switch has
+    said two things where only one can mean anything, and refusing it here means nothing
+    downstream has to decide which wins. Enforced in `__post_init__` for the reason
+    `ProfileSpec` gives above — a convention every future call site must rediscover
+    becomes a property of the type. [LAW:types-are-the-program]
+
+    The rule is stated once, here. `parse_layer` catches this and prepends the file and
+    stanza it was reading, because the location is what *it* knows and the rule is what
+    *this* knows; a second copy of the check upstream, written to produce a better
+    message, is the copy that would drift. [LAW:single-enforcer]
     """
 
     sets: tuple[Flag, ...] = ()
     drops: frozenset[str] = frozenset()
+
+    def __post_init__(self) -> None:
+        both = sorted(self.drops & {flag.switch for flag in self.sets})
+        if both:
+            raise CromError(
+                f"both sets and drops {', '.join(both)}.\n"
+                f"A drop removes a switch this stanza inherits, and setting it here "
+                f"already replaces whatever was inherited — so one of the two cannot mean "
+                f"anything. Keep the flag to override the switch, or the drop to remove it."
+            )
 
 
 @dataclass(frozen=True)
