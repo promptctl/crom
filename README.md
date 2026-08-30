@@ -194,6 +194,28 @@ A crom command names an end state and converges to it, so crom never tells you t
 different crom command first. If the only thing between a command and its job is another
 crom command, crom runs it and says so.
 
+Asking for a state you are already in is the simplest case of that. `crom init` in a
+project that already has a `.crom.toml` reports the namespace and seed that file
+declares and exits 0 without touching it; `crom add ci` for an already-declared `ci`
+reports the seed, port, and directory `ci` resolves to and exits 0 the same way.
+`crom up` on a running browser and `crom down` on a stopped one always behaved like
+this, and now every command does.
+
+But converging is not ignoring. crom compares the facts you actually state — so a bare
+`crom add ci` states only the name and always converges — and any stated fact that
+differs from the file is an error naming the difference: `crom add ci --port 9500`
+against a `ci` pinned to 9224 stops with `port: declared 9224, you asked for 9500`, and
+`crom init other` in a project whose namespace is `proj` stops the same way. Neither
+touches the file. The comparison is on what the config effectively means, not on which
+key it happens to spell things in, so `crom add ci --seed fresh` is fine when `ci`
+inherits `fresh` from `[defaults]`. `--port` is the one exception: an assigned port is
+remembered in the machine-local ledger and written nowhere in the file, so pinning the
+number crom happened to hand out is a real change to a checkout on any other machine,
+and crom asks you to make it yourself. Exiting 0 having quietly dropped your `--port 9500`
+would be crom claiming work it did not do and you finding out at launch. crom does not
+rewrite a config it did not just create: edit the file, or `crom rm <ref>` and add the
+profile back.
+
 A profile you refer to but never declared gets declared, exactly as `crom add <name>`
 with no options would declare it — a bare stanza, so `[defaults]` still governs its seed.
 That covers `crom up`, `crom port`, `crom env`, `crom mcp`, and `crom config <ref>`, and
