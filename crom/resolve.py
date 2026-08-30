@@ -302,10 +302,12 @@ def resolve_spec(scope: Scope, spec: ProfileSpec) -> ResolvedProfile:
     # and reporting it only for the profiles that don't override it would make the
     # diagnostic depend on which stanza you were resolving. [LAW:no-silent-failure]
     #
-    # Drops are absent because they carry no text that could interpolate: an entry is a
-    # switch name, and a switch is the text before the first `=` — the half of a flag a
-    # variable never lives in. Composition matches drops against unexpanded switches for
-    # the same reason it can: both sides are the spelling the file used.
+    # Drops are absent for the same reason features are, and not the one first written
+    # here: it is not that a switch name is the half a variable never lives in — this check
+    # covers the switch half of a `flags` entry, since `render` yields the whole string. It
+    # is that `flags.drops` refuses a `${` in a drop outright, so a drop carries no variable
+    # to be unknown, and a typo that would silently match nothing is caught where it was
+    # written instead. [LAW:parse-dont-validate]
     #
     # Features are absent from this check because they cannot fail it: `parse_features`
     # refuses a `${` in a feature name outright, so a feature carries no variable to be

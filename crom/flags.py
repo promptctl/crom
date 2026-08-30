@@ -20,6 +20,8 @@ type that makes two layers' answers to one question visible as such.
 [LAW:types-are-the-program]
 """
 
+from collections.abc import Callable
+
 from .model import Composed, CromError, Flag, Layer
 
 
@@ -54,6 +56,25 @@ def layer(texts: list[str] | tuple[str, ...], where: str) -> tuple[Flag, ...]:
     return tuple(seen.values())
 
 
+# What a drop entry may not be, and how to say so. Every one of these is an entry that
+# could never match a switch any layer supplies, so it would drop nothing and say nothing
+# — a config stating a removal crom does not perform, with no diagnostic anywhere.
+# [LAW:no-silent-failure] A switch name that is merely wrong (`--disbale-sync`) is
+# indistinguishable from one deliberately naming a switch no layer happens to set, which
+# is allowed; these are the shapes that are wrong on their face.
+_ILLEGAL_DROPS: tuple[tuple[Callable[[str], bool], str], ...] = (
+    (lambda text: not text.strip(), "is empty"),
+    (
+        lambda text: text != text.strip(),
+        "has leading or trailing whitespace, which no switch carries",
+    ),
+    (
+        lambda text: "${" in text,
+        "interpolates a variable, and a switch name here is a literal",
+    ),
+)
+
+
 def drops(texts: list[str] | tuple[str, ...], where: str) -> frozenset[str]:
     """Parse one stanza's `drop_flags` list — switch names, each removing what it inherits.
 
@@ -66,6 +87,12 @@ def drops(texts: list[str] | tuple[str, ...], where: str) -> frozenset[str]:
     removes the switch whatever value it inherited, so `--disable-sync=false` is a value
     that could not be honoured — silently ignoring it would let a config say something
     crom does not do. [LAW:no-silent-failure]
+
+    A name is literal, and `${VAR}` is refused rather than expanded — the same rule
+    `parse_features` applies to a feature name, for the same reason. crom never expands a
+    drop: composition matches it against the switch half of a flag, which is the spelling
+    the file used on both sides. So a variable written here could only ever fail to match,
+    and the removal the config states would silently not happen.
 
     Repetition is refused for the reason `layer` refuses it: dropping a switch once
     removes it, so the second entry does nothing, and a list that answers a question
@@ -80,6 +107,14 @@ def drops(texts: list[str] | tuple[str, ...], where: str) -> frozenset[str]:
                 f"A drop removes the switch whatever value it inherited, so the whole "
                 f"entry is {flag.switch!r}."
             )
+        for is_illegal, fault in _ILLEGAL_DROPS:
+            if is_illegal(text):
+                raise CromError(
+                    f"{where}: the entry {text!r} {fault}.\n"
+                    f"crom matches each entry against the switches the layers below "
+                    f"supply, exactly as written — so it has to be the literal switch "
+                    f"name, e.g. --disable-sync."
+                )
         if flag.switch in seen:
             raise CromError(
                 f"{where}: {flag.switch} is named twice. Dropping a switch once removes "

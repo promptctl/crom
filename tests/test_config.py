@@ -138,6 +138,18 @@ class ProfileTest(unittest.TestCase):
                 + '[profiles.dev]\nflags = ["--headless=new"]\ndrop_flags = ["--headless"]\n'
             )
 
+    def test_a_drop_entry_that_could_never_match_a_switch_is_refused(self):
+        """Each of these would drop nothing and say nothing — a config stating a removal
+        crom does not perform. A merely misspelled switch cannot be told from one naming a
+        switch no layer happens to set, which is allowed; these are wrong on their face."""
+        for entry, fault in (
+            ('""', "is empty"),
+            ('" --no-pings"', "whitespace"),
+            ('"--${CROM_PROFILE}"', "interpolates a variable"),
+        ):
+            with self.subTest(entry=entry), self.assertRaisesRegex(CromError, fault):
+                parse(MINIMAL + f"[profiles.dev]\ndrop_flags = [{entry}]\n")
+
     def test_the_switches_crom_owns_are_refused_in_drop_flags_too(self):
         """Reserved is a fact about the switch, not about which list named it: a config
         that could drop `--user-data-dir` would leave crom unable to name the profile."""
