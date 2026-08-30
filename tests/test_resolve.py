@@ -127,6 +127,18 @@ class ComposeTest(unittest.TestCase):
         )
         self.assertEqual(flags.render(composed.flags), ("--a=2",))
 
+    def test_a_switch_set_again_after_a_drop_lands_with_the_layer_that_supplies_it(self):
+        """A drop takes the switch's place in the list with it, so the layer that sets it
+        afterwards is introducing it rather than restoring it. Every other switch keeps
+        its slot — the stability the ordering rule exists for is about the list, not about
+        a switch whose removal the config asked for."""
+        composed = flags.compose(
+            self.layer("--policy=1", "--kept"),
+            self.layer(drops=("--policy",)),
+            self.layer("--policy=2"),
+        )
+        self.assertEqual(flags.render(composed.flags), ("--kept", "--policy=2"))
+
     def test_dropping_a_switch_no_layer_supplies_changes_nothing(self):
         composed = flags.compose(self.layer("--a"), self.layer(drops=("--b",)))
         self.assertEqual(flags.render(composed.flags), ("--a",))

@@ -198,6 +198,16 @@ def compose(*layers: Layer) -> Composed:
     crom's policy flags where a reader of `crom config` expects them, rather than
     shuffling the whole list because a profile overrode one early switch.
 
+    A drop removes the switch *and its place in the list*, which is what
+    position-of-first-introduction means once removal is expressible: nothing survives a
+    drop to hold a position, so a lower layer setting the switch again is introducing it,
+    not restoring it, and it lands where that layer's flags land. The guarantee above is
+    unharmed — every *other* switch keeps its slot, and the one that moves has moved to
+    the layer that actually supplies it, which is where a reader of `crom config` should
+    find it. Remembering the old index instead would print the switch inside crom's policy
+    block while a profile is the thing supplying it, and would keep a second record of
+    order alive after the thing it ordered was deleted. [LAW:one-source-of-truth]
+
     A layer's drops apply to what it *inherits*, so they run before its own sets — which
     is the only reading under which dropping a switch and then setting it in the layer
     below could differ from setting it alone, and `config.parse_layer` refuses a stanza
