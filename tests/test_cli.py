@@ -393,6 +393,35 @@ class CliTest(unittest.TestCase):
 
         self.assertIn("Already declared", self.crom("add", "ci", "--seed", "fresh"))
 
+    def test_adding_a_profile_again_with_a_flag_it_already_inherits_is_the_same_request(self):
+        """Flags are judged on effective values, exactly as the seed is.
+
+        A flag reaching the profile from `[defaults]` reaches it on every machine that
+        checks the file out, so a profile already running `--headless` *is* the profile
+        `--flag --headless` asked for. Concatenating the stated flag onto the defaults
+        compared `--headless` against `--headless --headless` and exited 4 — refusing over
+        a difference the comparison had invented, and reporting the doubled list back as
+        what the user had asked for.
+        """
+        self.crom("init")
+        config_path = self.project / ".crom.toml"
+        config_path.write_text(config_path.read_text().replace("flags = []", 'flags = ["--headless"]', 1))
+        self.crom("add", "ci")
+
+        output = self.crom("add", "ci", "--flag", "--headless")
+
+        self.assertIn("Already declared myproj/ci", output)
+
+    def test_adding_a_profile_again_with_its_flags_reordered_is_the_same_request(self):
+        """Order is not a fact about the profile, so restating the same flags in another
+        order is not a change to it."""
+        self.crom("init")
+        self.crom("add", "ci", "--flag", "--headless", "--flag", "--no-sandbox")
+
+        output = self.crom("add", "ci", "--flag", "--no-sandbox", "--flag", "--headless")
+
+        self.assertIn("Already declared myproj/ci", output)
+
     def test_adding_a_profile_again_with_different_flags_is_refused(self):
         self.crom("init")
         self.crom("add", "ci")

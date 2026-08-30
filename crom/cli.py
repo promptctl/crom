@@ -502,10 +502,24 @@ def add_cmd(session: _Session, name: str, seed_text: str | None, flags: tuple[st
             ),
             # An empty tuple is the only way `--flag` can go unmentioned, so emptiness is
             # statedness here — unlike `seed` and `port`, which have a real `None`.
+            #
+            # Effective, and as a set, for the reason the seed fact is effective: a flag
+            # reaching the profile from `[defaults]` reaches it on every machine that
+            # checks the file out, so a profile already running `--headless` *is* the
+            # profile `--flag --headless` asked for. Concatenating the stated flags onto
+            # the defaults instead compared `--headless` against `--headless --headless`
+            # and refused — naming a difference that was an artifact of the comparison
+            # rather than a fact about the project, and printing the doubled list back at
+            # the user as what they had asked for. A set because order and repetition are
+            # not facts about the profile either: the same flags typed in another order
+            # are the same request, and refusing over that is the spurious refusal this
+            # command exists to stop making. [LAW:one-source-of-truth] `[defaults]`
+            # inheritance decides both sides here exactly as `resolve_spec` decides it for
+            # the seed.
             (
                 "flags",
-                " ".join((*scope.default_flags, *declared.flags)),
-                " ".join((*scope.default_flags, *spec.flags)) if spec.flags else None,
+                " ".join(sorted({*scope.default_flags, *declared.flags})),
+                " ".join(sorted({*scope.default_flags, *spec.flags})) if spec.flags else None,
             ),
         ),
         f"Edit {target} directly, or `crom rm {profile.ref}` and add it again.",
