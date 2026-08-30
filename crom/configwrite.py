@@ -386,6 +386,7 @@ def _stanza(spec: ProfileSpec, base: Path) -> tomlkit.items.Table:
     stated = {
         "seed": None if spec.seed is None else render_seed(spec.seed, base),
         "flags": list(flags.render(spec.flags)),
+        "features": dict(spec.features) or None,
         "port": spec.port,
         "env": dict(spec.env) or None,
     }

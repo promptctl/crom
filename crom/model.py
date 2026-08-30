@@ -220,6 +220,11 @@ class ProfileSpec:
     # what lets `flags.compose` see that this profile's `--disable-features` and
     # `[defaults]`'s are two answers to one question. [LAW:parse-dont-validate]
     flags: tuple[Flag, ...] = ()
+    # Which Chrome features this stanza turns on or off. A table rather than two lists,
+    # because a feature is in one of three states — on, off, or unmentioned — and two
+    # lists would let one name appear in both. `flags.features` folds this across layers
+    # and renders it; an absent name is unmentioned and reaches neither switch.
+    features: dict[str, bool] = field(default_factory=dict)
     env: dict[str, str] = field(default_factory=dict)
     seed: Seed | None = None
     port: int | None = None
@@ -256,6 +261,7 @@ class Scope:
     profiles_root: Path
     chrome_binary: Path
     default_flags: tuple[Flag, ...] = ()
+    default_features: dict[str, bool] = field(default_factory=dict)
     default_env: dict[str, str] = field(default_factory=dict)
     # `DEFAULT_SEED`, not a literal — this dataclass default is the sixth answer to the
     # question that constant exists to answer, and it sat 80 lines below the comment

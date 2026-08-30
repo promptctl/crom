@@ -86,9 +86,9 @@ class ComposeTest(unittest.TestCase):
 
     def test_a_later_layer_replaces_an_earlier_layers_value_for_the_same_switch(self):
         composed = flags.compose(
-            self.flags("--disable-features=A"), self.flags("--disable-features=B")
+            self.flags("--disable-blink-features=A"), self.flags("--disable-blink-features=B")
         )
-        self.assertEqual(flags.render(composed), ("--disable-features=B",))
+        self.assertEqual(flags.render(composed), ("--disable-blink-features=B",))
 
     def test_a_switch_only_one_layer_names_survives_untouched(self):
         composed = flags.compose(self.flags("--a"), self.flags("--b=1"))
@@ -107,6 +107,39 @@ class ComposeTest(unittest.TestCase):
     def test_only_the_first_equals_sign_splits_switch_from_value(self):
         composed = flags.compose(self.flags("--host-resolver-rules=MAP a b=1.2.3.4"))
         self.assertEqual(flags.render(composed), ("--host-resolver-rules=MAP a b=1.2.3.4",))
+
+
+class FeaturesTest(unittest.TestCase):
+    """Folding feature tables into the at-most-two switches that carry them."""
+
+    def test_a_feature_reaches_the_switch_its_state_selects(self):
+        rendered = flags.render(flags.features({"On": True, "Off": False}))
+        self.assertEqual(rendered, ("--enable-features=On", "--disable-features=Off"))
+
+    def test_an_unmentioned_feature_reaches_neither_switch(self):
+        """Three states, and the third is silence. A feature no layer names must not be
+        turned on *or* off — which is why this is a table and not two lists."""
+        self.assertEqual(flags.render(flags.features({})), ())
+        self.assertEqual(flags.render(flags.features({"Off": False})), ("--disable-features=Off",))
+
+    def test_names_in_one_state_are_comma_joined_into_one_switch(self):
+        rendered = flags.render(flags.features({"A": False, "B": False}))
+        self.assertEqual(rendered, ("--disable-features=A,B",))
+
+    def test_a_later_layer_moves_a_feature_rather_than_adding_a_second_answer(self):
+        """The reason a table beats two lists: flipping a feature *removes* it from the
+        switch it was in. Two lists would leave the name in both, and Chrome resolves that
+        pair by disabling — so the later layer would silently lose."""
+        rendered = flags.render(flags.features({"X": False}, {"X": True}))
+        self.assertEqual(rendered, ("--enable-features=X",))
+
+    def test_layers_fold_later_wins_leaving_untouched_features_alone(self):
+        rendered = flags.render(
+            flags.features({"Kept": False}, {"Flipped": False}, {"Flipped": True})
+        )
+        self.assertEqual(
+            rendered, ("--enable-features=Flipped", "--disable-features=Kept")
+        )
 
 
 class LedgerFixture(unittest.TestCase):
@@ -183,18 +216,22 @@ class ResolveTest(LedgerFixture):
         self.assertTrue(str(profile.profile_dir).startswith(str(self.root / ".crom" / "profiles")))
 
     def test_a_profile_flag_replaces_the_defaults_entry_for_the_same_switch(self):
-        """The defect this composition exists for: two `--disable-features` switches
-        reached Chrome, which silently discards all but the last — so a project setting
-        the switch for its own reasons deleted whatever `[defaults]` had set."""
+        """The defect this composition exists for: two occurrences of one switch reached
+        Chrome, which resolves the pair by its own per-switch rules — so a project setting
+        a switch for its own reasons silently changed whatever `[defaults]` had set.
+
+        `--disable-blink-features` rather than `--disable-features`: the latter is now
+        crom's to compose from `features` tables and a `flags` list may not name it, so it
+        can no longer stand as the example of a switch two layers both answer."""
         scope = self.scope(
             MINIMAL
-            + '[defaults]\nflags = ["--disable-features=FromDefaults"]\n'
-            + '[profiles.dev]\nflags = ["--disable-features=FromProfile"]\n'
+            + '[defaults]\nflags = ["--disable-blink-features=FromDefaults"]\n'
+            + '[profiles.dev]\nflags = ["--disable-blink-features=FromProfile"]\n'
         )
         argv = resolve.resolve(ProfileRef("myapp", "dev"), scope).argv
         self.assertEqual(
-            [a for a in argv if a.startswith("--disable-features=")],
-            ["--disable-features=FromProfile"],
+            [a for a in argv if a.startswith("--disable-blink-features=")],
+            ["--disable-blink-features=FromProfile"],
         )
 
     def test_a_profile_flag_replaces_the_launch_policys_entry_for_the_same_switch(self):
@@ -206,12 +243,58 @@ class ResolveTest(LedgerFixture):
     def test_every_switch_reaches_chrome_exactly_once(self):
         scope = self.scope(
             MINIMAL
-            + '[defaults]\nflags = ["--disable-features=A", "--window-size=800,600"]\n'
-            + '[profiles.dev]\nflags = ["--disable-features=B", "--no-pings"]\n'
+            + '[defaults]\nflags = ["--disable-blink-features=A", "--window-size=800,600"]\n'
+            + '[profiles.dev]\nflags = ["--disable-blink-features=B", "--no-pings"]\n'
         )
         argv = resolve.resolve(ProfileRef("myapp", "dev"), scope).argv[1:]
         switches = [a.split("=", 1)[0] for a in argv]
         self.assertEqual(sorted(switches), sorted(set(switches)))
+
+    def test_a_profiles_feature_joins_croms_own_rather_than_replacing_it(self):
+        """The defect the `features` table exists for. A config that wanted one feature off
+        used to write `--disable-features=SharedStorageAPI`, which replaced crom's whole
+        entry for that switch — deleting the What's New suppression with nothing to show
+        for it. Composed as a table, both names ride the one switch Chrome reads."""
+        scope = self.scope(
+            MINIMAL + '[profiles.dev]\n[profiles.dev.features]\nSharedStorageAPI = false\n'
+        )
+        argv = resolve.resolve(ProfileRef("myapp", "dev"), scope).argv
+
+        disabled = [a for a in argv if a.startswith("--disable-features=")]
+        self.assertEqual(len(disabled), 1)
+        self.assertCountEqual(
+            disabled[0].removeprefix("--disable-features=").split(","),
+            ["ChromeWhatsNewUI", "SharedStorageAPI"],
+        )
+
+    def test_a_profile_can_turn_a_policy_feature_back_on(self):
+        """Turning it on is implemented by *removing* the name from the disable list, which
+        is the only thing that could work: an added `--enable-features` loses to a
+        `--disable-features` naming the same feature, in either order."""
+        scope = self.scope(
+            MINIMAL + '[profiles.dev]\n[profiles.dev.features]\nChromeWhatsNewUI = true\n'
+        )
+        argv = resolve.resolve(ProfileRef("myapp", "dev"), scope).argv
+
+        disabled = [a for a in argv if a.startswith("--disable-features=")]
+        self.assertEqual(disabled, [])
+        self.assertIn("--enable-features=ChromeWhatsNewUI", argv)
+
+    def test_a_profile_feature_overrides_the_defaults_table(self):
+        scope = self.scope(
+            MINIMAL
+            + "[defaults.features]\nShared = false\nKept = false\n"
+            + "[profiles.dev]\n[profiles.dev.features]\nShared = true\n"
+        )
+        argv = resolve.resolve(ProfileRef("myapp", "dev"), scope).argv
+
+        self.assertIn("--enable-features=Shared", argv)
+        disabled = [a for a in argv if a.startswith("--disable-features=")]
+        self.assertEqual(len(disabled), 1)
+        self.assertCountEqual(
+            disabled[0].removeprefix("--disable-features=").split(","),
+            ["ChromeWhatsNewUI", "Kept"],
+        )
 
     def test_variables_expand_in_flags(self):
         scope = self.scope(

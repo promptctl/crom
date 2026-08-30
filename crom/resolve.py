@@ -24,7 +24,7 @@ from .model import (
     Seed,
 )
 from .paths import user_config_file
-from .policy import LAUNCH_POLICY_FLAGS
+from .policy import LAUNCH_POLICY_FEATURES, LAUNCH_POLICY_FLAGS
 
 # The closed vocabulary a config may interpolate into flags and env values. Closed on
 # purpose: an unknown ${...} is an error, never an empty string silently spliced into a
@@ -269,7 +269,18 @@ def resolve_spec(scope: Scope, spec: ProfileSpec) -> ResolvedProfile:
     # rather than three: it asks what this *config* states, and crom's launch policy is
     # not in the config. Deliberately different layer sets, not a drift — see
     # `cli._effective_flags`, which owns that reasoning.
-    composed = flags.compose(LAUNCH_POLICY_FLAGS, scope.default_flags, spec.flags)
+    #
+    # The features layer is composed last, and its position carries no conflict to
+    # resolve: `config.RESERVED_SWITCHES` refuses `--enable-features` and
+    # `--disable-features` inside any `flags` list, so those two switches can reach
+    # `compose` from nowhere else and land wherever this layer is placed. Last is simply
+    # where a reader of `crom config` finds them.
+    composed = flags.compose(
+        LAUNCH_POLICY_FLAGS,
+        scope.default_flags,
+        spec.flags,
+        flags.features(LAUNCH_POLICY_FEATURES, scope.default_features, spec.features),
+    )
     raw_env = {**scope.default_env, **spec.env}
 
     # [LAW:effects-at-boundaries] Every way this resolution can fail runs first, while
@@ -281,8 +292,20 @@ def resolve_spec(scope: Scope, spec: ProfileSpec) -> ResolvedProfile:
     # typo in a `[defaults]` flag that this profile happens to override is still a typo,
     # and reporting it only for the profiles that don't override it would make the
     # diagnostic depend on which stanza you were resolving. [LAW:no-silent-failure]
+    #
+    # The features layers are rendered one at a time for that same reason, and included at
+    # all because `_expand` runs over the *composed* list — feature names reach it like any
+    # other flag text, so a `${TYPO}` in one is a failure this checkpoint owns. Left out,
+    # it would raise below instead, after `port_for` had already reserved a port for a
+    # profile that never resolves.
     _reject_unknown_variables(
-        (*flags.render(scope.default_flags), *flags.render(spec.flags), *raw_env.values()),
+        (
+            *flags.render(scope.default_flags),
+            *flags.render(spec.flags),
+            *flags.render(flags.features(scope.default_features)),
+            *flags.render(flags.features(spec.features)),
+            *raw_env.values(),
+        ),
         _variables(ref, profile_dir, scope.config_dir, None),
         where,
     )
