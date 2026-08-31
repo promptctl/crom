@@ -291,9 +291,12 @@ def resolve_spec(scope: Scope, spec: ProfileSpec) -> ResolvedProfile:
     # one `--disable-features` carries names from every layer at once. See `flags.features`.
     #
     # The three feature tables are named with the same strings their stanzas' `flags` are
-    # named with, because they are the same stanzas. `default_flags.origin` is not read for
-    # them: a `[defaults]` that sets features and no flags has an empty layer, and one
-    # stanza would then appear under two names in one listing. [LAW:one-source-of-truth]
+    # named with, because they are the same stanzas. Read from the shared constants rather
+    # than from `default_flags.origin` and `spec.flags.origin`, which do carry the right
+    # strings: a stanza's name belongs to the stanza, not to whichever of its keys happened
+    # to be parsed, and taking the `features` label out of the `flags` layer would make one
+    # half of a stanza depend on a sibling half for no reason but that it is holding the
+    # string. [LAW:one-source-of-truth] the name has one home, and both keys read it there.
     composed = flags.compose(
         Layer(LAUNCH_POLICY_FLAGS, origin=LAUNCH_POLICY_ORIGIN),
         scope.default_flags,

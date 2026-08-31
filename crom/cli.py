@@ -406,7 +406,7 @@ def _resolution(answered: Resolution, *, named: bool) -> str:
     # replaced flag reads "over --window-size=800,600 from [defaults]" and a replaced
     # feature reads "over false from [defaults]". Layer-first put a bare `false` against a
     # layer name and left the reader to guess which word was the value.
-    over = "".join(f", over {answer.value} from {answer.layer}" for answer in answered.replaced)
+    over = "".join(f", over {answer.said} from {answer.layer}" for answer in answered.replaced)
     return f"{answered.question + ' ' if named else ''}from {answered.stands.layer}{over}"
 
 
@@ -952,7 +952,7 @@ def config_cmd(session: _Session, ref: str | None, as_json: bool):
                 # this one being a reduced version of them. A switch set once and then
                 # dropped has no other channel carrying the value that was lost: the flag
                 # is absent from argv, which is the whole reason this line exists.
-                f"  (dropped {removal.what.stands.value}, "
+                f"  (dropped {removal.what.stands.said}, "
                 f"{_resolution(removal.what, named=False)} — removed by {removal.by})"
                 for removal in profile.provenance.dropped
             ),

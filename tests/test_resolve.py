@@ -199,7 +199,7 @@ class ComposeTest(unittest.TestCase):
         )
         (answered,) = composed.emitted[0].why
         self.assertEqual(answered.question, "--a")
-        self.assertEqual((answered.stands.layer, answered.stands.value), ("profile", "--a=2"))
+        self.assertEqual((answered.stands.layer, answered.stands.said), ("profile", "--a=2"))
 
     def test_every_layer_a_switch_outranked_is_kept_in_the_order_they_spoke(self):
         """A reader hunting for a flag they wrote needs their own layer named, not just
@@ -211,7 +211,7 @@ class ComposeTest(unittest.TestCase):
         )
         (answered,) = composed.emitted[0].why
         self.assertEqual(
-            [(a.layer, a.value) for a in answered.replaced],
+            [(a.layer, a.said) for a in answered.replaced],
             [("policy", "--a=1"), ("defaults", "--a=2")],
         )
 
@@ -282,8 +282,8 @@ class FeaturesTest(unittest.TestCase):
         (emitted,) = flags.features(("policy", {"X": False}), ("profile", {"X": True}))
         (answered,) = emitted.why
         self.assertEqual(str(emitted.flag), "--enable-features=X")
-        self.assertEqual((answered.stands.layer, answered.stands.value), ("profile", "true"))
-        self.assertEqual([(a.layer, a.value) for a in answered.replaced], [("policy", "false")])
+        self.assertEqual((answered.stands.layer, answered.stands.said), ("profile", "true"))
+        self.assertEqual([(a.layer, a.said) for a in answered.replaced], [("policy", "false")])
 
 
 class LedgerFixture(unittest.TestCase):

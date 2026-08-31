@@ -358,7 +358,7 @@ def compose(*layers: Layer) -> Composed:
     # happened.
     return Composed(
         tuple(
-            Emitted(Flag.parse(answers[-1].value), (Resolution(switch, answers),))
+            Emitted(Flag.parse(answers[-1].said), (Resolution(switch, answers),))
             for switch, answers in resolved.items()
         ),
         tuple(record for switch, record in dropped.items() if switch not in resolved),

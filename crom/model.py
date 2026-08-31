@@ -258,14 +258,25 @@ def profile_stanza(name: str) -> str:
 class Answer:
     """What one layer said about one question, in the spelling its stanza used.
 
-    `value` is a rendered string rather than a `Flag` or a bool because the two producers
-    answer differently shaped questions — a whole flag, or a feature's `true`/`false` —
-    and the shape is known only where the answer is made. Rendering it there keeps one
-    report type for both instead of a union the renderer would have to take apart.
+    `said`, not `value`: this is what a layer *stated*, which is a different fact from what
+    Chrome is given. They part company whenever a flag's value interpolates — the stanza
+    said `--load-extension=${CROM_CONFIG_DIR}/ext` and Chrome gets an absolute path — and a
+    field called `value` invited a reader to treat the two as one. The stated spelling is
+    the useful one here: this text is printed so a user can find the flag they wrote, and
+    for a dropped flag it is the *only* honest text, since nothing was launched for an
+    expansion to describe.
+
+    A rendered string rather than a `Flag` or a bool because the two producers answer
+    differently shaped questions — a whole flag, or a feature's `true`/`false` — and the
+    shape is known only where the answer is made. Rendering it there keeps one report type
+    for both instead of a union the renderer would have to take apart.
     """
 
     layer: str
-    value: str
+    said: str
+
+    def describe(self) -> dict:
+        return {"layer": self.layer, "said": self.said}
 
 
 @dataclass(frozen=True)
@@ -302,20 +313,24 @@ class Resolution:
         return self.answers[:-1]
 
     def describe(self) -> dict:
-        """The whole resolution, including the answer that stands.
+        """The whole resolution — every answer, and which one stands.
 
-        `value` is redundant for an emitted plain flag, whose flag *is* the standing
-        answer, and that is the point: it used to be omitted on the strength of a sibling
-        channel carrying it, which is true of `Emitted` and false of `Removed` — so a
-        switch set once and then dropped reported neither the value that was lost nor
-        anywhere to find it. A rendering that is complete only when read from one of its
-        two directions is a map that is true in one direction. [FRAMING:representation]
+        The standing answer is carried rather than left to a sibling channel. `Emitted` has
+        such a channel (its flag) and `Removed` has none, so omitting it reported a dropped
+        switch with no trace of what was lost. A rendering complete only when read from one
+        of its two directions is a map true in one direction. [FRAMING:representation]
+
+        `stands` and `over` render through the same `Answer.describe()`, so an answer looks
+        the same wherever it appears. Flattening the standing one into sibling keys made it
+        the one answer with a bespoke shape, and named its text `value` — which invited the
+        reading that it must equal the emitted flag. It does not: `Emitted.flag` is what
+        Chrome is given and `stands.said` is what the layer stated, and the two differ
+        exactly when the value interpolates a variable. [LAW:one-type-per-behavior]
         """
         return {
             "question": self.question,
-            "value": self.stands.value,
-            "from": self.stands.layer,
-            "over": [{"layer": a.layer, "value": a.value} for a in self.replaced],
+            "stands": self.stands.describe(),
+            "over": [answer.describe() for answer in self.replaced],
         }
 
 
