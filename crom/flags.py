@@ -25,6 +25,25 @@ from collections.abc import Callable
 from .model import Answer, Composed, CromError, Emitted, Flag, Layer, Removed, Resolution
 
 
+# A switch name may not interpolate a variable, in either list that can hold one — this is
+# the predicate and the phrase, written once because it is one rule. [LAW:single-enforcer]
+# Both lists match a switch by the spelling the file used and `resolve._expand` runs
+# afterwards, so a variable in a switch name can only ever fail to match: a drop would
+# silently remove nothing, and a `flags` entry would silently fail to override, leaving crom
+# to emit the same Chrome switch twice. Measured before this rule existed: `[defaults]`
+# holding `--${CROM_PROFILE}-x=1` and `[profiles.dev]` holding `--dev-x=2` reached Chrome as
+# `--dev-x=1 --dev-x=2`. [LAW:no-silent-failure]
+#
+# Only the switch half. `${...}` in a flag's *value* is the supported feature and is
+# untouched — it is expanded after composition has already decided which switch wins, so
+# nothing about it can make two names collide.
+_INTERPOLATED_SWITCH = "interpolates a variable into the switch name"
+
+
+def _interpolates(switch: str) -> bool:
+    return "${" in switch
+
+
 def layer(texts: list[str] | tuple[str, ...], where: str) -> tuple[Flag, ...]:
     """Parse one stanza's flag list, refusing a list that answers a question twice.
 
@@ -44,7 +63,19 @@ def layer(texts: list[str] | tuple[str, ...], where: str) -> tuple[Flag, ...]:
     [LAW:single-enforcer]
     """
     seen: dict[str, Flag] = {}
-    for flag in (Flag.parse(text) for text in texts):
+    for text, flag in ((text, Flag.parse(text)) for text in texts):
+        # Before the duplicate rule, for the reason `_ILLEGAL_DROPS` runs before the value
+        # check: an interpolated switch cannot be meaningfully compared to another switch,
+        # so the duplicate remedy would be advice about a name that is not the name.
+        if _interpolates(flag.switch):
+            raise CromError(
+                f"{where}: {text!r} {_INTERPOLATED_SWITCH}.\n"
+                f"crom resolves each switch by the name the file spells and expands "
+                f"variables only afterwards, so this names a switch no other layer can "
+                f"meet — it would fail to override the same switch written literally, and "
+                f"crom would hand Chrome both. Write the switch name literally; a flag's "
+                f"value still interpolates: --load-extension=${{CROM_CONFIG_DIR}}/ext."
+            )
         first = seen.get(flag.switch)
         if first is not None:
             raise CromError(
@@ -76,10 +107,9 @@ _ILLEGAL_DROPS: tuple[tuple[Callable[[str], bool], str], ...] = (
         lambda switch: switch != switch.strip(),
         "names a switch with leading or trailing whitespace, which no switch carries",
     ),
-    (
-        lambda switch: "${" in switch,
-        "interpolates a variable into the switch name",
-    ),
+    # The same rule `layer` applies to a `flags` entry's switch half, read from the same
+    # predicate so the two lists cannot come to disagree about what a switch name may be.
+    (_interpolates, _INTERPOLATED_SWITCH),
 )
 
 

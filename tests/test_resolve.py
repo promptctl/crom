@@ -494,6 +494,23 @@ class ResolveTest(LedgerFixture):
         profile = resolve.resolve(ProfileRef("myapp", "dev"), scope)
         self.assertIn(f"--load-extension={self.root}/ext", profile.argv)
 
+    def test_a_variable_in_a_switch_name_is_refused_rather_than_emitted_twice(self):
+        """crom resolves a switch by the name the file spells and expands afterwards, so a
+        variable in a switch half names something that can never meet the switch Chrome is
+        given. `--${CROM_PROFILE}-x` in `[defaults]` and `--dev-x` in the profile used to be
+        two switches to crom and one to Chrome, and both reached the command line — the one
+        thing single emission exists to prevent.
+
+        The refusal lands at load rather than at resolve, so the file is refused once for
+        every profile it declares rather than per profile that happens to read it.
+        """
+        with self.assertRaisesRegex(CromError, "interpolates a variable into the switch name"):
+            self.scope(
+                MINIMAL
+                + '[defaults]\nflags = ["--${CROM_PROFILE}-x=1"]\n'
+                + '[profiles.dev]\nflags = ["--dev-x=2"]\n'
+            )
+
     def test_variables_expand_in_env_values(self):
         scope = self.scope(MINIMAL + '[profiles.dev]\nenv = { DEBUG_URL = "${CROM_PORT}" }\n')
         profile = resolve.resolve(ProfileRef("myapp", "dev"), scope)
