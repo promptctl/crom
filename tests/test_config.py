@@ -143,12 +143,35 @@ class ProfileTest(unittest.TestCase):
         crom does not perform. A merely misspelled switch cannot be told from one naming a
         switch no layer happens to set, which is allowed; these are wrong on their face."""
         for entry, fault in (
-            ('""', "is empty"),
+            ('""', "names an empty switch"),
             ('" --no-pings"', "whitespace"),
             ('"--${CROM_PROFILE}"', "interpolates a variable"),
         ):
             with self.subTest(entry=entry), self.assertRaisesRegex(CromError, fault):
                 parse(MINIMAL + f"[profiles.dev]\ndrop_flags = [{entry}]\n")
+
+    def test_a_drop_entry_is_diagnosed_by_the_fault_its_remedy_would_not_cure(self):
+        """An entry can be both ill-shaped and value-carrying, and the value remedy is the
+        switch itself — so the switch is what has to be legal for that remedy to work.
+        Answered the other way round, `"--${FOO}=bar"` was told to write `"--${FOO}"` and
+        `"=foo"` to write `""`, each failing again on the next load. The same rule the
+        reserved check follows: a diagnostic whose remedy does not work is worse than none.
+        """
+        for entry, fault in (
+            ('"--${FOO}=bar"', "interpolates a variable"),
+            ('" --foo=bar"', "whitespace"),
+            ('"=foo"', "names an empty switch"),
+        ):
+            with self.subTest(entry=entry), self.assertRaisesRegex(CromError, fault):
+                parse(MINIMAL + f"[profiles.dev]\ndrop_flags = [{entry}]\n")
+
+    def test_a_well_formed_drop_entry_with_a_value_is_told_to_drop_the_value(self):
+        """The remedy the other test protects: here the switch *is* legal, so naming the
+        value is the useful thing to say, and writing what it suggests loads cleanly."""
+        with self.assertRaisesRegex(CromError, r"(?s)carries a value.*'--disable-sync'"):
+            parse(MINIMAL + '[profiles.dev]\ndrop_flags = ["--disable-sync=false"]\n')
+        scope = parse(MINIMAL + '[profiles.dev]\ndrop_flags = ["--disable-sync"]\n')
+        self.assertEqual(scope.profiles["dev"].flags.drops, frozenset({"--disable-sync"}))
 
     def test_the_switches_crom_owns_are_refused_in_drop_flags_too(self):
         """Reserved is a fact about the switch, not about which list named it: a config

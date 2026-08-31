@@ -56,21 +56,29 @@ def layer(texts: list[str] | tuple[str, ...], where: str) -> tuple[Flag, ...]:
     return tuple(seen.values())
 
 
-# What a drop entry may not be, and how to say so. Every one of these is an entry that
-# could never match a switch any layer supplies, so it would drop nothing and say nothing
-# — a config stating a removal crom does not perform, with no diagnostic anywhere.
-# [LAW:no-silent-failure] A switch name that is merely wrong (`--disbale-sync`) is
+# What the switch a drop entry names may not be, and how to say so. Every one of these
+# could never match a switch any layer supplies, so the entry would drop nothing and say
+# nothing — a config stating a removal crom does not perform, with no diagnostic anywhere.
+# [LAW:no-silent-failure] A name that is merely wrong (`--disbale-sync`) is
 # indistinguishable from one deliberately naming a switch no layer happens to set, which
 # is allowed; these are the shapes that are wrong on their face.
+#
+# Read against `flag.switch`, not the raw text, and answered before the value check —
+# because the value check's remedy *is* the switch, so the switch is what has to be legal
+# for that remedy to work. `"--${FOO}=bar"` told the author to write `"--${FOO}"`, which
+# fails again on the next load; `"=foo"` told them to write `""`. The same rule the
+# reserved check already follows: a diagnostic whose remedy does not work is worse than
+# none. The faults therefore describe the *name*, so the message stays true where name and
+# entry differ — `"=foo"` names an empty switch without being an empty entry.
 _ILLEGAL_DROPS: tuple[tuple[Callable[[str], bool], str], ...] = (
-    (lambda text: not text.strip(), "is empty"),
+    (lambda switch: not switch.strip(), "names an empty switch"),
     (
-        lambda text: text != text.strip(),
-        "has leading or trailing whitespace, which no switch carries",
+        lambda switch: switch != switch.strip(),
+        "names a switch with leading or trailing whitespace, which no switch carries",
     ),
     (
-        lambda text: "${" in text,
-        "interpolates a variable, and a switch name here is a literal",
+        lambda switch: "${" in switch,
+        "interpolates a variable into the switch name",
     ),
 )
 
@@ -101,20 +109,20 @@ def drops(texts: list[str] | tuple[str, ...], where: str) -> frozenset[str]:
     seen: list[str] = []
     for text in texts:
         flag = Flag.parse(text)
-        if flag.value is not None:
-            raise CromError(
-                f"{where}: {text!r} carries a value, and an entry here is a switch name.\n"
-                f"A drop removes the switch whatever value it inherited, so the whole "
-                f"entry is {flag.switch!r}."
-            )
         for is_illegal, fault in _ILLEGAL_DROPS:
-            if is_illegal(text):
+            if is_illegal(flag.switch):
                 raise CromError(
                     f"{where}: the entry {text!r} {fault}.\n"
                     f"crom matches each entry against the switches the layers below "
                     f"supply, exactly as written — so it has to be the literal switch "
                     f"name, e.g. --disable-sync."
                 )
+        if flag.value is not None:
+            raise CromError(
+                f"{where}: {text!r} carries a value, and an entry here is a switch name.\n"
+                f"A drop removes the switch whatever value it inherited, so the whole "
+                f"entry is {flag.switch!r}."
+            )
         if flag.switch in seen:
             raise CromError(
                 f"{where}: {flag.switch} is named twice. Dropping a switch once removes "
