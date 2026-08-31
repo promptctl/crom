@@ -266,7 +266,7 @@ class HeaderInvariantTest(unittest.TestCase):
         the spec removed."""
         configwrite.ensure_profile(
             self.target,
-            ProfileSpec(name="ci", flags=Layer(drops=frozenset({"--disable-sync"}))),
+            ProfileSpec(name="ci", flags=Layer(drops=frozenset({"--disable-sync"}), origin="[profiles.ci]")),
             header='namespace = "myapp"\n',
         )
         scope = config.parse(self.target.read_text(), self.target)

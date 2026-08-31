@@ -78,14 +78,14 @@ file is always the `user` namespace and must not declare one.
 | `namespace` | top level | Required in a project config. Keeps this project's ports and profile directories clear of every other project's. `user` is reserved. |
 | `chrome_binary` | top level | Path to Chrome. Auto-detected per platform when absent. |
 | `state_dir` | top level | Where profile directories go, relative to the config file. Defaults to `~/.local/state/crom/profiles`. Set it to `.crom/profiles` to keep a project's browser data inside the repo (and gitignore it). |
-| `flags` | `[defaults]`, `[profiles.X]` | Extra Chrome switches. Namespace defaults come first, then the profile's own. |
+| `flags` | `[defaults]`, `[profiles.X]` | Extra Chrome switches. A later layer replaces an earlier layer's entry for the same switch, so a profile overrides `[defaults]` and `[defaults]` overrides crom's launch policy. `${VARIABLE}` is expanded in a flag's *value* only, never in its switch name — crom resolves switches by the name the file spells and expands afterwards, so a variable there would name a switch no other layer could match. `crom config` shows which layer each flag came from and what it replaced. |
 | `drop_flags` | `[defaults]`, `[profiles.X]` | Switch names removed from what this stanza inherits, whether it came from `[defaults]` or from crom's own launch policy. `drop_flags = ["--disable-sync"]` in a profile launches that profile with sync available, with no edit to crom. A layer below can set the switch again. Each entry is the literal switch name and nothing else — no value, no `${VARIABLE}`, no surrounding whitespace — because crom matches it against the switches the layers below supply exactly as written. Dropping a switch nothing supplies is fine; naming one twice, naming a switch crom owns, or both setting and dropping the same switch in one stanza is refused. `crom config` prints what was dropped under the command line. |
 | `features` | `[defaults]`, `[profiles.X]` | Chrome features to turn on or off, as `FeatureName = true`/`false`. A name no layer mentions is left alone. crom folds every layer's table into a single `--enable-features` and `--disable-features`, so a feature you turn off joins crom's own rather than replacing them — which is why `flags` may not name those two switches itself. Feature names are literal: unlike `flags` and `env`, they do not interpolate `${VARIABLE}`. |
 | `env` | `[defaults]`, `[profiles.X]` | Environment variables for the Chrome process. |
 | `seed` | `[defaults]`, `[profiles.X]` | Where a new profile's data comes from: `fresh`, `default`, `chrome:<Profile Name>`, or a path to an existing user-data-dir. A profile with no `seed` key inherits `[defaults].seed`, which is `default` unless the config says otherwise. |
 | `port` | `[profiles.X]` | Pin the CDP port. Leave it out and crom assigns a free one and remembers it. |
 
-Flags and env values can interpolate `${CROM_PROFILE_DIR}`, `${CROM_CONFIG_DIR}`,
+Flag values and env values can interpolate `${CROM_PROFILE_DIR}`, `${CROM_CONFIG_DIR}`,
 `${CROM_PORT}`, `${CROM_NAMESPACE}`, and `${CROM_PROFILE}` — so a project can load an
 extension that lives next to its config:
 
@@ -160,6 +160,7 @@ crom add NAME [--seed SEED]   declare a profile in the config governing this dir
 crom rm REF                   stop it if running, undeclare it, release its port, delete its data
 crom init [NS] [--seed SEED]  write a .crom.toml here
 crom config [REF]             which config is in effect, and the exact Chrome command line
+                              — each flag attributed to the layer that supplied it
 crom port [REF]               print the port
 crom env [REF]                print shell exports
 crom mcp [REF]                write .mcp.json
