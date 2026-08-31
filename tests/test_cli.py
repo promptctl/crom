@@ -46,24 +46,44 @@ class CliTest(unittest.TestCase):
         self.env.start()
         self.scan = mock.patch("crom.chrome.scan", return_value={})
         self.scan.start()
-        self.runner = CliRunner()
 
     def tearDown(self):
         self.scan.stop()
         self.env.stop()
         self.tmp.cleanup()
 
-    def crom(self, *args, cwd: Path | None = None, expect: int = 0):
+    def invoke(self, *args, cwd: Path | None = None, expect: int = 0):
+        """Run one command in the project directory, and hand back the whole result.
+
+        The only way this suite runs a command, deliberately: which directory crom is
+        standing in *is* an input — `load_ambient` discovers the governing config by
+        walking up from the cwd — and it is ambient state no argument carries.
+        [LAW:no-ambient-temporal-coupling] A test that reached past this and called a
+        runner directly ran in whatever directory pytest was launched from, found no
+        project config there, and quietly asserted against the bootstrapped `user` scope
+        instead of the project it had just written. It passed, because the claims it made
+        are true of `user/default` too.
+
+        So the `CliRunner` is built here rather than kept as an attribute: with no runner
+        to reach for, that mistake is unrepresentable rather than discouraged.
+        [LAW:types-are-the-program] A runner carries no state between invocations, so
+        building one per call costs nothing.
+        """
         previous = Path.cwd()
         os.chdir(cwd or self.project)
         try:
-            result = self.runner.invoke(cli.main, list(args))
+            result = CliRunner().invoke(cli.main, list(args))
         finally:
             os.chdir(previous)
         self.assertEqual(
             result.exit_code, expect, f"crom {' '.join(args)} -> {result.exit_code}\n{result.output}"
         )
-        return result.output
+        return result
+
+    def crom(self, *args, cwd: Path | None = None, expect: int = 0):
+        """What a script sees: stdout and stderr as one stream, which is what a terminal
+        shows. `invoke` is for the few tests that need the two told apart."""
+        return self.invoke(*args, cwd=cwd, expect=expect).output
 
     # --- bootstrap ------------------------------------------------------------------
 
@@ -965,9 +985,9 @@ class CliTest(unittest.TestCase):
         """Attribution is information, not a warning: nothing here may change the exit
         status, move output to stderr, or prompt."""
         self.crom("init")
-        result = self.runner.invoke(cli.main, ["config", "default"])
+        result = self.invoke("config", "default")
 
-        self.assertEqual(result.exit_code, 0)
+        self.assertIn("Here, crom is in the 'myproj' namespace.", result.stdout)
         self.assertEqual(result.stderr, "")
         self.assertIn("from crom's launch policy", result.stdout)
         self.assertNotIn("over ", result.stdout)
