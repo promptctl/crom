@@ -58,10 +58,16 @@ _POLICY_TEXTS: tuple[str, ...] = (
     "--disable-session-crashed-bubble",  # no "Chrome didn't shut down correctly" bubble
 )
 
+# What this policy is called wherever it is named to a user — in the diagnostic for a
+# duplicate below, and as the layer `crom config` attributes a policy flag to. A config
+# stanza's name comes from the file; this one has no file, so it is written here, once.
+# [LAW:one-source-of-truth]
+LAUNCH_POLICY_ORIGIN = "crom's launch policy"
+
 # Through the same checkpoint a user's `flags` list goes through, so crom's own list is
 # held to the rule it enforces: naming a switch twice above is a bug that fails loudly at
 # import rather than silently dropping the earlier entry. [LAW:single-enforcer]
-LAUNCH_POLICY_FLAGS: tuple[Flag, ...] = layer(_POLICY_TEXTS, "crom's launch policy")
+LAUNCH_POLICY_FLAGS: tuple[Flag, ...] = layer(_POLICY_TEXTS, LAUNCH_POLICY_ORIGIN)
 
 # The features crom turns off for every managed Chrome, in the same vocabulary a config's
 # `features` table uses — crom's policy is the first layer of that table, not a privileged

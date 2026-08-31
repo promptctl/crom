@@ -22,7 +22,26 @@ type that makes two layers' answers to one question visible as such.
 
 from collections.abc import Callable
 
-from .model import Composed, CromError, Flag, Layer
+from .model import Answer, Composed, CromError, Emitted, Flag, Layer, Removed, Resolution
+
+
+# A switch name may not interpolate a variable, in either list that can hold one — this is
+# the predicate and the phrase, written once because it is one rule. [LAW:single-enforcer]
+# Both lists match a switch by the spelling the file used and `resolve._expand` runs
+# afterwards, so a variable in a switch name can only ever fail to match: a drop would
+# silently remove nothing, and a `flags` entry would silently fail to override, leaving crom
+# to emit the same Chrome switch twice. Measured before this rule existed: `[defaults]`
+# holding `--${CROM_PROFILE}-x=1` and `[profiles.dev]` holding `--dev-x=2` reached Chrome as
+# `--dev-x=1 --dev-x=2`. [LAW:no-silent-failure]
+#
+# Only the switch half. `${...}` in a flag's *value* is the supported feature and is
+# untouched — it is expanded after composition has already decided which switch wins, so
+# nothing about it can make two names collide.
+_INTERPOLATED_SWITCH = "interpolates a variable into the switch name"
+
+
+def _interpolates(switch: str) -> bool:
+    return "${" in switch
 
 
 def layer(texts: list[str] | tuple[str, ...], where: str) -> tuple[Flag, ...]:
@@ -44,7 +63,19 @@ def layer(texts: list[str] | tuple[str, ...], where: str) -> tuple[Flag, ...]:
     [LAW:single-enforcer]
     """
     seen: dict[str, Flag] = {}
-    for flag in (Flag.parse(text) for text in texts):
+    for text, flag in ((text, Flag.parse(text)) for text in texts):
+        # Before the duplicate rule, for the reason `_ILLEGAL_DROPS` runs before the value
+        # check: an interpolated switch cannot be meaningfully compared to another switch,
+        # so the duplicate remedy would be advice about a name that is not the name.
+        if _interpolates(flag.switch):
+            raise CromError(
+                f"{where}: {text!r} {_INTERPOLATED_SWITCH}.\n"
+                f"crom resolves each switch by the name the file spells and expands "
+                f"variables only afterwards, so this names a switch no other layer can "
+                f"meet — it would fail to override the same switch written literally, and "
+                f"crom would hand Chrome both. Write the switch name literally; a flag's "
+                f"value still interpolates: --load-extension=${{CROM_CONFIG_DIR}}/ext."
+            )
         first = seen.get(flag.switch)
         if first is not None:
             raise CromError(
@@ -76,10 +107,9 @@ _ILLEGAL_DROPS: tuple[tuple[Callable[[str], bool], str], ...] = (
         lambda switch: switch != switch.strip(),
         "names a switch with leading or trailing whitespace, which no switch carries",
     ),
-    (
-        lambda switch: "${" in switch,
-        "interpolates a variable into the switch name",
-    ),
+    # The same rule `layer` applies to a `flags` entry's switch half, read from the same
+    # predicate so the two lists cannot come to disagree about what a switch name may be.
+    (_interpolates, _INTERPOLATED_SWITCH),
 )
 
 
@@ -179,8 +209,8 @@ def _remedy(first: Flag, second: Flag) -> str:
 FEATURE_SWITCHES: dict[bool, str] = {True: "--enable-features", False: "--disable-features"}
 
 
-def features(*tables: dict[str, bool]) -> tuple[Flag, ...]:
-    """Fold feature tables into the at-most-two switches that carry them.
+def features(*tables: tuple[str, dict[str, bool]]) -> tuple[Emitted, ...]:
+    """Fold each layer's feature table into the at-most-two switches that carry them.
 
     A feature is in one of three states — on, off, or unmentioned — and a table of
     name -> bool is exactly that domain: the two switches are a *rendering* of one fact,
@@ -208,22 +238,42 @@ def features(*tables: dict[str, bool]) -> tuple[Flag, ...]:
     *removing* the name from the disable list, which is the only way it could take effect
     at all: an added `--enable-features` would lose to the disable that was still there.
 
-    The result is flags like any others — `resolve_spec` hands them to `compose` as a
-    `Layer` of their own, and `compose` needs no case for it. A `Layer` rather than
-    something narrower because that is what `compose` takes; the fold has no drops to
-    contribute, since a feature is turned off by naming it, never by removing a switch.
-    Each switch is omitted when no feature is in its state — an `--enable-features=` with an empty
-    value is a switch Chrome is given and told nothing by, which is a different claim
-    from the one crom means.
-    """
-    resolved: dict[str, bool] = {}
-    for table in tables:
-        resolved.update(table)
+    The result is emitted flags like any others, resolved here rather than by `compose`.
+    They used to go through `compose` as a `Layer` of their own, which was uniform and
+    told the report a lie: `compose` attributes a whole switch to the last layer that set
+    it, and these two switches belong to no single layer — one `--disable-features` can
+    carry names contributed by all three at once. `config.RESERVED_SWITCHES` refuses both
+    switches inside any `flags` list, so no other layer can supply one and `compose` had
+    nothing to resolve about them anyway; folding them here instead means each switch has
+    exactly one place that decides its value *and* explains it. [LAW:one-source-of-truth]
 
-    named: dict[str, list[str]] = {switch: [] for switch in FEATURE_SWITCHES.values()}
-    for name, state in resolved.items():
-        named[FEATURE_SWITCHES[state]].append(name)
-    return tuple(Flag(switch, ",".join(names)) for switch, names in named.items() if names)
+    Each switch is omitted when no feature is in its state — an `--enable-features=` with
+    an empty value is a switch Chrome is given and told nothing by, which is a different
+    claim from the one crom means. The value is joined from the resolutions rather than
+    from a second list of names, so what the switch says and what the report says it says
+    cannot come apart.
+    """
+    # name -> the switch its state selects, and every layer's answer about it. The switch
+    # is kept rather than the bool because a bool would have to be turned back into a
+    # switch after the fold, while the answers keep the states in the vocabulary the file
+    # wrote them in. [LAW:one-source-of-truth]
+    resolved: dict[str, tuple[str, tuple[Answer, ...]]] = {}
+    for origin, table in tables:
+        for name, state in table.items():
+            _, answers = resolved.get(name, ("", ()))
+            resolved[name] = (
+                FEATURE_SWITCHES[state],
+                (*answers, Answer(origin, str(state).lower())),
+            )
+
+    carried: dict[str, list[Resolution]] = {switch: [] for switch in FEATURE_SWITCHES.values()}
+    for name, (switch, answers) in resolved.items():
+        carried[switch].append(Resolution(name, answers))
+    return tuple(
+        Emitted(Flag(switch, ",".join(r.question for r in resolutions)), tuple(resolutions))
+        for switch, resolutions in carried.items()
+        if resolutions
+    )
 
 
 def compose(*layers: Layer) -> Composed:
@@ -232,10 +282,16 @@ def compose(*layers: Layer) -> Composed:
     Given crom's launch policy, then `[defaults]`, then the profile, this is the rule
     `profile > defaults > policy` that every other config key already obeys. Each switch
     appears once in the result, at the position where it was *first* introduced and
-    carrying the value the *last* layer gave it — which is what a dict assignment does,
-    so the ordering is not a second mechanism to keep in step with the resolution.
+    carrying the value the *last* layer gave it — the first from a dict key's insertion
+    order and the second from the end of the answers appended under it, so the ordering is
+    not a second mechanism to keep in step with the resolution.
     [LAW:dataflow-not-control-flow] no branch asks whether a switch is already present;
-    the same assignment runs for every flag and the data decides what it means.
+    the same append runs for every flag and the data decides what it means.
+
+    The answers are kept rather than overwritten, which is what makes the fold its own
+    report: which layer supplied a flag and which layers it outranked are visible only
+    while the fold runs, so `crom config` would otherwise have to compose a second time to
+    find them out. See `model.Resolution`. [LAW:one-source-of-truth]
 
     Position-of-first-introduction is what makes the order stable across runs and keeps
     crom's policy flags where a reader of `crom config` expects them, rather than
@@ -265,25 +321,47 @@ def compose(*layers: Layer) -> Composed:
     beneath: a global sort would spend a real fact about where each removal came from to
     buy an alphabet nobody asked for.
 
-    [LAW:one-source-of-truth] this is the only answer to "what flags does this profile
-    launch with". `resolve_spec` builds argv from it and `crom add` compares against it,
-    so the two cannot come to disagree about what a declaration means.
+    [LAW:one-source-of-truth] this is the only answer to "what do this config's `flags`
+    and `drop_flags` lists resolve to". `resolve_spec` builds argv from it and `crom add`
+    compares against it, so the two cannot come to disagree about what a declaration
+    means. The two feature switches are the one part of the launch list decided elsewhere,
+    because they are decided per feature name rather than per switch — `features` owns
+    them end to end, and `RESERVED_SWITCHES` keeps them out of every list this sees.
     """
-    resolved: dict[str, Flag] = {}
-    dropped: dict[str, None] = {}
+    # switch -> every answer given to it, earliest first. Appending rather than replacing
+    # is what turns the fold into its own report: the last entry is the value that wins,
+    # which is the same fact the emitted flag carries, so the two cannot disagree about
+    # who won. [LAW:one-source-of-truth] A plain `dict[str, Flag]` threw the losers away
+    # and left `crom config` to re-run the composition to find them.
+    resolved: dict[str, tuple[Answer, ...]] = {}
+    dropped: dict[str, Removed] = {}
     for one_layer in layers:
         for switch in sorted(one_layer.drops & resolved.keys()):
-            del resolved[switch]
-            dropped[switch] = None
+            # The drop takes the whole argument with it, not just the winner — a user
+            # hunting for a `[defaults]` flag that a profile overrode and then dropped is
+            # owed both halves of why it is gone.
+            dropped[switch] = Removed(one_layer.origin, Resolution(switch, resolved.pop(switch)))
         for flag in one_layer.sets:
-            resolved[flag.switch] = flag
-    # What the reader actually lost, which is not everything a drop ever removed: a layer
-    # below the drop may set the switch again, and reporting it as dropped beside an argv
-    # that plainly contains it would be a false sentence about the list it annotates.
-    # A dict, not a list, so a switch removed twice is still one thing that happened.
+            resolved[flag.switch] = (
+                *resolved.get(flag.switch, ()),
+                Answer(one_layer.origin, str(flag)),
+            )
+    # The emitted flag is the standing answer, parsed back from the text that answer
+    # holds rather than kept beside it — `Flag.parse(str(flag))` is the identity for every
+    # flag crom makes, since `__str__` joins at the same `=` that `parse` splits at, and one
+    # value that renders the flag beats two that can drift. [LAW:one-source-of-truth]
+    #
+    # `dropped` reports what the reader actually lost, which is not everything a drop ever
+    # removed: a layer below the drop may set the switch again, and reporting it as dropped
+    # beside an argv that plainly contains it would be a false sentence about the list it
+    # annotates. A dict, not a list, so a switch removed twice is still one thing that
+    # happened.
     return Composed(
-        tuple(resolved.values()),
-        tuple(switch for switch in dropped if switch not in resolved),
+        tuple(
+            Emitted(Flag.parse(answers[-1].said), (Resolution(switch, answers),))
+            for switch, answers in resolved.items()
+        ),
+        tuple(record for switch, record in dropped.items() if switch not in resolved),
     )
 
 

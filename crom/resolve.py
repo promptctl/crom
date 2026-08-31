@@ -12,9 +12,13 @@ from pathlib import Path
 from . import configwrite, flags, registry, report
 from .config import load_file, load_user_scope
 from .model import (
+    DEFAULTS_STANZA,
     USER_NAMESPACE,
+    Composed,
     CromError,
+    Emitted,
     FailedProfile,
+    Flag,
     Layer,
     NotFound,
     ProfileEntry,
@@ -23,9 +27,10 @@ from .model import (
     ResolvedProfile,
     Scope,
     Seed,
+    profile_stanza,
 )
 from .paths import user_config_file
-from .policy import LAUNCH_POLICY_FEATURES, LAUNCH_POLICY_FLAGS
+from .policy import LAUNCH_POLICY_FEATURES, LAUNCH_POLICY_FLAGS, LAUNCH_POLICY_ORIGIN
 
 # The closed vocabulary a config may interpolate into flags and env values. Closed on
 # purpose: an unknown ${...} is an error, never an empty string silently spliced into a
@@ -273,22 +278,37 @@ def resolve_spec(scope: Scope, spec: ProfileSpec) -> ResolvedProfile:
     # not in the config. Deliberately different layer sets, not a drift — see
     # `cli._effective_flags`, which owns that reasoning.
     #
-    # The features layer is composed last, and its position carries no conflict to
-    # resolve: `config.RESERVED_SWITCHES` refuses `--enable-features` and
-    # `--disable-features` inside any `flags` list, so those two switches can reach
-    # `compose` from nowhere else and land wherever this layer is placed. Last is simply
-    # where a reader of `crom config` finds them.
+    # Only the two config stanzas arrive as layers with drops: crom's policy is flags and
+    # nothing else, and a `Layer` around it says so. A profile dropping a policy switch is
+    # the point — that is how a project launches with sync on without editing crom's own
+    # list — while the policy dropping something beneath it would have nothing to drop.
     #
-    # Only the two config stanzas arrive as layers with drops: crom's policy and the
-    # composed features are flags and nothing else, and a `Layer` around each says so.
-    # A profile dropping a policy switch is the point — that is how a project launches
-    # with sync on without editing crom's own list — while the policy dropping something
-    # beneath it would have nothing to drop.
+    # The feature switches are folded beside the composition rather than through it, and
+    # appended last. `config.RESERVED_SWITCHES` refuses `--enable-features` and
+    # `--disable-features` inside any `flags` list and inside any `drop_flags` list, so no
+    # layer can set or remove one and `compose` never had a conflict to resolve about them
+    # — while attributing them *would* have been a conflict it could only get wrong, since
+    # one `--disable-features` carries names from every layer at once. See `flags.features`.
+    #
+    # The three feature tables are named with the same strings their stanzas' `flags` are
+    # named with, because they are the same stanzas. Read from the shared constants rather
+    # than from `default_flags.origin` and `spec.flags.origin`, which do carry the right
+    # strings: a stanza's name belongs to the stanza, not to whichever of its keys happened
+    # to be parsed, and taking the `features` label out of the `flags` layer would make one
+    # half of a stanza depend on a sibling half for no reason but that it is holding the
+    # string. [LAW:one-source-of-truth] the name has one home, and both keys read it there.
     composed = flags.compose(
-        Layer(LAUNCH_POLICY_FLAGS),
+        Layer(LAUNCH_POLICY_FLAGS, origin=LAUNCH_POLICY_ORIGIN),
         scope.default_flags,
         spec.flags,
-        Layer(flags.features(LAUNCH_POLICY_FEATURES, scope.default_features, spec.features)),
+    )
+    emitted = (
+        *composed.emitted,
+        *flags.features(
+            (LAUNCH_POLICY_ORIGIN, LAUNCH_POLICY_FEATURES),
+            (DEFAULTS_STANZA, scope.default_features),
+            (profile_stanza(spec.name), spec.features),
+        ),
     )
     raw_env = {**scope.default_env, **spec.env}
 
@@ -326,7 +346,19 @@ def resolve_spec(scope: Scope, spec: ProfileSpec) -> ResolvedProfile:
     port = registry.port_for(ref, pinned=spec.port, source=scope.source)
 
     variables = _variables(ref, profile_dir, scope.config_dir, port)
-    launch_flags = tuple(_expand(f, variables, where) for f in flags.render(composed.flags))
+    # Expansion lands in the report, and `argv` is then built from the report — one list,
+    # not two that must stay parallel. That is what lets `crom config` match an annotation
+    # to a command line by the text itself: the strings are the same strings.
+    # [LAW:one-source-of-truth] The *answers* stay unexpanded on purpose — a user hunting
+    # for the flag they wrote is hunting for the text they typed, not for what crom made
+    # of it.
+    provenance = Composed(
+        tuple(
+            Emitted(Flag.parse(_expand(str(item.flag), variables, where)), item.why)
+            for item in emitted
+        ),
+        composed.dropped,
+    )
     env = {k: _expand(v, variables, where) for k, v in raw_env.items()}
 
     seed: Seed = spec.seed if spec.seed is not None else scope.default_seed
@@ -336,11 +368,11 @@ def resolve_spec(scope: Scope, spec: ProfileSpec) -> ResolvedProfile:
         port=port,
         profile_dir=profile_dir,
         chrome_binary=scope.chrome_binary,
-        argv=build_argv(scope.chrome_binary, profile_dir, port, launch_flags),
+        argv=build_argv(scope.chrome_binary, profile_dir, port, flags.render(provenance.flags)),
         env=env,
         seed=seed,
         source=scope.source,
-        dropped=composed.dropped,
+        provenance=provenance,
     )
 
 

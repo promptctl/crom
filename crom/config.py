@@ -25,6 +25,7 @@ from .browser import find_chrome
 from .locking import exclusive
 from .model import (
     DEFAULT_SEED,
+    DEFAULTS_STANZA,
     FALLBACK_NAMESPACE,
     MAX_PORT,
     MIN_PORT,
@@ -40,6 +41,7 @@ from .model import (
     SeedChrome,
     SeedFresh,
     SeedPath,
+    profile_stanza,
     slug_for,
     validate_name,
 )
@@ -210,7 +212,11 @@ def parse_layer(raw_flags, raw_drops, where: str, source: Path) -> Layer:
     sets = flags.layer(raw_flags, f"{source}: {where}.flags")
     drops = flags.drops(raw_drops, f"{source}: {where}.drop_flags")
     try:
-        return Layer(sets=sets, drops=drops)
+        # `where` is both halves of the same fact: the stanza this diagnostic is about, and
+        # the stanza `crom config` will attribute these flags to. Naming the layer here is
+        # what keeps a flag's origin tied to the parse that produced it rather than to a
+        # label some later caller remembers to pass. [LAW:one-source-of-truth]
+        return Layer(sets=sets, drops=drops, origin=where)
     except CromError as fault:
         # `Layer` owns the rule; this owns the location. Re-raised with strictly more
         # information than it caught, never less — the alternative was a second copy of
@@ -538,11 +544,11 @@ def parse(text: str, source: Path, *, namespace: str | None = None) -> Scope:
 
     defaults = data.get("defaults", {})
     if not isinstance(defaults, dict):
-        raise CromError(f"{source}: [defaults] must be a table")
-    _reject_unknown(defaults, _DEFAULTS_KEYS, "[defaults]", source)
+        raise CromError(f"{source}: {DEFAULTS_STANZA} must be a table")
+    _reject_unknown(defaults, _DEFAULTS_KEYS, DEFAULTS_STANZA, source)
 
     default_seed = (
-        parse_seed(defaults["seed"], "[defaults]", source, config_dir)
+        parse_seed(defaults["seed"], DEFAULTS_STANZA, source, config_dir)
         if "seed" in defaults
         else DEFAULT_SEED
     )
@@ -553,7 +559,7 @@ def parse(text: str, source: Path, *, namespace: str | None = None) -> Scope:
 
     profiles: dict[str, ProfileSpec] = {}
     for name, raw in raw_profiles.items():
-        where = f"[profiles.{name}]"
+        where = profile_stanza(name)
         if not isinstance(raw, dict):
             raise CromError(f"{source}: {where} must be a table")
         _reject_unknown(raw, _PROFILE_KEYS, where, source)
@@ -575,10 +581,10 @@ def parse(text: str, source: Path, *, namespace: str | None = None) -> Scope:
         profiles_root=profiles_root,
         chrome_binary=binary,
         default_flags=parse_layer(
-            defaults.get("flags", []), defaults.get("drop_flags", []), "[defaults]", source
+            defaults.get("flags", []), defaults.get("drop_flags", []), DEFAULTS_STANZA, source
         ),
-        default_features=parse_features(defaults.get("features", {}), "[defaults]", source),
-        default_env=parse_env(defaults.get("env", {}), "[defaults]", source),
+        default_features=parse_features(defaults.get("features", {}), DEFAULTS_STANZA, source),
+        default_env=parse_env(defaults.get("env", {}), DEFAULTS_STANZA, source),
         default_seed=default_seed,
         profiles=profiles,
     )

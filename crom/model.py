@@ -174,11 +174,11 @@ class Flag:
 
 @dataclass(frozen=True)
 class Layer:
-    """One stanza's whole say over the launch flags: what it sets, and what it drops.
+    """One stanza's whole say over the launch flags: what it sets, drops, and is called.
 
-    A stanza says these in two TOML keys — `flags` and `drop_flags` — but they are one
-    fact: what this layer does to what it inherits. Carrying them as one value is what
-    makes it impossible to compose a layer's flags while forgetting its drops. Two
+    A stanza says the first two in two TOML keys — `flags` and `drop_flags` — but they
+    are one fact: what this layer does to what it inherits. Carrying them as one value is
+    what makes it impossible to compose a layer's flags while forgetting its drops. Two
     fields on `ProfileSpec` would leave every present and future composition site to
     remember the pairing by convention, and a site that forgot would silently launch
     with a switch the config removed. [LAW:types-are-the-program]
@@ -187,12 +187,21 @@ class Layer:
     lands in argv. `drops` is a set because a drop names a switch and says nothing else
     about it, so neither order nor multiplicity could carry meaning.
 
-    The two are disjoint, and this constructor is what makes that true rather than
-    `config.parse_layer` being careful: a layer that both sets and drops one switch has
-    said two things where only one can mean anything, and refusing it here means nothing
-    downstream has to decide which wins. Enforced in `__post_init__` for the reason
-    `ProfileSpec` gives above — a convention every future call site must rediscover
-    becomes a property of the type. [LAW:types-are-the-program]
+    `origin` is how a reader of `crom config` will hear this stanza named — `[defaults]`,
+    `[profiles.dev]`, `crom's launch policy` — and it is a field rather than something the
+    renderer looks up because only the stanza's own parser knows it. A layer that says
+    something must say where it was said: `__post_init__` refuses a non-empty layer with
+    no name, so `flags.compose` cannot produce a flag whose origin renders as a blank.
+    [LAW:types-are-the-program] Only a layer that says something needs a name, which is
+    why the field can carry a default at all: a bare `Layer()` contributes nothing to the
+    report, so there is nothing for a name to label.
+
+    `sets` and `drops` are disjoint, and this constructor is what makes that true rather
+    than `config.parse_layer` being careful: a layer that both sets and drops one switch
+    has said two things where only one can mean anything, and refusing it here means
+    nothing downstream has to decide which wins. Enforced in `__post_init__` for the
+    reason `ProfileSpec` gives above — a convention every future call site must
+    rediscover becomes a property of the type. [LAW:types-are-the-program]
 
     The rule is stated once, here. `parse_layer` catches this and prepends the file and
     stanza it was reading, because the location is what *it* knows and the rule is what
@@ -202,8 +211,14 @@ class Layer:
 
     sets: tuple[Flag, ...] = ()
     drops: frozenset[str] = frozenset()
+    origin: str = ""
 
     def __post_init__(self) -> None:
+        if (self.sets or self.drops) and not self.origin:
+            raise CromError(
+                "a layer that sets or drops a flag must name where it was written; "
+                "this is a crom bug, not a fault in any config"
+            )
         both = sorted(self.drops & {flag.switch for flag in self.sets})
         if both:
             raise CromError(
@@ -214,23 +229,162 @@ class Layer:
             )
 
 
+# How a stanza is named to the user, in the spelling their config file uses. Written here
+# rather than at each site that needs one, because three of them must agree: `config`
+# labels the layer it parses, `cli` labels the stanza `crom add` writes, and `resolve`
+# labels the `features` table that sits beside the same stanza's `flags`. Two spellings
+# would put one stanza under two names in a single `crom config` listing.
+# [LAW:one-source-of-truth]
+DEFAULTS_STANZA = "[defaults]"
+
+
+def profile_stanza(name: str) -> str:
+    return f"[profiles.{name}]"
+
+
+# --- how the launch flags came to be -------------------------------------------------
+#
+# Every flag crom emits is the end of an argument between layers, and `crom config` is
+# where that argument is readable. The unit of the report is not a flag but a *question*:
+# for an ordinary switch the question is the switch itself, and for a feature it is the
+# feature name — because `flags.features` folds per name into a switch every layer
+# contributes to at once, so "the profile overrode the policy's `--disable-features`" is a
+# false sentence about a union. Both are one mechanism at different grains: an emitted
+# switch carries the resolutions that decided it, exactly one in the ordinary case and one
+# per feature name in the two that features own. [LAW:one-type-per-behavior]
+
+
+@dataclass(frozen=True)
+class Answer:
+    """What one layer said about one question, in the spelling its stanza used.
+
+    `said`, not `value`: this is what a layer *stated*, which is a different fact from what
+    Chrome is given. They part company whenever a flag's value interpolates — the stanza
+    said `--load-extension=${CROM_CONFIG_DIR}/ext` and Chrome gets an absolute path — and a
+    field called `value` invited a reader to treat the two as one. The stated spelling is
+    the useful one here: this text is printed so a user can find the flag they wrote, and
+    for a dropped flag it is the *only* honest text, since nothing was launched for an
+    expansion to describe.
+
+    A rendered string rather than a `Flag` or a bool because the two producers answer
+    differently shaped questions — a whole flag, or a feature's `true`/`false` — and the
+    shape is known only where the answer is made. Rendering it there keeps one report type
+    for both instead of a union the renderer would have to take apart.
+    """
+
+    layer: str
+    said: str
+
+    def describe(self) -> dict:
+        return {"layer": self.layer, "said": self.said}
+
+
+@dataclass(frozen=True)
+class Resolution:
+    """One question, and every answer given to it in the order the layers spoke.
+
+    The last answer stands and the earlier ones were replaced, which is the same
+    later-wins rule the fold itself runs on — so the report cannot disagree with the
+    composition about who won. [LAW:one-source-of-truth]
+
+    Answer values stay unexpanded — `${CROM_PORT}` is shown as the file spells it, because
+    a user looking for the flag they wrote is looking for the text they typed. The question
+    has no such choice to make: `flags.layer` refuses a variable in a switch name and
+    `parse_features` refuses one in a feature name, so a question has only ever one
+    spelling.
+    """
+
+    question: str
+    answers: tuple[Answer, ...]
+
+    def __post_init__(self) -> None:
+        if not self.answers:
+            raise CromError(
+                f"nothing was resolved for {self.question!r}; this is a crom bug, "
+                f"not a fault in any config"
+            )
+
+    @property
+    def stands(self) -> Answer:
+        return self.answers[-1]
+
+    @property
+    def replaced(self) -> tuple[Answer, ...]:
+        return self.answers[:-1]
+
+    def describe(self) -> dict:
+        """The whole resolution — every answer, and which one stands.
+
+        The standing answer is carried rather than left to a sibling channel. `Emitted` has
+        such a channel (its flag) and `Removed` has none, so omitting it reported a dropped
+        switch with no trace of what was lost. A rendering complete only when read from one
+        of its two directions is a map true in one direction. [FRAMING:representation]
+
+        `stands` and `over` render through the same `Answer.describe()`, so an answer looks
+        the same wherever it appears. Flattening the standing one into sibling keys made it
+        the one answer with a bespoke shape, and named its text `value` — which invited the
+        reading that it must equal the emitted flag. It does not: `Emitted.flag` is what
+        Chrome is given and `stands.said` is what the layer stated, and the two differ
+        exactly when the value interpolates a variable. [LAW:one-type-per-behavior]
+        """
+        return {
+            "question": self.question,
+            "stands": self.stands.describe(),
+            "over": [answer.describe() for answer in self.replaced],
+        }
+
+
+@dataclass(frozen=True)
+class Emitted:
+    """One switch crom puts on the command line, and the questions that decided it."""
+
+    flag: Flag
+    why: tuple[Resolution, ...]
+
+    def describe(self) -> dict:
+        return {"flag": str(self.flag), "why": [r.describe() for r in self.why]}
+
+
+@dataclass(frozen=True)
+class Removed:
+    """A switch a `drop_flags` entry took away, and the resolution it took with it.
+
+    `by` is the layer that dropped; `what` is everything that had been said about the
+    switch up to that point. Both halves are needed to answer the question this record
+    exists for — a user who wrote a flag and cannot find it in argv wants to know who
+    removed it *and* that it was theirs.
+    """
+
+    by: str
+    what: Resolution
+
+    def describe(self) -> dict:
+        return {"by": self.by, **self.what.describe()}
+
+
 @dataclass(frozen=True)
 class Composed:
     """What every layer agreed on: the flags to launch with, and the switches removed.
 
-    `dropped` cannot be derived from `flags` — a switch no layer ever set and a switch a
-    layer removed are both simply absent from it. The difference exists only while the
-    fold is running, which is why `flags.compose` reports it here rather than leaving
-    `crom config` to reconstruct it from the layers a second time.
-    [LAW:one-source-of-truth]
+    Neither field can be derived from the other, nor from the flags alone. A switch no
+    layer ever set and a switch a layer removed are both simply absent from `emitted`, and
+    which layer supplied a flag stops being visible the moment the fold has folded — both
+    differences exist only while it is running, which is why `flags.compose` reports them
+    here rather than leaving `crom config` to reconstruct them from the layers a second
+    time. [LAW:one-source-of-truth]
 
-    Only switches a drop actually removed appear. Dropping a switch nothing supplies is
-    allowed and changes nothing, so reporting it as dropped would tell the reader a
-    layer below had set something it never did.
+    Only switches a drop actually removed appear in `dropped`. Dropping a switch nothing
+    supplies is allowed and changes nothing, so reporting it as dropped would tell the
+    reader a layer below had set something it never did.
     """
 
-    flags: tuple[Flag, ...] = ()
-    dropped: tuple[str, ...] = ()
+    emitted: tuple[Emitted, ...] = ()
+    dropped: tuple[Removed, ...] = ()
+
+    @property
+    def flags(self) -> tuple[Flag, ...]:
+        """Just the flags, for the callers that are launching rather than explaining."""
+        return tuple(item.flag for item in self.emitted)
 
 
 # --- declarations ------------------------------------------------------------------
@@ -363,12 +517,16 @@ class ResolvedProfile:
     env: dict[str, str]
     seed: Seed
     source: Path | None
-    # The switches a `drop_flags` entry removed from what this profile inherited. Absent
-    # from `argv` by construction, and unrecoverable from it — which is the whole reason
-    # it is carried: `crom config` can report a flag as dropped instead of leaving the
-    # reader to notice that something they wrote in `[defaults]` is not there.
-    # [LAW:no-silent-failure]
-    dropped: tuple[str, ...] = ()
+    # How the flags in `argv` came to be — which layer supplied each one, what it
+    # replaced, and which switches a `drop_flags` entry removed. Unrecoverable from `argv`,
+    # which is the whole reason it is carried: a flag a user wrote can legitimately not
+    # appear there, and `crom config` can say why instead of leaving the reader to notice
+    # that something they wrote in `[defaults]` is missing. [LAW:no-silent-failure]
+    #
+    # The flags here are the expanded ones `argv` was built from, so `crom config` can
+    # match a report line to a command line by the text itself rather than by counting
+    # positions into a list whose ends crom owns.
+    provenance: Composed = Composed()
 
     @property
     def cdp_url(self) -> str:
