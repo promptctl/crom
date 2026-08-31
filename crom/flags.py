@@ -250,8 +250,12 @@ def compose(*layers: Layer) -> Composed:
     The drop is expressed as an intersection rather than a lookup per name: the set of
     switches a layer's drops actually reach *is* `drops & resolved`, so no branch has to
     ask whether each name was present, and the same intersection answers both what to
-    remove and what to report as removed. [LAW:dataflow-not-control-flow] Sorted, because
-    a set's iteration order is not a fact about the config and `crom config` prints this.
+    remove and what to report as removed. [LAW:dataflow-not-control-flow] The intersection
+    is sorted only within the layer that produced it, and only because a `frozenset`'s
+    iteration order is not a fact about the config — two runs must print the same line.
+    Across layers the report stays in composition order, like the flags it is printed
+    beneath: a global sort would spend a real fact about where each removal came from to
+    buy an alphabet nobody asked for.
 
     [LAW:one-source-of-truth] this is the only answer to "what flags does this profile
     launch with". `resolve_spec` builds argv from it and `crom add` compares against it,
