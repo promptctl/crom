@@ -901,6 +901,77 @@ class CliTest(unittest.TestCase):
         self.assertEqual(argv[-1], f"--remote-debugging-port={payload['resolved']['port']}")
         self.assertIn("--no-first-run", argv)
 
+    def _override_project(self) -> None:
+        """A config whose `[defaults]` and profile answer the same two questions."""
+        self.crom("init")
+        (self.project / ".crom.toml").write_text(
+            'namespace = "myproj"\n\n'
+            "[defaults]\n"
+            'flags = ["--window-size=800,600"]\n'
+            "features = { PictureInPicture = false }\n\n"
+            "[profiles.default]\n"
+            'flags = ["--window-size=1280,800"]\n'
+            "features = { PictureInPicture = true }\n"
+        )
+
+    def test_config_attributes_an_overridden_flag_and_names_what_it_replaced(self):
+        """A flag a user wrote can legitimately not be in argv because a later layer
+        replaced it. The listing that prints argv is where that has to be readable —
+        otherwise the only way to find out is to know the layering rule already."""
+        self._override_project()
+        human = self.crom("config", "default")
+
+        self.assertIn(
+            "--window-size=1280,800",
+            human,
+        )
+        self.assertIn(
+            "from [profiles.default], over --window-size=800,600 from [defaults]", human
+        )
+        self.assertNotIn("--window-size=800,600 ", human.replace("over --window-size=800,600", ""))
+
+    def test_config_attributes_a_feature_per_name_rather_than_per_switch(self):
+        """The two feature switches are a union of every layer's table, so 'the profile
+        overrode the policy's --disable-features' is a false sentence. The provenance for
+        them is per feature name, and the output has to say it that way."""
+        self._override_project()
+        human = self.crom("config", "default")
+
+        # crom's own policy feature and the project's, in one switch, each attributed to
+        # the layer that decided it — and the project's own flip shown over `[defaults]`.
+        self.assertIn("ChromeWhatsNewUI from crom's launch policy", human)
+        self.assertIn("PictureInPicture from [profiles.default], over false from [defaults]", human)
+
+    def test_config_json_carries_each_flags_layer_beside_the_command(self):
+        self._override_project()
+        payload = json.loads(self.crom("config", "default", "--json"))
+        by_flag = {entry["flag"]: entry["why"] for entry in payload["resolved"]["flags"]}
+
+        self.assertEqual(
+            by_flag["--window-size=1280,800"],
+            [
+                {
+                    "question": "--window-size",
+                    "from": "[profiles.default]",
+                    "over": [{"layer": "[defaults]", "value": "--window-size=800,600"}],
+                }
+            ],
+        )
+        # Every flag in the report is a flag on the command line, and vice versa for the
+        # ones crom composes — the two views describe one list.
+        self.assertLessEqual(set(by_flag), set(payload["resolved"]["argv"]))
+
+    def test_config_of_a_config_that_overrides_nothing_stays_a_clean_exit_on_stdout(self):
+        """Attribution is information, not a warning: nothing here may change the exit
+        status, move output to stderr, or prompt."""
+        self.crom("init")
+        result = self.runner.invoke(cli.main, ["config", "default"])
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(result.stderr, "")
+        self.assertIn("from crom's launch policy", result.stdout)
+        self.assertNotIn("over ", result.stdout)
+
     def test_config_names_a_dropped_switch_rather_than_leaving_it_missing(self):
         """A dropped switch is absent from argv and indistinguishable there from one
         nobody ever set. `crom config` is where a reader goes to find out what crom is
@@ -914,8 +985,21 @@ class CliTest(unittest.TestCase):
         payload = json.loads(self.crom("config", "default", "--json"))
 
         self.assertNotIn("--disable-sync", payload["resolved"]["argv"])
-        self.assertEqual(payload["resolved"]["dropped"], ["--disable-sync"])
-        self.assertIn("(dropped --disable-sync)", human)
+        self.assertEqual(
+            payload["resolved"]["dropped"],
+            [
+                {
+                    "by": "[profiles.default]",
+                    "question": "--disable-sync",
+                    "from": "crom's launch policy",
+                    "over": [],
+                }
+            ],
+        )
+        self.assertIn(
+            "(dropped --disable-sync, from crom's launch policy — removed by [profiles.default])",
+            human,
+        )
 
     def test_list_json_describes_every_addressable_profile(self):
         self.crom("init")

@@ -72,6 +72,16 @@ class ParseRefTest(unittest.TestCase):
             parse_ref("myapp\n/dev", "myapp")
 
 
+def rendered(emitted) -> tuple[str, ...]:
+    """The flag texts an emitted list carries, for tests about what Chrome is given."""
+    return flags.render(tuple(item.flag for item in emitted))
+
+
+def dropped_switches(profile) -> tuple[str, ...]:
+    """Just the switches a `drop_flags` entry removed from a resolved profile."""
+    return tuple(removal.what.question for removal in profile.provenance.dropped)
+
+
 class ArgvTest(unittest.TestCase):
     def test_crom_owned_switches_come_last_so_config_cannot_displace_them(self):
         argv = resolve.build_argv(Path("/chrome"), Path("/data"), 9300, ("--headless=new",))
@@ -83,8 +93,12 @@ class ArgvTest(unittest.TestCase):
 class ComposeTest(unittest.TestCase):
     """The layering rule itself, without a config file or a port ledger in the way."""
 
-    def layer(self, *texts: str, drops: tuple[str, ...] = ()) -> Layer:
-        return Layer(flags.layer(texts, "test"), flags.drops(drops, "test"))
+    def layer(self, *texts: str, drops: tuple[str, ...] = (), origin: str = "test") -> Layer:
+        return Layer(flags.layer(texts, "test"), flags.drops(drops, "test"), origin=origin)
+
+    def dropped(self, composed) -> tuple[str, ...]:
+        """Just the switches a drop removed — what most of these tests are about."""
+        return tuple(removal.what.question for removal in composed.dropped)
 
     def test_a_later_layer_replaces_an_earlier_layers_value_for_the_same_switch(self):
         composed = flags.compose(
@@ -115,7 +129,7 @@ class ComposeTest(unittest.TestCase):
         one parser that happens to build them — a test or a future caller reaching the type
         directly would otherwise construct the state the docstring says cannot exist."""
         with self.assertRaisesRegex(CromError, "both sets and drops --headless"):
-            Layer(sets=(Flag("--headless", "new"),), drops=frozenset({"--headless"}))
+            Layer(sets=(Flag("--headless", "new"),), drops=frozenset({"--headless"}), origin="test")
 
     def test_a_later_layer_removes_a_switch_it_drops(self):
         composed = flags.compose(self.layer("--a=1", "--b"), self.layer(drops=("--a",)))
@@ -150,14 +164,14 @@ class ComposeTest(unittest.TestCase):
     def test_dropping_a_switch_no_layer_supplies_changes_nothing(self):
         composed = flags.compose(self.layer("--a"), self.layer(drops=("--b",)))
         self.assertEqual(flags.render(composed.flags), ("--a",))
-        self.assertEqual(composed.dropped, ())
+        self.assertEqual(self.dropped(composed), ())
 
     def test_a_drop_that_removed_something_is_reported_as_dropped(self):
         """The one fact `flags` alone cannot carry: a switch that was removed and a switch
         nobody ever set are both simply absent from it."""
         composed = flags.compose(self.layer("--a=1", "--b"), self.layer(drops=("--a", "--b")))
         self.assertEqual(composed.flags, ())
-        self.assertEqual(composed.dropped, ("--a", "--b"))
+        self.assertEqual(self.dropped(composed), ("--a", "--b"))
 
     def test_a_switch_dropped_and_set_again_below_is_not_reported_as_dropped(self):
         """`crom config` prints this beside argv, so it must describe the argv it stands
@@ -165,40 +179,111 @@ class ComposeTest(unittest.TestCase):
         composed = flags.compose(
             self.layer("--a=1"), self.layer(drops=("--a",)), self.layer("--a=2")
         )
-        self.assertEqual(composed.dropped, ())
+        self.assertEqual(self.dropped(composed), ())
+
+
+    def test_a_layer_that_says_something_must_say_where_it_was_said(self):
+        """An unattributed layer would reach `crom config` as a flag whose origin renders
+        blank, and the renderer has nothing to fall back on. The constructor is what makes
+        that unreachable rather than the care of whichever caller builds the layer."""
+        with self.assertRaisesRegex(CromError, "must name where it was written"):
+            Layer(sets=(Flag("--headless", None),))
+        with self.assertRaisesRegex(CromError, "must name where it was written"):
+            Layer(drops=frozenset({"--headless"}))
+        # A stanza that says nothing contributes nothing to the report, so it needs no name.
+        self.assertEqual(Layer().origin, "")
+
+    def test_the_standing_answer_is_the_last_layer_to_speak(self):
+        composed = flags.compose(
+            self.layer("--a=1", origin="policy"), self.layer("--a=2", origin="profile")
+        )
+        (answered,) = composed.emitted[0].why
+        self.assertEqual(answered.question, "--a")
+        self.assertEqual((answered.stands.layer, answered.stands.value), ("profile", "--a=2"))
+
+    def test_every_layer_a_switch_outranked_is_kept_in_the_order_they_spoke(self):
+        """A reader hunting for a flag they wrote needs their own layer named, not just
+        whoever won — and with three layers, only the loser list can tell them which."""
+        composed = flags.compose(
+            self.layer("--a=1", origin="policy"),
+            self.layer("--a=2", origin="defaults"),
+            self.layer("--a=3", origin="profile"),
+        )
+        (answered,) = composed.emitted[0].why
+        self.assertEqual(
+            [(a.layer, a.value) for a in answered.replaced],
+            [("policy", "--a=1"), ("defaults", "--a=2")],
+        )
+
+    def test_a_drop_reports_the_layer_that_removed_it_and_the_one_that_supplied_it(self):
+        composed = flags.compose(
+            self.layer("--a=1", origin="policy"),
+            self.layer("--a=2", origin="defaults"),
+            self.layer(drops=("--a",), origin="profile"),
+        )
+        (removal,) = composed.dropped
+        self.assertEqual(removal.by, "profile")
+        self.assertEqual(removal.what.stands.layer, "defaults")
+        self.assertEqual([a.layer for a in removal.what.replaced], ["policy"])
 
 
 class FeaturesTest(unittest.TestCase):
     """Folding feature tables into the at-most-two switches that carry them."""
 
+    def features(self, *tables: dict) -> tuple[str, ...]:
+        """The switches these layers fold to, named for the test so origins stay legible."""
+        return rendered(
+            flags.features(*((f"layer{n}", table) for n, table in enumerate(tables)))
+        )
+
     def test_a_feature_reaches_the_switch_its_state_selects(self):
-        rendered = flags.render(flags.features({"On": True, "Off": False}))
-        self.assertEqual(rendered, ("--enable-features=On", "--disable-features=Off"))
+        self.assertEqual(
+            self.features({"On": True, "Off": False}),
+            ("--enable-features=On", "--disable-features=Off"),
+        )
 
     def test_an_unmentioned_feature_reaches_neither_switch(self):
         """Three states, and the third is silence. A feature no layer names must not be
         turned on *or* off — which is why this is a table and not two lists."""
-        self.assertEqual(flags.render(flags.features({})), ())
-        self.assertEqual(flags.render(flags.features({"Off": False})), ("--disable-features=Off",))
+        self.assertEqual(self.features({}), ())
+        self.assertEqual(self.features({"Off": False}), ("--disable-features=Off",))
 
     def test_names_in_one_state_are_comma_joined_into_one_switch(self):
-        rendered = flags.render(flags.features({"A": False, "B": False}))
-        self.assertEqual(rendered, ("--disable-features=A,B",))
+        self.assertEqual(self.features({"A": False, "B": False}), ("--disable-features=A,B",))
 
     def test_a_later_layer_moves_a_feature_rather_than_adding_a_second_answer(self):
         """The reason a table beats two lists: flipping a feature *removes* it from the
         switch it was in. Two lists would leave the name in both, and Chrome resolves that
         pair by disabling — so the later layer would silently lose."""
-        rendered = flags.render(flags.features({"X": False}, {"X": True}))
-        self.assertEqual(rendered, ("--enable-features=X",))
+        self.assertEqual(self.features({"X": False}, {"X": True}), ("--enable-features=X",))
 
     def test_layers_fold_later_wins_leaving_untouched_features_alone(self):
-        rendered = flags.render(
-            flags.features({"Kept": False}, {"Flipped": False}, {"Flipped": True})
-        )
         self.assertEqual(
-            rendered, ("--enable-features=Flipped", "--disable-features=Kept")
+            self.features({"Kept": False}, {"Flipped": False}, {"Flipped": True}),
+            ("--enable-features=Flipped", "--disable-features=Kept"),
         )
+
+
+    def test_one_switch_carries_one_resolution_per_feature_it_names(self):
+        """The shape that makes feature provenance different from a flag's: the switch is a
+        union, so 'the profile overrode the policy's --disable-features' is a false
+        sentence. Attribution is per name, and the emitted value is joined from exactly the
+        names the report explains."""
+        (emitted,) = flags.features(
+            ("policy", {"FromPolicy": False}), ("profile", {"FromProfile": False})
+        )
+        self.assertEqual(str(emitted.flag), "--disable-features=FromPolicy,FromProfile")
+        self.assertEqual(
+            [(r.question, r.stands.layer) for r in emitted.why],
+            [("FromPolicy", "policy"), ("FromProfile", "profile")],
+        )
+
+    def test_a_flipped_feature_names_the_layer_it_outranked_in_that_layers_vocabulary(self):
+        (emitted,) = flags.features(("policy", {"X": False}), ("profile", {"X": True}))
+        (answered,) = emitted.why
+        self.assertEqual(str(emitted.flag), "--enable-features=X")
+        self.assertEqual((answered.stands.layer, answered.stands.value), ("profile", "true"))
+        self.assertEqual([(a.layer, a.value) for a in answered.replaced], [("policy", "false")])
 
 
 class LedgerFixture(unittest.TestCase):
@@ -308,7 +393,7 @@ class ResolveTest(LedgerFixture):
 
         self.assertNotIn("--disable-sync", profile.argv)
         self.assertIn("--no-first-run", profile.argv)
-        self.assertEqual(profile.dropped, ("--disable-sync",))
+        self.assertEqual(dropped_switches(profile), ("--disable-sync",))
 
     def test_a_profile_can_drop_a_flag_it_would_inherit_from_defaults(self):
         scope = self.scope(
@@ -319,7 +404,7 @@ class ResolveTest(LedgerFixture):
         profile = resolve.resolve(ProfileRef("myapp", "dev"), scope)
 
         self.assertNotIn("--headless=new", profile.argv)
-        self.assertEqual(profile.dropped, ("--headless",))
+        self.assertEqual(dropped_switches(profile), ("--headless",))
 
     def test_dropping_a_switch_no_layer_supplies_resolves_without_complaint(self):
         """A drop states what this profile must not run with, and a layer below dropping
@@ -327,7 +412,7 @@ class ResolveTest(LedgerFixture):
         scope = self.scope(MINIMAL + '[profiles.dev]\ndrop_flags = ["--nothing-sets-this"]\n')
         profile = resolve.resolve(ProfileRef("myapp", "dev"), scope)
 
-        self.assertEqual(profile.dropped, ())
+        self.assertEqual(dropped_switches(profile), ())
 
     def test_a_drop_in_defaults_reaches_the_policy_and_the_profile_can_set_it_back(self):
         """`profile > defaults > policy` for drops as for everything else: `[defaults]`
@@ -344,7 +429,7 @@ class ResolveTest(LedgerFixture):
         )
         profile = resolve.resolve(ProfileRef("myapp", "dev"), restored)
         self.assertIn("--no-pings", profile.argv)
-        self.assertEqual(profile.dropped, ())
+        self.assertEqual(dropped_switches(profile), ())
 
     def test_every_switch_reaches_chrome_exactly_once(self):
         scope = self.scope(

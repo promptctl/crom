@@ -25,16 +25,20 @@ from . import chrome, config, configwrite, flags, mcp, migrate, registry, resolv
 from .config import discover, load_ambient, load_user_scope, parse_layer, parse_port, parse_seed
 from .model import (
     DEFAULT_SEED,
+    DEFAULTS_STANZA,
     USER_NAMESPACE,
     Conflict,
     CromError,
+    Emitted,
     FailedProfile,
     Layer,
     NotFound,
     ProfileSpec,
     ResolvedProfile,
+    Resolution,
     Scope,
     parse_ref,
+    profile_stanza,
     slug_for,
     validate_name,
 )
@@ -373,6 +377,40 @@ def _effective_flags(scope: Scope, *stanzas: Layer) -> str:
     )
 
 
+# How wide the flag column grows before the notes beside it stop lining up. A cap rather
+# than the true widest flag: one long `--host-resolver-rules=...` would otherwise push
+# every note on the listing off the right of an ordinary terminal, to align with a line
+# nobody was reading the note for.
+_NOTE_COLUMN = 46
+
+
+def _resolution(answered: Resolution, *, named: bool) -> str:
+    """One question's history, in a clause that can sit beside the flag it decided.
+
+    The one place a resolution becomes prose, so the three shapes the report has — an
+    ordinary switch, a feature name inside a switch that carries several, and a switch a
+    drop removed — read the same way rather than each inventing a phrasing.
+    [LAW:single-enforcer]
+
+    `named` because the question is worth printing only where the line does not already
+    carry it: an ordinary flag's question *is* the switch printed to its left.
+    """
+    # The value first and the layer last, so one phrasing carries both vocabularies: a
+    # replaced flag reads "over --window-size=800,600 from [defaults]" and a replaced
+    # feature reads "over false from [defaults]". Layer-first put a bare `false` against a
+    # layer name and left the reader to guess which word was the value.
+    over = "".join(f", over {answer.value} from {answer.layer}" for answer in answered.replaced)
+    return f"{answered.question + ' ' if named else ''}from {answered.stands.layer}{over}"
+
+
+def _note(item: Emitted) -> str:
+    """Where one emitted switch came from — one clause, or one per feature it carries."""
+    return " · ".join(
+        _resolution(answered, named=answered.question != item.flag.switch)
+        for answered in item.why
+    )
+
+
 def _reject_restatement(
     subject: str, facts: tuple[tuple[str, str | None, str | None], ...], remedy: str
 ) -> None:
@@ -421,7 +459,7 @@ def add_cmd(session: _Session, name: str, seed_text: str | None, flag_texts: tup
     validate_name("profile name", name)
     scope = session.scope
     target = scope.source or user_config_file()
-    where = f"[profiles.{name}]"
+    where = profile_stanza(name)
     spec = ProfileSpec(
         name=name,
         # No drops: `crom add` has no `--drop-flag`, so the request it builds cannot state
@@ -566,7 +604,14 @@ def add_cmd(session: _Session, name: str, seed_text: str | None, flag_texts: tup
                 # declaration can never differ from it.
                 _effective_flags(scope, declared.flags),
                 (
-                    _effective_flags(scope, Layer(drops=declared.flags.drops), spec.flags)
+                    _effective_flags(
+                        scope,
+                        # The declaration's own drops, so named after the declaration: this
+                        # layer is the file's drop policy on loan to the request, not a
+                        # stanza of its own. [LAW:one-source-of-truth]
+                        Layer(drops=declared.flags.drops, origin=declared.flags.origin),
+                        spec.flags,
+                    )
                     if spec.flags.sets
                     else None
                 ),
@@ -739,7 +784,7 @@ def init_cmd(namespace: str | None, seed_text: str | None):
     # machine's absolute path into a file meant to be committed — the exact outcome
     # `render_seed`'s docstring exists to prevent. [LAW:one-source-of-truth]
     base = target.parent
-    stated_seed = None if seed_text is None else parse_seed(seed_text, "[defaults]", target, base)
+    stated_seed = None if seed_text is None else parse_seed(seed_text, DEFAULTS_STANZA, target, base)
 
     # The refusal here is the kernel's `O_CREAT | O_EXCL`, not a check of ours, so two
     # `crom init` calls racing in one directory produce one file rather than one clobbering
@@ -844,13 +889,23 @@ def config_cmd(session: _Session, ref: str | None, as_json: bool):
     if ref:
         profile = session.working(ref)
         running, pids = _status(profile, chrome.scan())
+        notes = {str(item.flag): _note(item) for item in profile.provenance.emitted}
+        # Measured over the annotated lines alone: the bare ones are the binary path and
+        # the profile directory, which are the longest things here and have nothing to line
+        # anything up with.
+        width = min(max((len(arg) for arg in notes), default=0), _NOTE_COLUMN)
         payload["resolved"] = {
             **profile.describe(running=running, pids=pids),
             "argv": list(profile.argv),
             # Beside `argv` rather than inside `describe()`, for the reason the seed is:
             # this is how the profile came to be what it is, which is `crom config`'s
             # subject, while `up` and `list` report what it is now.
-            "dropped": list(profile.dropped),
+            #
+            # Rendered by the report's own types, so the JSON a consumer parses and the
+            # lines a human reads are two views of one value rather than two hand-kept
+            # descriptions of it. [LAW:one-source-of-truth]
+            "flags": [item.describe() for item in profile.provenance.emitted],
+            "dropped": [removal.describe() for removal in profile.provenance.dropped],
             # The seed lives here rather than in `describe()` because it is a create-time
             # input, not a property of the profile: once the directory exists it records
             # where the data came from, and every other `describe()` consumer — `up`,
@@ -864,17 +919,31 @@ def config_cmd(session: _Session, ref: str | None, as_json: bool):
                 f"  seed {configwrite.render_seed(profile.seed, profile.config_dir)}"
                 f" · port {profile.port} · {profile.profile_dir}"
             ),
-            *(f"  {arg}" for arg in profile.argv),
+            # Every line of the command, each annotated with where it came from. A flag a
+            # user wrote can legitimately not be here — a later layer replaced it, or a
+            # layer dropped it — and this listing is the only place that difference is
+            # visible, so it says which layer supplied each switch and which layers it
+            # outranked to get there. [LAW:no-silent-failure]
+            #
+            # `notes` is keyed by the flag text because the report holds the same expanded
+            # strings `argv` was built from; a line crom frames rather than composes — the
+            # binary, `--user-data-dir`, `--remote-debugging-port` — is simply not in it and
+            # prints bare, with no branch asking which kind of line this is.
+            # [LAW:dataflow-not-control-flow]
+            *(f"  {arg.ljust(width)}  {notes.get(arg, '')}".rstrip() for arg in profile.argv),
             # A dropped switch is absent from argv and indistinguishable there from one
             # nobody ever set, so the only reader who could tell them apart is the one who
             # wrote `drop_flags` — and they are the reader least in need of being told.
-            # Named here, the removal is something the listing shows rather than something
-            # the reader has to already know. [LAW:no-silent-failure]
+            # Named here with the layer it would have come from, the removal is something
+            # the listing shows rather than something the reader has to already know.
             #
             # A generator over a tuple that is usually empty, so the line appears when
             # there is one to print without a branch deciding whether this section exists.
-            # [LAW:dataflow-not-control-flow]
-            *(f"  (dropped {switch})" for switch in profile.dropped),
+            *(
+                f"  (dropped {removal.what.question}, "
+                f"{_resolution(removal.what, named=False)} — removed by {removal.by})"
+                for removal in profile.provenance.dropped
+            ),
         ]
 
     _emit(as_json, payload, lines)

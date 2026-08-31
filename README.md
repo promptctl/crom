@@ -160,6 +160,7 @@ crom add NAME [--seed SEED]   declare a profile in the config governing this dir
 crom rm REF                   stop it if running, undeclare it, release its port, delete its data
 crom init [NS] [--seed SEED]  write a .crom.toml here
 crom config [REF]             which config is in effect, and the exact Chrome command line
+                              — each flag attributed to the layer that supplied it
 crom port [REF]               print the port
 crom env [REF]                print shell exports
 crom mcp [REF]                write .mcp.json
