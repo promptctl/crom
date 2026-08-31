@@ -172,6 +172,67 @@ class Flag:
         return self.switch if self.value is None else f"{self.switch}={self.value}"
 
 
+@dataclass(frozen=True)
+class Layer:
+    """One stanza's whole say over the launch flags: what it sets, and what it drops.
+
+    A stanza says these in two TOML keys — `flags` and `drop_flags` — but they are one
+    fact: what this layer does to what it inherits. Carrying them as one value is what
+    makes it impossible to compose a layer's flags while forgetting its drops. Two
+    fields on `ProfileSpec` would leave every present and future composition site to
+    remember the pairing by convention, and a site that forgot would silently launch
+    with a switch the config removed. [LAW:types-are-the-program]
+
+    `sets` is ordered because position-of-first-introduction decides where a switch
+    lands in argv. `drops` is a set because a drop names a switch and says nothing else
+    about it, so neither order nor multiplicity could carry meaning.
+
+    The two are disjoint, and this constructor is what makes that true rather than
+    `config.parse_layer` being careful: a layer that both sets and drops one switch has
+    said two things where only one can mean anything, and refusing it here means nothing
+    downstream has to decide which wins. Enforced in `__post_init__` for the reason
+    `ProfileSpec` gives above — a convention every future call site must rediscover
+    becomes a property of the type. [LAW:types-are-the-program]
+
+    The rule is stated once, here. `parse_layer` catches this and prepends the file and
+    stanza it was reading, because the location is what *it* knows and the rule is what
+    *this* knows; a second copy of the check upstream, written to produce a better
+    message, is the copy that would drift. [LAW:single-enforcer]
+    """
+
+    sets: tuple[Flag, ...] = ()
+    drops: frozenset[str] = frozenset()
+
+    def __post_init__(self) -> None:
+        both = sorted(self.drops & {flag.switch for flag in self.sets})
+        if both:
+            raise CromError(
+                f"both sets and drops {', '.join(both)}.\n"
+                f"A drop removes a switch this stanza inherits, and setting it here "
+                f"already replaces whatever was inherited — so one of the two cannot mean "
+                f"anything. Keep the flag to override the switch, or the drop to remove it."
+            )
+
+
+@dataclass(frozen=True)
+class Composed:
+    """What every layer agreed on: the flags to launch with, and the switches removed.
+
+    `dropped` cannot be derived from `flags` — a switch no layer ever set and a switch a
+    layer removed are both simply absent from it. The difference exists only while the
+    fold is running, which is why `flags.compose` reports it here rather than leaving
+    `crom config` to reconstruct it from the layers a second time.
+    [LAW:one-source-of-truth]
+
+    Only switches a drop actually removed appear. Dropping a switch nothing supplies is
+    allowed and changes nothing, so reporting it as dropped would tell the reader a
+    layer below had set something it never did.
+    """
+
+    flags: tuple[Flag, ...] = ()
+    dropped: tuple[str, ...] = ()
+
+
 # --- declarations ------------------------------------------------------------------
 
 
@@ -215,11 +276,12 @@ class ProfileSpec:
     """
 
     name: str
-    # `Flag`, not `str`: the stanza's flags have been through `config.parse_flags`, which
-    # is where a list naming one switch twice is refused, and carrying the parsed form is
-    # what lets `flags.compose` see that this profile's `--disable-blink-features` and
-    # `[defaults]`'s are two answers to one question. [LAW:parse-dont-validate]
-    flags: tuple[Flag, ...] = ()
+    # A `Layer`, not a list of strings: the stanza's flags have been through
+    # `config.parse_layer`, which is where a list naming one switch twice is refused, and
+    # carrying the parsed form is what lets `flags.compose` see that this profile's
+    # `--disable-blink-features` and `[defaults]`'s are two answers to one question.
+    # [LAW:parse-dont-validate]
+    flags: Layer = Layer()
     # Which Chrome features this stanza turns on or off. A table rather than two lists,
     # because a feature is in one of three states — on, off, or unmentioned — and two
     # lists would let one name appear in both. `flags.features` folds this across layers
@@ -260,7 +322,7 @@ class Scope:
     source: Path | None
     profiles_root: Path
     chrome_binary: Path
-    default_flags: tuple[Flag, ...] = ()
+    default_flags: Layer = Layer()
     default_features: dict[str, bool] = field(default_factory=dict)
     default_env: dict[str, str] = field(default_factory=dict)
     # `DEFAULT_SEED`, not a literal — this dataclass default is the sixth answer to the
@@ -301,6 +363,12 @@ class ResolvedProfile:
     env: dict[str, str]
     seed: Seed
     source: Path | None
+    # The switches a `drop_flags` entry removed from what this profile inherited. Absent
+    # from `argv` by construction, and unrecoverable from it — which is the whole reason
+    # it is carried: `crom config` can report a flag as dropped instead of leaving the
+    # reader to notice that something they wrote in `[defaults]` is not there.
+    # [LAW:no-silent-failure]
+    dropped: tuple[str, ...] = ()
 
     @property
     def cdp_url(self) -> str:

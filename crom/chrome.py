@@ -52,7 +52,7 @@ SHUTDOWN_TIMEOUT_SECONDS = 5.0
 # it backwards: it defended a path nobody has at the price of a restart everybody gets.
 #
 # The leading greedy `.*` still forces the *last* `--user-data-dir=`, so a configured flag
-# whose value contains that literal text cannot shadow the real one (`parse_flags`
+# whose value contains that literal text cannot shadow the real one (`parse_layer`
 # inspects only the switch name before `=`, so such a value is not rejected).
 _USER_DATA_DIR_RE = re.compile(r".*--user-data-dir=(.+?)(?=\s+--[A-Za-z0-9-]+|\s*\Z)")
 

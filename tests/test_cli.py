@@ -412,6 +412,39 @@ class CliTest(unittest.TestCase):
 
         self.assertIn("Already declared myproj/ci", output)
 
+    def test_restating_the_flags_of_a_profile_that_drops_one_is_the_same_request(self):
+        """The request cannot express `drop_flags`, so it is silent about drops rather
+        than asserting there are none. Resolved beside the declaration instead of on top
+        of it, the two sides were composed under different drop policies: a restatement
+        identical to the file exited 4 reporting a `[defaults]` flag the profile drops and
+        the user never typed — a difference the comparison invented, in a value the user
+        never spoke."""
+        self.crom("init")
+        (self.project / ".crom.toml").write_text(
+            'namespace = "myproj"\n'
+            '[defaults]\nflags = ["--b=2"]\n'
+            '[profiles.ci]\nflags = ["--a=1"]\ndrop_flags = ["--b"]\n'
+        )
+
+        output = self.crom("add", "ci", "--flag", "--a=1")
+
+        self.assertIn("Already declared myproj/ci", output)
+
+    def test_asking_for_a_switch_the_profile_drops_is_still_refused(self):
+        """The fix must not launder a real disagreement into convergence: the file says
+        remove this switch and the command says set it, which only the author can settle.
+        Refused with what each side actually says, rather than a fabricated value."""
+        self.crom("init")
+        (self.project / ".crom.toml").write_text(
+            'namespace = "myproj"\n'
+            '[defaults]\nflags = ["--b=2"]\n'
+            '[profiles.ci]\nflags = ["--a=1"]\ndrop_flags = ["--b"]\n'
+        )
+
+        output = self.crom("add", "ci", "--flag", "--b=9", expect=4)
+
+        self.assertIn("--b=9", output)
+
     def test_adding_a_profile_again_with_its_flags_reordered_is_the_same_request(self):
         """Order is not a fact about the profile, so restating the same flags in another
         order is not a change to it."""
@@ -867,6 +900,22 @@ class CliTest(unittest.TestCase):
         argv = payload["resolved"]["argv"]
         self.assertEqual(argv[-1], f"--remote-debugging-port={payload['resolved']['port']}")
         self.assertIn("--no-first-run", argv)
+
+    def test_config_names_a_dropped_switch_rather_than_leaving_it_missing(self):
+        """A dropped switch is absent from argv and indistinguishable there from one
+        nobody ever set. `crom config` is where a reader goes to find out what crom is
+        doing, so the removal has to be something the listing shows."""
+        self.crom("init")
+        # The template ends inside `[profiles.default]`, so this lands in that stanza.
+        path = self.project / ".crom.toml"
+        path.write_text(path.read_text() + 'drop_flags = ["--disable-sync"]\n')
+
+        human = self.crom("config", "default")
+        payload = json.loads(self.crom("config", "default", "--json"))
+
+        self.assertNotIn("--disable-sync", payload["resolved"]["argv"])
+        self.assertEqual(payload["resolved"]["dropped"], ["--disable-sync"])
+        self.assertIn("(dropped --disable-sync)", human)
 
     def test_list_json_describes_every_addressable_profile(self):
         self.crom("init")

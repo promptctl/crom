@@ -17,6 +17,7 @@ from crom import config, configwrite, locking
 from crom.model import (
     DEFAULT_SEED,
     CromError,
+    Layer,
     NotFound,
     ProfileSpec,
     SeedChrome,
@@ -258,6 +259,18 @@ class HeaderInvariantTest(unittest.TestCase):
         )
         scope = config.parse(self.target.read_text(), self.target)
         self.assertEqual(scope.profiles["ci"].features, {"SharedStorageAPI": False})
+
+    def test_declared_drop_flags_survive_the_write(self):
+        """Same promise as the features table: a `Layer` carries drops, so a writer that
+        rendered only its flags would silently declare a profile that runs with a switch
+        the spec removed."""
+        configwrite.ensure_profile(
+            self.target,
+            ProfileSpec(name="ci", flags=Layer(drops=frozenset({"--disable-sync"}))),
+            header='namespace = "myapp"\n',
+        )
+        scope = config.parse(self.target.read_text(), self.target)
+        self.assertEqual(scope.profiles["ci"].flags.drops, frozenset({"--disable-sync"}))
 
 
 
