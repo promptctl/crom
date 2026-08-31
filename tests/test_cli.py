@@ -952,6 +952,7 @@ class CliTest(unittest.TestCase):
             [
                 {
                     "question": "--window-size",
+                    "value": "--window-size=1280,800",
                     "from": "[profiles.default]",
                     "over": [{"layer": "[defaults]", "value": "--window-size=800,600"}],
                 }
@@ -972,6 +973,60 @@ class CliTest(unittest.TestCase):
         self.assertIn("from crom's launch policy", result.stdout)
         self.assertNotIn("over ", result.stdout)
 
+    def test_config_shows_the_value_a_drop_took_away_not_just_the_switch(self):
+        """A dropped flag is absent from argv, so this line is the only channel carrying
+        what was lost. Naming the switch alone tells a user who wrote
+        `--window-size=800,600` that something of theirs is gone without confirming it was
+        theirs."""
+        self.crom("init")
+        (self.project / ".crom.toml").write_text(
+            'namespace = "myproj"\n\n'
+            "[defaults]\n"
+            'flags = ["--window-size=800,600"]\n\n'
+            "[profiles.default]\n"
+            'drop_flags = ["--window-size"]\n'
+        )
+
+        human = self.crom("config", "default")
+        payload = json.loads(self.crom("config", "default", "--json"))
+
+        self.assertIn(
+            "(dropped --window-size=800,600, from [defaults] — removed by [profiles.default])",
+            human,
+        )
+        self.assertEqual(payload["resolved"]["dropped"][0]["value"], "--window-size=800,600")
+
+    def test_config_attributes_one_feature_switch_to_every_layer_that_filled_it(self):
+        """The shape this ticket exists for: one `--disable-features` carrying names from
+        two layers at once, where 'the profile overrode the policy's --disable-features'
+        would be a false sentence about a union. Each name is attributed on its own."""
+        self.crom("init")
+        (self.project / ".crom.toml").write_text(
+            'namespace = "myproj"\n\n'
+            "[defaults]\n"
+            "features = { PictureInPicture = false }\n\n"
+            "[profiles.default]\n"
+        )
+
+        human = self.crom("config", "default")
+        payload = json.loads(self.crom("config", "default", "--json"))
+        (entry,) = [
+            item
+            for item in payload["resolved"]["flags"]
+            if item["flag"].startswith("--disable-features=")
+        ]
+
+        # crom's own policy feature and the project's ride in one switch, each keeping its
+        # own layer — and the human line joins the two clauses rather than picking one.
+        self.assertEqual(
+            [(why["question"], why["from"]) for why in entry["why"]],
+            [("ChromeWhatsNewUI", "crom's launch policy"), ("PictureInPicture", "[defaults]")],
+        )
+        self.assertIn(
+            "ChromeWhatsNewUI from crom's launch policy · PictureInPicture from [defaults]",
+            human,
+        )
+
     def test_config_names_a_dropped_switch_rather_than_leaving_it_missing(self):
         """A dropped switch is absent from argv and indistinguishable there from one
         nobody ever set. `crom config` is where a reader goes to find out what crom is
@@ -991,6 +1046,7 @@ class CliTest(unittest.TestCase):
                 {
                     "by": "[profiles.default]",
                     "question": "--disable-sync",
+                    "value": "--disable-sync",
                     "from": "crom's launch policy",
                     "over": [],
                 }

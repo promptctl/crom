@@ -544,7 +544,7 @@ def parse(text: str, source: Path, *, namespace: str | None = None) -> Scope:
 
     defaults = data.get("defaults", {})
     if not isinstance(defaults, dict):
-        raise CromError(f"{source}: [defaults] must be a table")
+        raise CromError(f"{source}: {DEFAULTS_STANZA} must be a table")
     _reject_unknown(defaults, _DEFAULTS_KEYS, DEFAULTS_STANZA, source)
 
     default_seed = (

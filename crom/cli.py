@@ -829,7 +829,7 @@ def init_cmd(namespace: str | None, seed_text: str | None):
         (
             ("namespace", declared_namespace, namespace),
             (
-                "[defaults].seed",
+                f"{DEFAULTS_STANZA}.seed",
                 str(declared_seed),
                 None if stated_seed is None else configwrite.render_seed(stated_seed, base),
             ),
@@ -940,7 +940,12 @@ def config_cmd(session: _Session, ref: str | None, as_json: bool):
             # A generator over a tuple that is usually empty, so the line appears when
             # there is one to print without a branch deciding whether this section exists.
             *(
-                f"  (dropped {removal.what.question}, "
+                # The whole flag as its subject, not the bare switch — the same rule the
+                # emitted lines above follow, so the two shapes are parallel rather than
+                # this one being a reduced version of them. A switch set once and then
+                # dropped has no other channel carrying the value that was lost: the flag
+                # is absent from argv, which is the whole reason this line exists.
+                f"  (dropped {removal.what.stands.value}, "
                 f"{_resolution(removal.what, named=False)} — removed by {removal.by})"
                 for removal in profile.provenance.dropped
             ),

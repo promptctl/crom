@@ -299,8 +299,18 @@ class Resolution:
         return self.answers[:-1]
 
     def describe(self) -> dict:
+        """The whole resolution, including the answer that stands.
+
+        `value` is redundant for an emitted plain flag, whose flag *is* the standing
+        answer, and that is the point: it used to be omitted on the strength of a sibling
+        channel carrying it, which is true of `Emitted` and false of `Removed` — so a
+        switch set once and then dropped reported neither the value that was lost nor
+        anywhere to find it. A rendering that is complete only when read from one of its
+        two directions is a map that is true in one direction. [FRAMING:representation]
+        """
         return {
             "question": self.question,
+            "value": self.stands.value,
             "from": self.stands.layer,
             "over": [{"layer": a.layer, "value": a.value} for a in self.replaced],
         }
