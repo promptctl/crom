@@ -17,6 +17,7 @@ files and a reset would destroy the good declarations along with the bad line.
 import os
 import tomllib
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 from . import configwrite, flags, registry, report
@@ -31,6 +32,7 @@ from .model import (
     Conflict,
     CromError,
     Flag,
+    Layer,
     NotFound,
     ProfileSpec,
     Scope,
@@ -60,42 +62,79 @@ from .paths import (
 _STANZA = "{where}"
 _OWNED_BY_CROM = "crom owns it (it defines the profile's data directory and CDP port)"
 
+# What naming a feature switch in each list would actually do — the halves of the answer
+# that differ by which list it was named in, kept beside each other so the two readings
+# of one switch stay visibly one decision.
+_REPLACED_NOT_MERGED = (
+    "a flag naming it would replace that composition rather than join it, which is the "
+    "exact defect `features` exists to fix"
+)
+# Says only what is true. It first claimed a drop "would discard every layer's features at
+# once" — an effect that cannot occur: the features layer is composed last, a layer's drops
+# reach only what earlier layers left behind, so the drop would be a silent no-op. A
+# refusal message whose whole job is explaining a mistake is the last place to make one.
+# [FRAMING:representation]
+_NO_LAYER_SUPPLIES_IT = (
+    "no layer supplies it for a drop to remove, so dropping it would quietly do nothing"
+)
 
-def _owned_by_features(state: bool) -> str:
-    """Why a feature switch is refused, in the polarity of the switch that was written.
 
-    Named back in the vocabulary the author was reaching for: someone who typed
-    `--disable-features=X` wants X off, and `X = false` is how this config says that. The
-    switch itself cannot be honoured as written, because crom folds every layer's features
-    into one occurrence and a raw switch would be replaced rather than merged — which is
-    the exact defect the `features` table exists to fix, so accepting the switch quietly
-    would reintroduce it. [LAW:no-silent-failure]
+def _owned_by_features(*, state: bool, consequence: str) -> str:
+    """Why a feature switch is refused, and the `features` entry that says it instead.
+
+    `state` is the polarity to advise, which is not always the polarity of the switch:
+    someone who *sets* `--disable-features=X` wants X off (`X = false`), while someone who
+    *drops* `--disable-features` wants to stop X being turned off (`X = true`). One
+    function, two call sites, so the advice cannot drift from the fact that produced it —
+    and the switch a reader names is never quietly answered in the wrong polarity.
+    [LAW:no-silent-failure]
     """
     return (
-        f"crom composes that switch from `features` tables so Chrome is given it exactly "
-        f"once, and a flag naming it would be replaced rather than merged.\n"
+        f"crom composes that switch from every layer's `features` table so Chrome is given "
+        f"it exactly once, and {consequence}.\n"
         f"Say it in {_STANZA}.features instead, one entry per name: "
         f"FeatureName = {str(state).lower()}"
     )
 
 
+@dataclass(frozen=True)
+class Reserved:
+    """Why a switch may not be named, in the two lists that can name it.
+
+    Both halves answer the same question — what to write instead — and they differ only
+    where the alternative differs. Holding them in one record keyed by one switch is what
+    keeps `flags` and `drop_flags` refusing exactly the same set: two tables would have
+    two key sets, free to drift the first time a switch is added to one of them.
+    [LAW:one-source-of-truth]
+    """
+
+    setting: str
+    dropping: str
+
+
 # Identity switches carry the profile's identity and its CDP contract, and
 # `chrome.find_pids` matches on --user-data-dir to decide what is running; a config that
-# set one would make crom's map of reality wrong. The feature switches are reserved for a
-# different reason and get a different answer — see `_owned_by_features`.
-RESERVED_SWITCHES: dict[str, str] = {
-    "--user-data-dir": _OWNED_BY_CROM,
-    "--remote-debugging-port": _OWNED_BY_CROM,
-    "--remote-debugging-pipe": _OWNED_BY_CROM,
+# set one would make crom's map of reality wrong, and one that dropped it would leave crom
+# with no way to name the profile at all — the same refusal either way. The feature
+# switches are reserved for a different reason and get a different answer — see
+# `_owned_by_features`.
+RESERVED_SWITCHES: dict[str, Reserved] = {
+    **dict.fromkeys(
+        ("--user-data-dir", "--remote-debugging-port", "--remote-debugging-pipe"),
+        Reserved(setting=_OWNED_BY_CROM, dropping=_OWNED_BY_CROM),
+    ),
     **{
-        switch: _owned_by_features(state)
+        switch: Reserved(
+            setting=_owned_by_features(state=state, consequence=_REPLACED_NOT_MERGED),
+            dropping=_owned_by_features(state=not state, consequence=_NO_LAYER_SUPPLIES_IT),
+        )
         for state, switch in flags.FEATURE_SWITCHES.items()
     },
 }
 
 _SCOPE_KEYS = frozenset({"namespace", "chrome_binary", "state_dir", "defaults", "profiles"})
-_DEFAULTS_KEYS = frozenset({"flags", "features", "env", "seed"})
-_PROFILE_KEYS = frozenset({"flags", "features", "env", "seed", "port"})
+_DEFAULTS_KEYS = frozenset({"flags", "drop_flags", "features", "env", "seed"})
+_PROFILE_KEYS = frozenset({"flags", "drop_flags", "features", "env", "seed", "port"})
 
 
 # --- discovery ---------------------------------------------------------------------
@@ -136,8 +175,13 @@ def _reject_unknown(table: dict, allowed: frozenset[str], where: str, source: Pa
         )
 
 
-def parse_flags(raw, where: str, source: Path) -> tuple[Flag, ...]:
+def parse_layer(raw_flags, raw_drops, where: str, source: Path) -> Layer:
     """The border for everything a config — or `crom add --flag` — says about flags.
+
+    One border for both keys, because `flags` and `drop_flags` are one fact about the
+    stanza and a `Layer` is that fact. The two are checked together here rather than in
+    two functions a caller pairs up, so the disjointness `Layer` promises has a place to
+    be established. [LAW:parse-dont-validate]
 
     Returns parsed flags rather than the strings that came in, so `flags.compose` and
     `configwrite` both work from the switch/value split instead of each re-deriving it.
@@ -149,18 +193,56 @@ def parse_flags(raw, where: str, source: Path) -> tuple[Flag, ...]:
     duplicate and a reserved switch, and the duplicate message would tell the user to
     write `--user-data-dir=/a,/b` — advice that fails again on the next load, because no
     occurrence of a reserved switch is allowed however it is spelled. A diagnostic whose
-    remedy does not work is worse than none. [LAW:no-silent-failure]
+    remedy does not work is worse than none. [LAW:no-silent-failure] The same ordering
+    holds for `drop_flags`, where the reserved answer outranks "that entry carries a
+    value" for the same reason: removing the value leaves the entry still refused.
     """
-    if not isinstance(raw, list) or not all(isinstance(f, str) for f in raw):
+    if not isinstance(raw_flags, list) or not all(isinstance(f, str) for f in raw_flags):
         raise CromError(f"{source}: {where}.flags must be a list of strings")
-    for flag in (Flag.parse(text) for text in raw):
-        reason = RESERVED_SWITCHES.get(flag.switch)
-        if reason is not None:
+    if not isinstance(raw_drops, list) or not all(isinstance(f, str) for f in raw_drops):
+        raise CromError(
+            f"{source}: {where}.drop_flags must be a list of switch names, "
+            f'e.g. ["--disable-sync"]'
+        )
+    _reject_reserved(raw_flags, "may not set", lambda r: r.setting, where, source, "flags")
+    _reject_reserved(raw_drops, "may not drop", lambda r: r.dropping, where, source, "drop_flags")
+
+    sets = flags.layer(raw_flags, f"{source}: {where}.flags")
+    drops = flags.drops(raw_drops, f"{source}: {where}.drop_flags")
+    try:
+        return Layer(sets=sets, drops=drops)
+    except CromError as fault:
+        # `Layer` owns the rule; this owns the location. Re-raised with strictly more
+        # information than it caught, never less — the alternative was a second copy of
+        # the check here, written only to reach the file and stanza names, and a rule
+        # spelled in two places is one that eventually disagrees with itself.
+        # [LAW:one-source-of-truth]
+        raise CromError(f"{source}: {where} {fault}") from fault
+
+
+def _reject_reserved(
+    texts: list[str],
+    verb: str,
+    reason_for: Callable[[Reserved], str],
+    where: str,
+    source: Path,
+    key: str,
+) -> None:
+    """Refuse any entry naming a switch crom reserves, in the vocabulary of the list it is in.
+
+    [LAW:single-enforcer] `flags` and `drop_flags` are checked by this one function
+    against the one table, so a switch can never be reserved in one list and accepted in
+    the other. What differs between them is only how the refusal reads, which arrives as
+    values — the verb and which half of the `Reserved` record to quote — rather than as a
+    branch on which list is being checked. [LAW:dataflow-not-control-flow]
+    """
+    for flag in (Flag.parse(text) for text in texts):
+        reserved = RESERVED_SWITCHES.get(flag.switch)
+        if reserved is not None:
             raise CromError(
-                f"{source}: {where}.flags may not set {flag.switch} — "
-                + reason.replace(_STANZA, where)
+                f"{source}: {where}.{key} {verb} {flag.switch} — "
+                + reason_for(reserved).replace(_STANZA, where)
             )
-    return flags.layer(raw, f"{source}: {where}.flags")
 
 
 # What a feature name may not be, and how to say so — the four ways a name can fail to
@@ -478,7 +560,7 @@ def parse(text: str, source: Path, *, namespace: str | None = None) -> Scope:
         validate_name("profile name", name)
         profiles[name] = ProfileSpec(
             name=name,
-            flags=parse_flags(raw.get("flags", []), where, source),
+            flags=parse_layer(raw.get("flags", []), raw.get("drop_flags", []), where, source),
             features=parse_features(raw.get("features", {}), where, source),
             env=parse_env(raw.get("env", {}), where, source),
             seed=parse_seed(raw["seed"], where, source, config_dir) if "seed" in raw else None,
@@ -492,7 +574,9 @@ def parse(text: str, source: Path, *, namespace: str | None = None) -> Scope:
         source=source,
         profiles_root=profiles_root,
         chrome_binary=binary,
-        default_flags=parse_flags(defaults.get("flags", []), "[defaults]", source),
+        default_flags=parse_layer(
+            defaults.get("flags", []), defaults.get("drop_flags", []), "[defaults]", source
+        ),
         default_features=parse_features(defaults.get("features", {}), "[defaults]", source),
         default_env=parse_env(defaults.get("env", {}), "[defaults]", source),
         default_seed=default_seed,

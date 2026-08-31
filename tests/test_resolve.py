@@ -9,6 +9,8 @@ from crom import config, flags, registry, resolve
 from crom.model import (
     CromError,
     FailedProfile,
+    Flag,
+    Layer,
     ProfileRef,
     ProfileSpec,
     ResolvedProfile,
@@ -81,32 +83,89 @@ class ArgvTest(unittest.TestCase):
 class ComposeTest(unittest.TestCase):
     """The layering rule itself, without a config file or a port ledger in the way."""
 
-    def flags(self, *texts: str) -> tuple:
-        return flags.layer(texts, "test")
+    def layer(self, *texts: str, drops: tuple[str, ...] = ()) -> Layer:
+        return Layer(flags.layer(texts, "test"), flags.drops(drops, "test"))
 
     def test_a_later_layer_replaces_an_earlier_layers_value_for_the_same_switch(self):
         composed = flags.compose(
-            self.flags("--disable-blink-features=A"), self.flags("--disable-blink-features=B")
+            self.layer("--disable-blink-features=A"), self.layer("--disable-blink-features=B")
         )
-        self.assertEqual(flags.render(composed), ("--disable-blink-features=B",))
+        self.assertEqual(flags.render(composed.flags), ("--disable-blink-features=B",))
 
     def test_a_switch_only_one_layer_names_survives_untouched(self):
-        composed = flags.compose(self.flags("--a"), self.flags("--b=1"))
-        self.assertEqual(flags.render(composed), ("--a", "--b=1"))
+        composed = flags.compose(self.layer("--a"), self.layer("--b=1"))
+        self.assertEqual(flags.render(composed.flags), ("--a", "--b=1"))
 
     def test_an_overridden_switch_keeps_the_position_it_was_introduced_at(self):
         """Order is stable across runs, and overriding one early switch must not shuffle
         the rest of the list out from under a reader of `crom config`."""
-        composed = flags.compose(self.flags("--a=1", "--b"), self.flags("--a=2"))
-        self.assertEqual(flags.render(composed), ("--a=2", "--b"))
+        composed = flags.compose(self.layer("--a=1", "--b"), self.layer("--a=2"))
+        self.assertEqual(flags.render(composed.flags), ("--a=2", "--b"))
 
     def test_a_valueless_switch_is_not_the_same_as_an_empty_value(self):
-        composed = flags.compose(self.flags("--a"), self.flags("--a="))
-        self.assertEqual(flags.render(composed), ("--a=",))
+        composed = flags.compose(self.layer("--a"), self.layer("--a="))
+        self.assertEqual(flags.render(composed.flags), ("--a=",))
 
     def test_only_the_first_equals_sign_splits_switch_from_value(self):
-        composed = flags.compose(self.flags("--host-resolver-rules=MAP a b=1.2.3.4"))
-        self.assertEqual(flags.render(composed), ("--host-resolver-rules=MAP a b=1.2.3.4",))
+        composed = flags.compose(self.layer("--host-resolver-rules=MAP a b=1.2.3.4"))
+        self.assertEqual(flags.render(composed.flags), ("--host-resolver-rules=MAP a b=1.2.3.4",))
+
+    def test_a_layer_may_not_both_set_and_drop_one_switch(self):
+        """The constructor is what makes `Layer`'s disjointness true, not the care of the
+        one parser that happens to build them — a test or a future caller reaching the type
+        directly would otherwise construct the state the docstring says cannot exist."""
+        with self.assertRaisesRegex(CromError, "both sets and drops --headless"):
+            Layer(sets=(Flag("--headless", "new"),), drops=frozenset({"--headless"}))
+
+    def test_a_later_layer_removes_a_switch_it_drops(self):
+        composed = flags.compose(self.layer("--a=1", "--b"), self.layer(drops=("--a",)))
+        self.assertEqual(flags.render(composed.flags), ("--b",))
+
+    def test_a_drop_reaches_every_layer_beneath_it_not_just_the_one_below(self):
+        composed = flags.compose(
+            self.layer("--a=1"), self.layer("--b"), self.layer(drops=("--a",))
+        )
+        self.assertEqual(flags.render(composed.flags), ("--b",))
+
+    def test_a_layer_below_a_drop_can_set_the_switch_again(self):
+        """A drop is not a veto over the layers above it: `profile > defaults > policy`
+        means the *last* layer to speak decides, and dropping is one way to speak."""
+        composed = flags.compose(
+            self.layer("--a=1"), self.layer(drops=("--a",)), self.layer("--a=2")
+        )
+        self.assertEqual(flags.render(composed.flags), ("--a=2",))
+
+    def test_a_switch_set_again_after_a_drop_lands_with_the_layer_that_supplies_it(self):
+        """A drop takes the switch's place in the list with it, so the layer that sets it
+        afterwards is introducing it rather than restoring it. Every other switch keeps
+        its slot — the stability the ordering rule exists for is about the list, not about
+        a switch whose removal the config asked for."""
+        composed = flags.compose(
+            self.layer("--policy=1", "--kept"),
+            self.layer(drops=("--policy",)),
+            self.layer("--policy=2"),
+        )
+        self.assertEqual(flags.render(composed.flags), ("--kept", "--policy=2"))
+
+    def test_dropping_a_switch_no_layer_supplies_changes_nothing(self):
+        composed = flags.compose(self.layer("--a"), self.layer(drops=("--b",)))
+        self.assertEqual(flags.render(composed.flags), ("--a",))
+        self.assertEqual(composed.dropped, ())
+
+    def test_a_drop_that_removed_something_is_reported_as_dropped(self):
+        """The one fact `flags` alone cannot carry: a switch that was removed and a switch
+        nobody ever set are both simply absent from it."""
+        composed = flags.compose(self.layer("--a=1", "--b"), self.layer(drops=("--a", "--b")))
+        self.assertEqual(composed.flags, ())
+        self.assertEqual(composed.dropped, ("--a", "--b"))
+
+    def test_a_switch_dropped_and_set_again_below_is_not_reported_as_dropped(self):
+        """`crom config` prints this beside argv, so it must describe the argv it stands
+        next to: a switch that is right there is not one the reader lost."""
+        composed = flags.compose(
+            self.layer("--a=1"), self.layer(drops=("--a",)), self.layer("--a=2")
+        )
+        self.assertEqual(composed.dropped, ())
 
 
 class FeaturesTest(unittest.TestCase):
@@ -239,6 +298,53 @@ class ResolveTest(LedgerFixture):
         argv = resolve.resolve(ProfileRef("myapp", "dev"), scope).argv
         self.assertIn("--no-default-browser-check=0", argv)
         self.assertNotIn("--no-default-browser-check", argv)
+
+    def test_a_profile_can_drop_a_switch_the_launch_policy_supplies(self):
+        """The case `flags` alone cannot express: leaving sync on. Overriding
+        `--disable-sync` with a value would still hand Chrome the switch, and crom's policy
+        list is crom's, not something a project edits."""
+        scope = self.scope(MINIMAL + '[profiles.dev]\ndrop_flags = ["--disable-sync"]\n')
+        profile = resolve.resolve(ProfileRef("myapp", "dev"), scope)
+
+        self.assertNotIn("--disable-sync", profile.argv)
+        self.assertIn("--no-first-run", profile.argv)
+        self.assertEqual(profile.dropped, ("--disable-sync",))
+
+    def test_a_profile_can_drop_a_flag_it_would_inherit_from_defaults(self):
+        scope = self.scope(
+            MINIMAL
+            + '[defaults]\nflags = ["--headless=new"]\n'
+            + '[profiles.dev]\ndrop_flags = ["--headless"]\n'
+        )
+        profile = resolve.resolve(ProfileRef("myapp", "dev"), scope)
+
+        self.assertNotIn("--headless=new", profile.argv)
+        self.assertEqual(profile.dropped, ("--headless",))
+
+    def test_dropping_a_switch_no_layer_supplies_resolves_without_complaint(self):
+        """A drop states what this profile must not run with, and a layer below dropping
+        the same idea first is a config that agrees with itself, not one that errs."""
+        scope = self.scope(MINIMAL + '[profiles.dev]\ndrop_flags = ["--nothing-sets-this"]\n')
+        profile = resolve.resolve(ProfileRef("myapp", "dev"), scope)
+
+        self.assertEqual(profile.dropped, ())
+
+    def test_a_drop_in_defaults_reaches_the_policy_and_the_profile_can_set_it_back(self):
+        """`profile > defaults > policy` for drops as for everything else: `[defaults]`
+        removes the policy's switch, and a profile below it still gets the last word."""
+        dropped = self.scope(
+            MINIMAL + '[defaults]\ndrop_flags = ["--no-pings"]\n[profiles.dev]\n'
+        )
+        self.assertNotIn("--no-pings", resolve.resolve(ProfileRef("myapp", "dev"), dropped).argv)
+
+        restored = self.scope(
+            MINIMAL
+            + '[defaults]\ndrop_flags = ["--no-pings"]\n'
+            + '[profiles.dev]\nflags = ["--no-pings"]\n'
+        )
+        profile = resolve.resolve(ProfileRef("myapp", "dev"), restored)
+        self.assertIn("--no-pings", profile.argv)
+        self.assertEqual(profile.dropped, ())
 
     def test_every_switch_reaches_chrome_exactly_once(self):
         scope = self.scope(

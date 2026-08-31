@@ -22,14 +22,14 @@ from stat import S_ISREG
 import click
 
 from . import chrome, config, configwrite, flags, mcp, migrate, registry, resolve as resolver, seed
-from .config import discover, load_ambient, load_user_scope, parse_flags, parse_port, parse_seed
+from .config import discover, load_ambient, load_user_scope, parse_layer, parse_port, parse_seed
 from .model import (
     DEFAULT_SEED,
     USER_NAMESPACE,
     Conflict,
     CromError,
     FailedProfile,
-    Flag,
+    Layer,
     NotFound,
     ProfileSpec,
     ResolvedProfile,
@@ -344,8 +344,8 @@ def _scopes_to_list(session: _Session, everything: bool) -> tuple[list[Scope], l
     return scopes, unavailable
 
 
-def _effective_flags(scope: Scope, stanza: tuple[Flag, ...]) -> str:
-    """The flags a profile declaring `stanza` would have, as one comparable fact.
+def _effective_flags(scope: Scope, *stanzas: Layer) -> str:
+    """The flags a profile declaring `stanzas` would have, as one comparable fact.
 
     Through `flags.compose`, the same call `resolve_spec` makes, so a profile's
     `--disable-blink-features` and `[defaults]`'s are seen as two answers to one question
@@ -368,7 +368,9 @@ def _effective_flags(scope: Scope, stanza: tuple[Flag, ...]) -> str:
     that is right there in the file. [FRAMING:representation] the fact has one rendering,
     and it is the one the template promises.
     """
-    return " ".join(sorted(flags.render(flags.compose(scope.default_flags, stanza))))
+    return " ".join(
+        sorted(flags.render(flags.compose(scope.default_flags, *stanzas).flags))
+    )
 
 
 def _reject_restatement(
@@ -422,7 +424,10 @@ def add_cmd(session: _Session, name: str, seed_text: str | None, flag_texts: tup
     where = f"[profiles.{name}]"
     spec = ProfileSpec(
         name=name,
-        flags=parse_flags(list(flag_texts), where, target),
+        # No drops: `crom add` has no `--drop-flag`, so the request it builds cannot state
+        # one. The empty list is the request, not a placeholder — a stanza that drops
+        # nothing is what `--flag` alone asks for.
+        flags=parse_layer(list(flag_texts), [], where, target),
         # None when `--seed` was not given, which `configwrite` writes as no `seed` key
         # and `resolve_spec` reads as `scope.default_seed`. The old `default="fresh"`
         # meant every added profile carried an explicit `seed = "fresh"` nobody had asked
@@ -541,8 +546,30 @@ def add_cmd(session: _Session, name: str, seed_text: str | None, flag_texts: tup
             # one. [LAW:one-source-of-truth]
             (
                 "flags",
+                # Both sides are resolved under the *same* drop policy — the declaration's
+                # — because `--flag` cannot express `drop_flags`, so a request is silent
+                # about drops rather than asserting there are none. Composed beside the
+                # declaration instead, the asked side kept a `[defaults]` switch the
+                # profile drops, and a restatement identical to the file exited 4 citing a
+                # flag the user never typed.
+                #
+                # The drops arrive as their own layer under the request's flags, which is
+                # the layering rule applied to the two speakers: the file's policy governs
+                # the switches the command is silent about, and the command answers for the
+                # ones it names. So asking for a switch the profile drops still differs
+                # from the declaration and is still refused — that is a real disagreement
+                # between the command and the file — while asking for nothing new converges.
+                #
+                # Not composed *on top of* the whole declaration, which would have hidden
+                # the other half of this comparison's job: a request that omits a declared
+                # flag asks for a profile without it, and a superset laid over the
+                # declaration can never differ from it.
                 _effective_flags(scope, declared.flags),
-                _effective_flags(scope, spec.flags) if spec.flags else None,
+                (
+                    _effective_flags(scope, Layer(drops=declared.flags.drops), spec.flags)
+                    if spec.flags.sets
+                    else None
+                ),
             ),
         ),
         f"Edit {target} directly, or `crom rm {profile.ref}` and add it again.",
@@ -820,6 +847,10 @@ def config_cmd(session: _Session, ref: str | None, as_json: bool):
         payload["resolved"] = {
             **profile.describe(running=running, pids=pids),
             "argv": list(profile.argv),
+            # Beside `argv` rather than inside `describe()`, for the reason the seed is:
+            # this is how the profile came to be what it is, which is `crom config`'s
+            # subject, while `up` and `list` report what it is now.
+            "dropped": list(profile.dropped),
             # The seed lives here rather than in `describe()` because it is a create-time
             # input, not a property of the profile: once the directory exists it records
             # where the data came from, and every other `describe()` consumer — `up`,
@@ -834,6 +865,16 @@ def config_cmd(session: _Session, ref: str | None, as_json: bool):
                 f" · port {profile.port} · {profile.profile_dir}"
             ),
             *(f"  {arg}" for arg in profile.argv),
+            # A dropped switch is absent from argv and indistinguishable there from one
+            # nobody ever set, so the only reader who could tell them apart is the one who
+            # wrote `drop_flags` — and they are the reader least in need of being told.
+            # Named here, the removal is something the listing shows rather than something
+            # the reader has to already know. [LAW:no-silent-failure]
+            #
+            # A generator over a tuple that is usually empty, so the line appears when
+            # there is one to print without a branch deciding whether this section exists.
+            # [LAW:dataflow-not-control-flow]
+            *(f"  (dropped {switch})" for switch in profile.dropped),
         ]
 
     _emit(as_json, payload, lines)

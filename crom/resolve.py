@@ -15,6 +15,7 @@ from .model import (
     USER_NAMESPACE,
     CromError,
     FailedProfile,
+    Layer,
     NotFound,
     ProfileEntry,
     ProfileRef,
@@ -277,11 +278,17 @@ def resolve_spec(scope: Scope, spec: ProfileSpec) -> ResolvedProfile:
     # `--disable-features` inside any `flags` list, so those two switches can reach
     # `compose` from nowhere else and land wherever this layer is placed. Last is simply
     # where a reader of `crom config` finds them.
+    #
+    # Only the two config stanzas arrive as layers with drops: crom's policy and the
+    # composed features are flags and nothing else, and a `Layer` around each says so.
+    # A profile dropping a policy switch is the point — that is how a project launches
+    # with sync on without editing crom's own list — while the policy dropping something
+    # beneath it would have nothing to drop.
     composed = flags.compose(
-        LAUNCH_POLICY_FLAGS,
+        Layer(LAUNCH_POLICY_FLAGS),
         scope.default_flags,
         spec.flags,
-        flags.features(LAUNCH_POLICY_FEATURES, scope.default_features, spec.features),
+        Layer(flags.features(LAUNCH_POLICY_FEATURES, scope.default_features, spec.features)),
     )
     raw_env = {**scope.default_env, **spec.env}
 
@@ -295,12 +302,23 @@ def resolve_spec(scope: Scope, spec: ProfileSpec) -> ResolvedProfile:
     # and reporting it only for the profiles that don't override it would make the
     # diagnostic depend on which stanza you were resolving. [LAW:no-silent-failure]
     #
+    # Drops are absent for the same reason features are, and not the one first written
+    # here: it is not that a switch name is the half a variable never lives in — this check
+    # covers the switch half of a `flags` entry, since `render` yields the whole string. It
+    # is that `flags.drops` refuses a `${` in a drop outright, so a drop carries no variable
+    # to be unknown, and a typo that would silently match nothing is caught where it was
+    # written instead. [LAW:parse-dont-validate]
+    #
     # Features are absent from this check because they cannot fail it: `parse_features`
     # refuses a `${` in a feature name outright, so a feature carries no variable to be
     # unknown. That refusal is what keeps `flags.features` folding on the same text Chrome
     # is given, rather than on a pre-expansion spelling of it.
     _reject_unknown_variables(
-        (*flags.render(scope.default_flags), *flags.render(spec.flags), *raw_env.values()),
+        (
+            *flags.render(scope.default_flags.sets),
+            *flags.render(spec.flags.sets),
+            *raw_env.values(),
+        ),
         _variables(ref, profile_dir, scope.config_dir, None),
         where,
     )
@@ -308,7 +326,7 @@ def resolve_spec(scope: Scope, spec: ProfileSpec) -> ResolvedProfile:
     port = registry.port_for(ref, pinned=spec.port, source=scope.source)
 
     variables = _variables(ref, profile_dir, scope.config_dir, port)
-    launch_flags = tuple(_expand(f, variables, where) for f in flags.render(composed))
+    launch_flags = tuple(_expand(f, variables, where) for f in flags.render(composed.flags))
     env = {k: _expand(v, variables, where) for k, v in raw_env.items()}
 
     seed: Seed = spec.seed if spec.seed is not None else scope.default_seed
@@ -322,6 +340,7 @@ def resolve_spec(scope: Scope, spec: ProfileSpec) -> ResolvedProfile:
         env=env,
         seed=seed,
         source=scope.source,
+        dropped=composed.dropped,
     )
 
 

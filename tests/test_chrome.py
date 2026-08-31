@@ -96,7 +96,7 @@ class GroupByUserDataDirTest(unittest.TestCase):
         self.assertEqual(chrome._group_by_user_data_dir("  PID COMMAND\n\n   \n"), {})
 
     def test_a_configured_flag_cannot_spoof_the_user_data_dir(self):
-        """`parse_flags` only inspects the switch name before `=`, so a flag whose
+        """`parse_layer` only inspects the switch name before `=`, so a flag whose
         *value* contains the literal text is accepted — and it lands before crom's own
         switches in argv. Matching the first occurrence captured the decoy."""
         profile_dir = Path("/state/profiles/myapp/dev")
