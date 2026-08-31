@@ -394,6 +394,13 @@ def _resolution(answered: Resolution, *, named: bool) -> str:
 
     `named` because the question is worth printing only where the line does not already
     carry it: an ordinary flag's question *is* the switch printed to its left.
+
+    That comparison spans an expansion — the question is the switch as the file spells it,
+    the flag has been through `resolve._expand` — and it is sound because `flags.layer`
+    refuses a `${` in a switch name, so the two spellings cannot differ. If that border
+    rule is ever relaxed, this reduces an ordinary flag to the feature shape and prints the
+    pre-expansion switch beside its expanded self. [LAW:parse-dont-validate] the border is
+    what makes this safe to read, not care taken here.
     """
     # The value first and the layer last, so one phrasing carries both vocabularies: a
     # replaced flag reads "over --window-size=800,600 from [defaults]" and a replaced

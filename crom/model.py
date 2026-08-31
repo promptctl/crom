@@ -192,9 +192,9 @@ class Layer:
     renderer looks up because only the stanza's own parser knows it. A layer that says
     something must say where it was said: `__post_init__` refuses a non-empty layer with
     no name, so `flags.compose` cannot produce a flag whose origin renders as a blank.
-    [LAW:types-are-the-program] The empty layer needs no name, and has one every caller
-    already writes — `Layer()` is a stanza that says nothing, and nothing is what it
-    contributes to the report.
+    [LAW:types-are-the-program] Only a layer that says something needs a name, which is
+    why the field can carry a default at all: a bare `Layer()` contributes nothing to the
+    report, so there is nothing for a name to label.
 
     `sets` and `drops` are disjoint, and this constructor is what makes that true rather
     than `config.parse_layer` being careful: a layer that both sets and drops one switch
@@ -276,8 +276,11 @@ class Resolution:
     later-wins rule the fold itself runs on — so the report cannot disagree with the
     composition about who won. [LAW:one-source-of-truth]
 
-    Unexpanded: `${CROM_PORT}` is shown as the file spells it, because a user looking for
-    the flag they wrote is looking for the text they typed.
+    Answer values stay unexpanded — `${CROM_PORT}` is shown as the file spells it, because
+    a user looking for the flag they wrote is looking for the text they typed. The question
+    has no such choice to make: `flags.layer` refuses a variable in a switch name and
+    `parse_features` refuses one in a feature name, so a question has only ever one
+    spelling.
     """
 
     question: str
