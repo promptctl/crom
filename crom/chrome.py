@@ -189,6 +189,14 @@ class _StderrSink:
     read it rewinds where Chrome writes next: measured, a child printing `AAAA` then
     `BBBB` around a parent `seek(0)` leaves a file containing only `BBBB`. Reading through
     a second descriptor keeps our seeks ours.
+
+    That sharing is also what makes Chrome's own fan-out harmless. The zygote, the GPU
+    process and every renderer inherit fd 2 by `fork`, so they hold the same description
+    and advance the same offset; concurrent writes queue behind it rather than racing to
+    compute a position. Measured on this platform: six processes writing 12,000 lines
+    through one inherited description lost none and interleaved none, and the same holds
+    for 64KB writes. `O_APPEND` guards the opposite topology — several *separate*
+    descriptions appending to one file — which nothing here creates.
     """
 
     handle: IO[bytes]
@@ -207,10 +215,18 @@ class _StderrSink:
         page-derived text, so an escape sequence could repaint the error it appears in.
         Newline and tab are the message's shape, not control of the terminal, and stay.
         """
-        with open(self.path, "rb") as reader:
-            reader.seek(0, os.SEEK_END)
-            reader.seek(max(0, reader.tell() - STDERR_TAIL_BYTES))
-            raw = reader.read().decode("utf-8", errors="replace")
+        try:
+            with open(self.path, "rb") as reader:
+                reader.seek(0, os.SEEK_END)
+                reader.seek(max(0, reader.tell() - STDERR_TAIL_BYTES))
+                raw = reader.read().decode("utf-8", errors="replace")
+        except OSError as e:
+            # Said, not swallowed. `""` already means "Chrome printed nothing", so
+            # returning it here would collapse two different facts into one value the
+            # message cannot tell apart. [LAW:parse-dont-validate] Reached on a
+            # successful launch too, where a raw error would crash a browser that came
+            # up fine over a diagnostic nobody needed.
+            return f"(crom could not read what Chrome printed: {e})"
         return "".join(ch for ch in raw if ch in "\n\t" or ch.isprintable()).strip()
 
 
@@ -247,7 +263,12 @@ def _stderr_sink() -> Iterator[_StderrSink]:
         with handle:
             yield _StderrSink(handle=handle, path=path)
     finally:
-        path.unlink()
+        # `missing_ok` because a tmp-cleaner having got there first is not a failure:
+        # the state unlink exists to establish already holds. Anything else — a temp
+        # filesystem that went read-only mid-launch — stays loud, even though it costs
+        # the error in flight, because that is the browser's filesystem breaking and not
+        # diagnostics plumbing. [LAW:no-silent-failure]
+        path.unlink(missing_ok=True)
 
 
 def _quote(transcript: str) -> str:

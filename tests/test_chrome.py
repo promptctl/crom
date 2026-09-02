@@ -559,6 +559,19 @@ class StderrCaptureTest(unittest.TestCase):
         self.assertNotIn("\x1b", section)  # the escapes do not
         self.assertNotIn("\x07", section)
 
+    def test_a_sink_that_vanished_is_said_out_loud_and_crashes_nothing(self):
+        """`tail` runs on every launch, so an unreadable sink must not take the launch
+        with it — and must not pass itself off as a silent Chrome either. Those are two
+        facts, and `""` is already spoken for by the second."""
+        profile = self.stub_profile("import sys; sys.stderr.write('lost'); sys.exit(6)")
+        with mock.patch("crom.chrome.open", side_effect=OSError("gone"), create=True):
+            with self.assertRaises(CromError) as caught:
+                chrome.launch(profile)
+
+        message = str(caught.exception)
+        self.assertIn("exited 6 during startup", message)  # the real outcome survives
+        self.assertIn("could not read what Chrome printed", self.quoted(message))
+
     def test_capture_leaves_no_file_behind(self):
         """Capture costs a successful launch what `DEVNULL` did: nothing anyone can find."""
         before = set(Path(tempfile.gettempdir()).glob("crom-chrome-stderr-*"))
