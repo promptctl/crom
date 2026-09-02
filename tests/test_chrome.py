@@ -464,6 +464,62 @@ _CDP_VERSION_DOCUMENT = (
 _FLOOD_STDERR = 'sys.stderr.write("x" * 200000); sys.stderr.flush()'
 
 
+# Trickles one byte at a time, slower than any real server and faster than the socket
+# timeout — the gap a per-`recv` timeout cannot close, since every single read is legal.
+_TRICKLE_FOREVER = '''
+import socket, sys, time
+port = int([a for a in sys.argv if a.startswith("--remote-debugging-port=")][0].split("=")[1])
+server = socket.socket()
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server.bind(("127.0.0.1", port))
+server.listen(5)
+while True:
+    conn, _ = server.accept()
+    conn.recv(4096)
+    try:
+        conn.sendall(b"HTTP/1.1 200 OK\\r\\n\\r\\n")
+        while True:
+            conn.sendall(b"z")
+            time.sleep(0.5)
+    except OSError:
+        pass
+    conn.close()
+'''
+
+# Answers on the CDP port without speaking HTTP at all — the shape of any other service
+# that happens to bind the port. `http.client` cannot parse the status line and raises
+# `BadStatusLine`, which is neither an `OSError` nor a `URLError`.
+_NOT_HTTP = '''
+import socket, sys
+port = int([a for a in sys.argv if a.startswith("--remote-debugging-port=")][0].split("=")[1])
+server = socket.socket()
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server.bind(("127.0.0.1", port))
+server.listen(5)
+while True:
+    conn, _ = server.accept()
+    conn.recv(4096)
+    conn.sendall(b"SSH-2.0-OpenSSH_9.0\\r\\n")
+    conn.close()
+'''
+
+# Puts terminal escapes in the status line's reason phrase, which the stranger chooses
+# just as freely as the body — and which reaches the message down a different arm.
+_ESCAPES_IN_THE_REASON = r'''
+import socket, sys
+port = int([a for a in sys.argv if a.startswith("--remote-debugging-port=")][0].split("=")[1])
+server = socket.socket()
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server.bind(("127.0.0.1", port))
+server.listen(5)
+while True:
+    conn, _ = server.accept()
+    conn.recv(4096)
+    conn.sendall(b"HTTP/1.1 404 \x1b[2J\x1b[1;31mLAUNCH OK\x1b[0m\x07 evil-reason\r\n"
+                 b"Content-Length: 0\r\n\r\n")
+    conn.close()
+'''
+
 # Announces no length and never closes, so a client that reads to the end of the body
 # reads until its own socket timeout instead. Not a `_serving_stub`, because what it does
 # is exactly the thing that stub cannot do: refuse to finish.
@@ -560,6 +616,29 @@ class StderrCaptureTest(unittest.TestCase):
         for pid in chrome.find_pids_for_dir(profile_dir):
             os.kill(pid, signal.SIGKILL)
 
+    def launch_bounded(self, profile: ResolvedProfile, seconds: float = 30.0) -> str:
+        """Run `launch` under a wall clock and return the CromError text it raised.
+
+        The regressions around reading the port do not fail, they hang — a read that never
+        returns takes the whole suite with it and reports nothing, which is the one failure
+        mode that cannot describe itself. On its own joinable thread the bound is
+        enforceable and the failure says which test hit it.
+        """
+        errors: list[str] = []
+
+        def attempt() -> None:
+            try:
+                chrome.launch(profile)
+            except CromError as e:
+                errors.append(str(e))
+
+        worker = threading.Thread(target=attempt, daemon=True)
+        worker.start()
+        worker.join(seconds)
+        self.assertFalse(worker.is_alive(), f"launch did not return within {seconds:g}s")
+        self.assertEqual(len(errors), 1, "the launch had to fail and did not")
+        return errors[0]
+
     def quoted(self, message: str) -> str:
         """What the error attributes to Chrome, isolated from the command echo.
 
@@ -604,7 +683,7 @@ class StderrCaptureTest(unittest.TestCase):
 
         Neither the port probe nor the process lookup is mocked here, and that is the
         whole design of the test: the stub floods stderr *before* it binds the port, so
-        readiness is downstream of surviving the write. Stubbing `_cdp_ready` would cut
+        readiness is downstream of surviving the write. Stubbing `_probe_port` would cut
         exactly the causal link under test — an earlier version of this test did, and it
         passed against a `stderr=PIPE` that deadlocks a real browser.
         """
@@ -662,6 +741,25 @@ class StderrCaptureTest(unittest.TestCase):
         self.assertNotIn("\x1b", message)  # the escapes do not
         self.assertNotIn("\x07", message)
 
+    def test_a_stranger_cannot_smuggle_escapes_through_the_status_line_either(self):
+        """The body is not the only text the stranger writes.
+
+        A non-200 reply reaches the message down its own arm, carrying a reason phrase the
+        stranger chose. Sanitising the body and not the reason leaves the same hole in a
+        second doorway — which is why every arm goes through `_summarise` rather than each
+        remembering. This is the arm that was already forgotten once.
+        """
+        profile = self.stub_profile(_ESCAPES_IN_THE_REASON, port=9311)
+        with mock.patch.object(chrome, "LAUNCH_TIMEOUT_SECONDS", 5.0):
+            with self.assertRaises(CromError) as caught:
+                chrome.launch(profile)
+
+        message = str(caught.exception)
+        self.assertIn("HTTP 404", message)  # the diagnosis survives
+        self.assertIn("evil-reason", message)
+        self.assertNotIn("\x1b", message)  # the escapes do not
+        self.assertNotIn("\x07", message)
+
     def test_a_stranger_serving_a_flood_cannot_become_the_error_message(self):
         """A server holding the port answers with whatever size it likes, and the message
         is headed for a terminal — so what is shown is one bounded line of it."""
@@ -685,26 +783,72 @@ class StderrCaptureTest(unittest.TestCase):
         truncated reply is not a DevTools document and neither was the whole.
         """
         profile = self.stub_profile(_STREAM_FOREVER, port=9306)
-        errors: list[str] = []
-
-        def attempt() -> None:
-            try:
-                chrome.launch(profile)
-            except CromError as e:
-                errors.append(str(e))
-
-        # Run it on a joinable daemon thread rather than inline. The regression here is a
-        # read that never returns, so an inline call would hang the suite with no output —
-        # the one failure mode that cannot report itself. Bounded, it fails and says why.
-        worker = threading.Thread(target=attempt, daemon=True)
         with mock.patch.object(chrome, "LAUNCH_TIMEOUT_SECONDS", 5.0):
-            worker.start()
-            worker.join(30)
+            message = self.launch_bounded(profile)
 
-        never_returned = "launch never returned: the probe read the whole stream"
-        self.assertFalse(worker.is_alive(), never_returned)
-        self.assertEqual(len(errors), 1, "a stranger on the port has to fail the launch")
-        self.assertIn("not as a Chrome DevTools endpoint", errors[0])
+        self.assertIn("not as a Chrome DevTools endpoint", message)
+
+    def test_a_stranger_trickling_bytes_cannot_outlast_the_launch_timeout(self):
+        """The bound a size cap cannot supply, and the reason `_read_reply` holds a clock.
+
+        This server sends one byte every 0.5s, so every individual `recv` completes well
+        inside the 1s socket timeout and nothing ever trips it. Filling the size cap that
+        way would take hours, and `_await_startup` cannot intervene because it checks its
+        deadline *between* probes and this is inside one — so `up` blocks far past the 30s
+        it documents. Only a wall clock inside the read closes that gap.
+        """
+        profile = self.stub_profile(_TRICKLE_FOREVER, port=9307)
+        with mock.patch.object(chrome, "LAUNCH_TIMEOUT_SECONDS", 3.0):
+            # Bounded well under the hours the regression takes, and well over the seconds
+            # the fix takes, so the gap between them is what the assertion reads.
+            message = self.launch_bounded(profile, seconds=30.0)
+
+        self.assertIn("not as a Chrome DevTools endpoint", message)
+
+    def test_a_listener_that_does_not_speak_http_is_a_stranger_not_a_traceback(self):
+        """`BadStatusLine` is neither an `OSError` nor a `URLError`.
+
+        Left uncaught it escapes `launch` as a raw traceback, past the CromError contract
+        the CLI's exit codes rest on — and a service that binds the port without speaking
+        HTTP is not an exotic case here, it is the plainest form of the thing this outcome
+        was added to name.
+        """
+        profile = self.stub_profile(_NOT_HTTP, port=9308)
+        with mock.patch.object(chrome, "LAUNCH_TIMEOUT_SECONDS", 5.0):
+            with self.assertRaises(CromError) as caught:
+                chrome.launch(profile)
+
+        message = str(caught.exception)
+        self.assertIn("not as a Chrome DevTools endpoint", message)
+        self.assertIn("BadStatusLine", message)  # what actually happened, named
+
+    def test_a_chrome_whose_own_flags_inflate_its_reply_is_still_recognised(self):
+        """A configured `--user-agent` lands in `/json/version`, and the document grows.
+
+        Measured against Chrome/152: a 12,000-character agent — an ordinary thing to put
+        in `[defaults]` — makes the document 12,315 bytes. Read through a smaller cap it
+        stops parsing as JSON, and crom fails a launch that worked by calling its own
+        browser a stranger. The size cap has to clear a document the user can inflate.
+        """
+        document = (
+            '{"Browser": "Chrome/152.0.7977.66", "User-Agent": "' + "x" * 12000 + '", '
+            '"webSocketDebuggerUrl": "ws://127.0.0.1/devtools/browser/stub-uuid"}'
+        )
+        self.assertGreater(len(document), 8192)  # the bound this used to be read through
+        profile = self.stub_profile(_serving_stub(document), port=9309)
+        with mock.patch.object(chrome, "LAUNCH_TIMEOUT_SECONDS", 5.0):
+            self.assertTrue(chrome.launch(profile))
+
+    def test_a_stranger_cannot_answer_a_launch_with_a_traceback(self):
+        """Nesting deeper than the JSON decoder will follow raises `RecursionError`, which
+        is not a `ValueError` and so is not caught by the parse's other arms. It fits
+        inside the size cap now that the cap clears an inflated real document."""
+        profile = self.stub_profile(_serving_stub("[" * 20000 + "]" * 20000), port=9310)
+        with mock.patch.object(chrome, "LAUNCH_TIMEOUT_SECONDS", 5.0):
+            with self.assertRaises(CromError) as caught:
+                chrome.launch(profile)
+
+        self.assertIn("not as a Chrome DevTools endpoint", str(caught.exception))
 
     def test_the_quotation_is_bounded_by_the_tail_of_what_was_printed(self):
         """A browser that logged all day is quoted by its ending, not its whole history."""

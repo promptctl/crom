@@ -8,6 +8,7 @@ Everything here takes a `ResolvedProfile`, whose `argv` is already complete, so 
 module never reads a config file or decides a port.
 """
 
+import http.client
 import json
 import os
 import re
@@ -34,12 +35,20 @@ SHUTDOWN_TIMEOUT_SECONDS = 5.0
 # which logged all day is quoted by its ending rather than its whole history.
 STDERR_TAIL_BYTES = 4096
 
-# How much of a reply from the CDP port we are willing to hold. Whatever is listening
-# there may not be Chrome, so the read is bounded against a server that streams forever.
-# The bound has to clear a real CDP version document, because a clipped one no longer
-# parses as JSON and crom would call its own browser a stranger: measured against
-# Chrome/152, that document is 428 bytes, so this leaves nearly twenty times the margin.
-PORT_REPLY_BYTES = 8192
+# How long crom will spend reading whatever answers on the CDP port. This is the bound
+# that matters: `urlopen`'s timeout applies to each `recv`, never to the call, so a
+# listener trickling bytes just under it holds a read open for hours without once
+# tripping it — and `_await_startup` can only check its own deadline between probes.
+PORT_REPLY_SECONDS = 2.0
+
+# How much of that reply to keep — a cap, and worth saying which. A CDP version document
+# is 428 bytes as Chrome ships, but Chrome reflects `--user-agent` into it and that flag
+# is user-configurable through `[defaults]`: measured, a 12,000-character agent makes the
+# document 12,315 bytes. Clipping it stops it parsing as JSON, and crom would then call
+# its own healthy browser a stranger — a false failure on a launch that worked. 64KB is
+# over five times that worst case; a `--user-agent` past roughly that is the documented
+# edge of what crom can recognise, rather than a surprise.
+PORT_REPLY_BYTES = 65536
 
 # One line of an unknown server's reply, long enough to recognise it by and short enough
 # that a minified page cannot become the error message.
@@ -151,22 +160,34 @@ def is_running(profile: ResolvedProfile) -> bool:
     return bool(find_pids(profile))
 
 
-def _printable(raw: bytes) -> str:
-    """Bytes crom does not control, rendered as text a terminal will only ever display.
+def _printable(text: str) -> str:
+    """Text crom did not write, rendered so a terminal will only ever display it.
 
-    One job, done once at each boundary where foreign bytes enter a message: Chrome's
-    stderr and whatever answers on the CDP port. Downstream then holds a printable string
-    by construction rather than by discipline. [LAW:parse-dont-validate]
+    One job, done once wherever foreign text enters a message: Chrome's stderr, and
+    whatever answers on the CDP port. Downstream then holds a printable string by
+    construction rather than by discipline. [LAW:parse-dont-validate]
 
-    Bad UTF-8 is replaced, not raised on — refusing to decode would fail while reporting a
-    failure. Control characters are dropped because these bytes reach a terminal that
-    `DEVNULL` used to shield: Chrome's log lines carry page-derived text and a stranger on
-    the port is by definition unvetted, so an escape sequence could repaint the error it
-    appears in. Newline and tab are the message's shape, not control of the terminal, and
-    stay. [LAW:single-enforcer] the sanitising happens here and nowhere else.
+    Control characters are dropped because this text reaches a terminal that `DEVNULL`
+    used to shield: Chrome's log lines carry page-derived text, and a listener on the port
+    is unvetted by definition, so an escape sequence could repaint the error it appears
+    in. Newline and tab are the message's shape, not control of the terminal, and stay.
+    Callers holding bytes decode with `errors="replace"` on the way in, because refusing
+    to decode would fail while reporting a failure.
+    [LAW:single-enforcer] the sanitising happens here and nowhere else.
     """
-    text = raw.decode("utf-8", errors="replace")
     return "".join(ch for ch in text if ch in "\n\t" or ch.isprintable()).strip()
+
+
+def _summarise(text: str) -> str:
+    """One short printable line of something a stranger on the port chose to say.
+
+    Every arm of `_probe_port` that quotes its stranger comes through here — the reply
+    body, an HTTP reason phrase, the offending line inside an `HTTPException`. All three
+    are chosen by whatever holds the port and all three land in an error headed for a
+    terminal, so they are one job rather than three call sites that each have to remember.
+    An arm added later reaches the sanitising by using this; one was already forgotten.
+    """
+    return textwrap.shorten(_printable(text), PORT_REPLY_SUMMARY_CHARS, placeholder=" …")
 
 
 def _lsof_hint(port: int) -> str:
@@ -231,8 +252,35 @@ def _advertises_devtools(reply: bytes) -> bool:
     """
     try:
         return str(json.loads(reply)["webSocketDebuggerUrl"]).startswith("ws://")
-    except (ValueError, TypeError, KeyError):
+    except (ValueError, TypeError, KeyError, RecursionError):
+        # `RecursionError` because `PORT_REPLY_BYTES` is large enough to hold JSON nested
+        # deeper than the decoder will follow — measured, that starts around 32KB of
+        # `[[[…`, which only a stranger would send and which is still just "not a DevTools
+        # document". It is not a `ValueError`, so without it a hostile listener answers a
+        # launch with a traceback instead of a CromError.
         return False
+
+
+def _read_reply(resp: http.client.HTTPResponse) -> bytes:
+    """Whatever the port is willing to say, within a bounded time and a bounded size.
+
+    Three endings — enough bytes, end of the reply, or the clock — and the clock is the
+    one that had to exist. `resp.read(n)` blocks until it holds all n bytes, and the
+    socket timeout bounds each `recv` rather than the call, so a listener trickling one
+    byte just under that timeout keeps every individual read legal while the total runs to
+    hours. `_await_startup` cannot see it, because it checks its deadline between probes
+    and this is inside one. Bounding bytes never bounded that; only a clock does.
+    [LAW:no-ambient-temporal-coupling] how long this may take is owned here rather than
+    left to whatever is on the far end.
+    """
+    deadline = time.monotonic() + PORT_REPLY_SECONDS
+    reply = b""
+    while len(reply) < PORT_REPLY_BYTES and time.monotonic() < deadline:
+        chunk = resp.read1(PORT_REPLY_BYTES - len(reply))
+        if not chunk:
+            break
+        reply += chunk
+    return reply
 
 
 def _probe_port(port: int) -> _PortAnswer:
@@ -263,19 +311,25 @@ def _probe_port(port: int) -> _PortAnswer:
     """
     try:
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=1) as resp:
-            reply = resp.read(PORT_REPLY_BYTES)
+            reply = _read_reply(resp)
     except urllib.error.HTTPError as e:
-        return _AnsweredByStranger(f"HTTP {e.code} {e.reason}")
+        return _AnsweredByStranger(f"HTTP {e.code} {_summarise(str(e.reason))}")
     except (urllib.error.URLError, OSError):
         # A half-delivered response reads the same as nothing here, and calling it silence
         # costs only another 100ms round. Reached far more often by the ordinary case:
         # the port is refusing connections because Chrome has not opened it yet.
         return _Silent()
+    except http.client.HTTPException as e:
+        # Something accepted the connection and then said what HTTP could not parse, which
+        # is a stranger rather than silence — and it is how a service that does not speak
+        # HTTP at all shows up, the very case this outcome exists for. Below the `OSError`
+        # arm deliberately: `RemoteDisconnected` is both a `ConnectionResetError` and a
+        # `BadStatusLine`, and a connection that closed without saying anything is silence.
+        return _AnsweredByStranger(_summarise(f"{type(e).__name__}: {e}"))
 
     if _advertises_devtools(reply):
         return _Answered()
-    summary = textwrap.shorten(_printable(reply), PORT_REPLY_SUMMARY_CHARS, placeholder=" …")
-    return _AnsweredByStranger(summary or "an empty reply")
+    return _AnsweredByStranger(_summarise(reply.decode("utf-8", "replace")) or "an empty reply")
 
 
 def _require_port_available(profile: ResolvedProfile) -> None:
@@ -337,7 +391,7 @@ class _StderrSink:
             with open(self.path, "rb") as reader:
                 reader.seek(0, os.SEEK_END)
                 reader.seek(max(0, reader.tell() - STDERR_TAIL_BYTES))
-                raw = reader.read()
+                raw = reader.read().decode("utf-8", "replace")
         except OSError as e:
             # Said, not swallowed. `""` already means "Chrome printed nothing", so
             # returning it here would collapse two different facts into one value the
