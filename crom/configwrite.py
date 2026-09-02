@@ -55,9 +55,15 @@ namespace = "{namespace}"
 # A flag here replaces crom's own setting for the same switch, and a profile's replaces
 # this one's — each switch reaches Chrome exactly once. To remove a switch a layer below
 # set rather than replace it, name it in `drop_flags = ["--disable-sync"]`.
+#
+# Chrome features are not flags here: write `features = {{ SomeFeature = false }}`, and
+# crom folds every layer's table into one --enable-features and one --disable-features.
+#
 # Available in flags and env values:
 # ${{CROM_PROFILE_DIR}}, ${{CROM_CONFIG_DIR}}, ${{CROM_PORT}}, ${{CROM_NAMESPACE}},
 # ${{CROM_PROFILE}}.
+#
+# `crom config --help` is the full reference for every key a config may set.
 [defaults]
 seed = {seed}
 flags = []

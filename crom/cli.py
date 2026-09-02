@@ -211,6 +211,18 @@ def main(ctx):
     A new profile starts as a copy of your real Chrome profile, so it has your
     logins and extensions. `--seed fresh` on `init` or `add` gets an empty one.
 
+    \b
+    The config file (.crom.toml, written by `crom init`)
+      top level          namespace (required), chrome_binary, state_dir
+      [defaults]         flags, drop_flags, features, env, seed
+      [profiles.<name>]  flags, drop_flags, features, env, seed, port
+
+    A profile's answer beats `[defaults]`, and both beat crom's own launch
+    policy — for every key, and for flags one Chrome switch at a time, so each
+    switch reaches Chrome exactly once. `crom config <profile>` shows the
+    resolved command with the layer behind each flag; `crom config --help` is
+    the reference for what every key accepts.
+
     crom does the setup step for you rather than naming it: a profile you refer
     to but never declared is declared, and a config file crom cannot read is
     reset to the default with your original kept beside it as `<name>.broken`.
@@ -860,7 +872,100 @@ def init_cmd(namespace: str | None, seed_text: str | None):
 @click.option("--json", "as_json", is_flag=True)
 @click.pass_obj
 def config_cmd(session: _Session, ref: str | None, as_json: bool):
-    """Show which config is in effect, and how a profile resolves under it."""
+    """Show the config in effect, and how a profile resolves flag by flag.
+
+    With a REF, every flag of the launch command is printed with the layer that
+    supplied it and whatever it outranked — the layering rule below, on your own
+    config. This help is the reference for writing that config.
+
+    \b
+    Where a key may appear
+      top level          namespace (required), chrome_binary, state_dir
+      [defaults]         flags, drop_flags, features, env, seed
+      [profiles.<name>]  flags, drop_flags, features, env, seed, port
+
+    Every key resolves the same way: a profile's answer beats `[defaults]`, and
+    both beat crom's own launch policy. Flags resolve by switch name rather than
+    by concatenation, so each Chrome switch is emitted exactly once — crom
+    composes the command instead of handing Chrome two answers to the same
+    question.
+
+    \b
+    What each key accepts
+      namespace      this project's name — lowercase letters, digits, and . _ -
+                     Required in a project config, and never `user`. Your own
+                     config in ~/.config/crom is the `user` namespace and must
+                     not set the key at all.
+      chrome_binary  path to the Chrome to launch. Default: the one crom finds.
+      state_dir      where this namespace's profile directories live.
+                     Default: crom's own state directory.
+      flags          Chrome switches as you would type them on a command line:
+                     ["--window-size=1280,800", "--no-pings"]. A later layer's
+                     entry replaces an earlier layer's for the same switch.
+      drop_flags     switch names alone, never their values: to drop an
+                     inherited --window-size=1280,800, write ["--window-size"].
+                     Removes a switch a layer below supplied, crom's launch
+                     policy included — ["--disable-sync"] launches Chrome with
+                     sync left on. This is the only way to say *less* than a
+                     lower layer did; a `flags` entry can only replace it.
+      features       Chrome feature name -> true/false. The layers union rather
+                     than replace, later layers winning per name, and the whole
+                     table is emitted as one --enable-features and one
+                     --disable-features. There is deliberately no
+                     `drop_features`: a table is already per name, so a layer
+                     can say the opposite without erasing anything.
+      env            string values put into Chrome's environment. Merged one
+                     variable at a time, so a profile adding a variable keeps
+                     the rest of `[defaults]` rather than replacing the table.
+      seed           where a profile's data comes from the first time crom
+                     creates it:
+    \b
+                       default                your default Chrome profile
+                       chrome:<Profile Name>  another profile inside your Chrome
+                       fresh                  an empty profile
+                       ./dir  /dir  ~/dir     a directory you keep yourself
+    \b
+      port           pin this profile's CDP port, 1..65535. Left out, crom
+                     assigns one and remembers it.
+
+    Paths in `chrome_binary`, `state_dir` and a `seed` resolve against the
+    directory the config file is in, so a committed config means the same thing
+    on every machine.
+
+    \b
+    Switches crom owns, and what to write instead
+      --user-data-dir, --remote-debugging-port, --remote-debugging-pipe
+        The profile's identity and its CDP contract, which crom sets. Naming one
+        in `flags` or `drop_flags` is refused.
+      --enable-features, --disable-features
+        Write `features` entries instead. crom folds every layer's table into
+        these two switches, so a `flags` list naming either is refused.
+
+    Inside `flags` values and `env` values, ${CROM_NAMESPACE}, ${CROM_PROFILE},
+    ${CROM_PORT}, ${CROM_PROFILE_DIR} and ${CROM_CONFIG_DIR} expand. A switch
+    *name* may not interpolate — crom resolves switches by the spelling your
+    file uses, and expands afterwards — and feature names are literal.
+
+    \b
+    A config using all of it
+      namespace = "myapp"
+    \b
+      [defaults]
+      seed = "default"
+      flags = ["--window-size=1280,800", "--disable-blink-features=PIP"]
+      features = { SharedStorageAPI = false }
+      env = { TZ = "UTC" }
+    \b
+      [profiles.dev]                            # inherits every default above
+    \b
+      [profiles.ci]
+      seed = "fresh"
+      port = 9401
+      flags = ["--window-size=800,600"]         # replaces the [defaults] size
+      drop_flags = ["--disable-blink-features"] # launches without it at all
+      features = { SharedStorageAPI = true }    # flips the default back on
+      env = { TZ = "America/Denver" }
+    """
     scope = session.scope
     default_seed = configwrite.render_seed(scope.default_seed, scope.config_dir)
     payload = {

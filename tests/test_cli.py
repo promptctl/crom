@@ -8,6 +8,7 @@ external system, not an implementation detail of crom.
 import contextlib
 import json
 import os
+import re
 import shlex
 import tempfile
 import unittest
@@ -1324,6 +1325,27 @@ class CliTest(unittest.TestCase):
         self.assertEqual(sorted(listed), sorted(set(listed)), "a command is listed twice")
         self.assertEqual(set(cli.main.commands) - set(listed), set(), "ungrouped command(s)")
         self.assertEqual(set(listed) - set(cli.main.commands), set(), "section names a dead command")
+
+    def test_every_config_key_the_parser_accepts_is_named_in_help(self):
+        """crom's primary reader is an agent that gets one look at `--help` and then
+        writes a `.crom.toml` from it, never the parser's source. A key the parser
+        accepts but the help never names is invisible to that reader — it cannot be
+        discovered at all, only stumbled into after a rejected file. The help was just
+        updated to name every key `config.py` accepts; this is what keeps that true
+        when someone adds key number seven and updates only the parser.
+        [LAW:one-source-of-truth] the parser's frozensets are read here rather than
+        restated, so this test agrees with the parser by construction and can only
+        drift from the help text, which is the direction that matters.
+        """
+        help_text = self.crom("--help") + self.crom("config", "--help")
+        for keys in (config._SCOPE_KEYS, config._DEFAULTS_KEYS, config._PROFILE_KEYS):
+            for key in keys:
+                # The key as a word, not as a substring. `env` occurs inside
+                # "environment" and `port` inside "--remote-debugging-port", so a plain
+                # `assertIn` would keep passing off prose that never names the key —
+                # green for a reader who still cannot find it.
+                named = re.search(rf"(?<![-\w]){re.escape(key)}(?![\w])", help_text)
+                self.assertTrue(named, f"config key {key!r} is not named in --help")
 
     # --- seeding --------------------------------------------------------------------
 
