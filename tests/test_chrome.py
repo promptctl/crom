@@ -11,11 +11,13 @@ import os
 import shutil
 import signal
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
 import time
 import unittest
+from collections.abc import Callable
 from pathlib import Path
 from unittest import mock
 
@@ -318,8 +320,6 @@ class ProcessBoundaryTest(unittest.TestCase):
                 chrome.scan()
 
     def test_a_failing_ps_is_reported_not_crashed_through(self):
-        import subprocess
-
         failure = subprocess.CalledProcessError(1, ["ps"], stderr="ps: bad option")
         with mock.patch("crom.chrome.subprocess.run", side_effect=failure):
             with self.assertRaisesRegex(CromError, "`ps` exited 1"):
@@ -520,6 +520,29 @@ while True:
     conn.close()
 '''
 
+# Paces bytes just *under* the per-recv timeout rather than well under it, so a read is
+# reliably in flight when the overall deadline passes. `_TRICKLE_FOREVER` at 0.5s never
+# straddles that boundary, so it cannot show what one read costs after the clock runs out.
+_TRICKLE_PAST_THE_DEADLINE = '''
+import socket, sys, time
+port = int([a for a in sys.argv if a.startswith("--remote-debugging-port=")][0].split("=")[1])
+server = socket.socket()
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server.bind(("127.0.0.1", port))
+server.listen(5)
+while True:
+    conn, _ = server.accept()
+    conn.recv(4096)
+    try:
+        conn.sendall(b"HTTP/1.1 200 OK\\r\\n\\r\\n")
+        while True:
+            conn.sendall(b"z")
+            time.sleep(0.9)
+    except OSError:
+        pass
+    conn.close()
+'''
+
 # Announces no length and never closes, so a client that reads to the end of the body
 # reads until its own socket timeout instead. Not a `_serving_stub`, because what it does
 # is exactly the thing that stub cannot do: refuse to finish.
@@ -616,28 +639,36 @@ class StderrCaptureTest(unittest.TestCase):
         for pid in chrome.find_pids_for_dir(profile_dir):
             os.kill(pid, signal.SIGKILL)
 
-    def launch_bounded(self, profile: ResolvedProfile, seconds: float = 30.0) -> str:
-        """Run `launch` under a wall clock and return the CromError text it raised.
+    def bounded(self, call: Callable[[], object], seconds: float = 30.0) -> object:
+        """Run `call` under a wall clock, returning what it returned or raising what it
+        raised — but failing the test outright if it never came back.
 
-        The regressions around reading the port do not fail, they hang — a read that never
-        returns takes the whole suite with it and reports nothing, which is the one failure
-        mode that cannot describe itself. On its own joinable thread the bound is
-        enforceable and the failure says which test hit it.
+        Every regression around reading the port shares a failure mode: it does not fail,
+        it hangs. A read that never returns takes the whole suite with it and reports
+        nothing, which is the one outcome that cannot describe itself. On a joinable
+        daemon thread the bound is enforceable and the failure names the test that hit it.
+
+        Which call is a parameter rather than a helper per call site, so `launch` and
+        `_probe_port` are bounded by the same code. [LAW:composability]
         """
-        errors: list[str] = []
+        outcome: list[tuple[str, object]] = []
 
         def attempt() -> None:
             try:
-                chrome.launch(profile)
-            except CromError as e:
-                errors.append(str(e))
+                outcome.append(("returned", call()))
+            except BaseException as e:  # noqa: BLE001 — re-raised below, on the test's thread
+                outcome.append(("raised", e))
 
         worker = threading.Thread(target=attempt, daemon=True)
         worker.start()
         worker.join(seconds)
-        self.assertFalse(worker.is_alive(), f"launch did not return within {seconds:g}s")
-        self.assertEqual(len(errors), 1, "the launch had to fail and did not")
-        return errors[0]
+        self.assertFalse(worker.is_alive(), f"the call did not return within {seconds:g}s")
+        kind, result = outcome[0]
+        if kind == "raised":
+            # Back on the calling thread, where `assertRaises` can see it and a genuine
+            # error is a test failure rather than a message on stderr nobody reads.
+            raise result  # type: ignore[misc]
+        return result
 
     def quoted(self, message: str) -> str:
         """What the error attributes to Chrome, isolated from the command echo.
@@ -784,9 +815,10 @@ class StderrCaptureTest(unittest.TestCase):
         """
         profile = self.stub_profile(_STREAM_FOREVER, port=9306)
         with mock.patch.object(chrome, "LAUNCH_TIMEOUT_SECONDS", 5.0):
-            message = self.launch_bounded(profile)
+            with self.assertRaises(CromError) as caught:
+                self.bounded(lambda: chrome.launch(profile))
 
-        self.assertIn("not as a Chrome DevTools endpoint", message)
+        self.assertIn("not as a Chrome DevTools endpoint", str(caught.exception))
 
     def test_a_stranger_trickling_bytes_cannot_outlast_the_launch_timeout(self):
         """The bound a size cap cannot supply, and the reason `_read_reply` holds a clock.
@@ -801,9 +833,44 @@ class StderrCaptureTest(unittest.TestCase):
         with mock.patch.object(chrome, "LAUNCH_TIMEOUT_SECONDS", 3.0):
             # Bounded well under the hours the regression takes, and well over the seconds
             # the fix takes, so the gap between them is what the assertion reads.
-            message = self.launch_bounded(profile, seconds=30.0)
+            with self.assertRaises(CromError) as caught:
+                self.bounded(lambda: chrome.launch(profile), seconds=30.0)
 
-        self.assertIn("not as a Chrome DevTools endpoint", message)
+        self.assertIn("not as a Chrome DevTools endpoint", str(caught.exception))
+
+    def test_one_probe_costs_no_more_than_the_ceiling_the_constants_name(self):
+        """The bound is a sum, and this is the test that holds it to the sum.
+
+        `_read_reply` checks its deadline between reads, so a read in flight when the
+        deadline passes still runs to its own timeout — the ceiling is
+        `PORT_REPLY_SECONDS + PORT_RECV_SECONDS`, not the first alone. A fixture pacing
+        well under the recv timeout never puts a read in that position and so would pass
+        against any ceiling at all; this one paces just under it, and the lower assertion
+        is what proves the straddle actually happened rather than the test flattering
+        itself.
+        """
+        profile = self.stub_profile(_TRICKLE_PAST_THE_DEADLINE, port=9312)
+        server = subprocess.Popen(
+            profile.argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        self.addCleanup(server.kill)
+        listening = time.monotonic() + 10
+        while time.monotonic() < listening:
+            with socket.socket() as knock:
+                if knock.connect_ex(("127.0.0.1", profile.port)) == 0:
+                    break
+            time.sleep(0.05)
+
+        started = time.monotonic()
+        answer = self.bounded(lambda: chrome._probe_port(profile.port))
+        elapsed = time.monotonic() - started
+
+        self.assertIsInstance(answer, chrome._AnsweredByStranger)
+        # Straddled: the read outlived the deadline, which is the case under test.
+        self.assertGreater(elapsed, chrome.PORT_REPLY_SECONDS)
+        # And was still capped by the ceiling the constants document, slack for scheduling.
+        ceiling = chrome.PORT_REPLY_SECONDS + chrome.PORT_RECV_SECONDS
+        self.assertLess(elapsed, ceiling + 1.0)
 
     def test_a_listener_that_does_not_speak_http_is_a_stranger_not_a_traceback(self):
         """`BadStatusLine` is neither an `OSError` nor a `URLError`.

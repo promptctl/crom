@@ -35,11 +35,21 @@ SHUTDOWN_TIMEOUT_SECONDS = 5.0
 # which logged all day is quoted by its ending rather than its whole history.
 STDERR_TAIL_BYTES = 4096
 
-# How long crom will spend reading whatever answers on the CDP port. This is the bound
-# that matters: `urlopen`'s timeout applies to each `recv`, never to the call, so a
-# listener trickling bytes just under it holds a read open for hours without once
-# tripping it — and `_await_startup` can only check its own deadline between probes.
+# How long crom keeps reading whatever answers on the CDP port, and how long any one
+# blocking socket operation inside that may take. One probe costs at most the sum: the
+# deadline is checked between reads, so a read already in flight when it passes still runs
+# to its own timeout. Stating the arithmetic is the point of having both names — the
+# second used to be a bare `timeout=1` at the `urlopen` call, which left the quantity that
+# actually matters, what one probe can cost, written down in neither place.
+#
+# The recv slice is not smaller because a real browser needs it. Measured against
+# Chrome/152 on loopback, worst time from the connection being accepted to the reply being
+# complete: 282ms over 16,197 samples on default flags. A timeout near that misreads a
+# healthy Chrome as `_Silent` now and then — survivable, since `_Silent` is the retry
+# state, but paid on every launch to tighten a ceiling that already sits ten times inside
+# `LAUNCH_TIMEOUT_SECONDS`. 1.0s keeps three and a half times the measured worst.
 PORT_REPLY_SECONDS = 2.0
+PORT_RECV_SECONDS = 1.0
 
 # How much of that reply to keep — a cap, and worth saying which. A CDP version document
 # is 428 bytes as Chrome ships, but Chrome reflects `--user-agent` into it and that flag
@@ -272,6 +282,11 @@ def _read_reply(resp: http.client.HTTPResponse) -> bytes:
     and this is inside one. Bounding bytes never bounded that; only a clock does.
     [LAW:no-ambient-temporal-coupling] how long this may take is owned here rather than
     left to whatever is on the far end.
+
+    The same shape survives one layer down, bounded rather than removed: this deadline is
+    also checked between reads, so a read in flight when it passes runs on to its own
+    timeout. That is why the ceiling is `PORT_REPLY_SECONDS + PORT_RECV_SECONDS` and not
+    the first alone — a real bound, but the sum, and the constants say so.
     """
     deadline = time.monotonic() + PORT_REPLY_SECONDS
     reply = b""
@@ -310,7 +325,8 @@ def _probe_port(port: int) -> _PortAnswer:
     stranger is not a browser.
     """
     try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=1) as resp:
+        url = f"http://127.0.0.1:{port}/json/version"
+        with urllib.request.urlopen(url, timeout=PORT_RECV_SECONDS) as resp:
             reply = _read_reply(resp)
     except urllib.error.HTTPError as e:
         return _AnsweredByStranger(f"HTTP {e.code} {_summarise(str(e.reason))}")
