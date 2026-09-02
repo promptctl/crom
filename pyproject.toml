@@ -16,5 +16,15 @@ dependencies = [
 [project.scripts]
 crom = "crom.cli:main"
 
+# The suite is stdlib `unittest` and needs nothing installed to run. pytest is declared
+# anyway because an *undeclared* tool does not fail here — `uv run` falls through to
+# PATH, and the system pytest it reached could not import `crom`, so the ten collection
+# errors read `No module named 'crom'` and accused the package while the real fault was
+# the interpreter. Declaring it is what puts that interpreter out of reach.
+# [LAW:no-silent-failure] the error now names the true fault because there is no longer
+# a wrong interpreter to reach. Not an unused dependency: dropping it restores the trap.
+[dependency-groups]
+dev = ["pytest>=8"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["crom"]
