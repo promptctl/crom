@@ -211,17 +211,12 @@ def main(ctx):
     A new profile starts as a copy of your real Chrome profile, so it has your
     logins and extensions. `--seed fresh` on `init` or `add` gets an empty one.
 
-    \b
-    The config file (.crom.toml, written by `crom init`)
-      top level          namespace (required), chrome_binary, state_dir
-      [defaults]         flags, drop_flags, features, env, seed
-      [profiles.<name>]  flags, drop_flags, features, env, seed, port
-
-    A profile's answer beats `[defaults]`, and both beat crom's own launch
-    policy — for every key, and for flags one Chrome switch at a time, so each
-    switch reaches Chrome exactly once. `crom config <profile>` shows the
-    resolved command with the layer behind each flag; `crom config --help` is
-    the reference for what every key accepts.
+    A `.crom.toml` written by `crom init` sets the namespace, then `[defaults]`
+    and a `[profiles.<name>]` for each profile. Where both answer, the profile
+    wins, and for flags it wins one Chrome switch at a time, so each switch
+    reaches Chrome exactly once. `crom config <profile>` shows the resolved
+    command with the layer behind each flag; `crom config --help` is the
+    reference for every key a config may set.
 
     crom does the setup step for you rather than naming it: a profile you refer
     to but never declared is declared, and a config file crom cannot read is
@@ -884,15 +879,24 @@ def config_cmd(session: _Session, ref: str | None, as_json: bool):
       [defaults]         flags, drop_flags, features, env, seed
       [profiles.<name>]  flags, drop_flags, features, env, seed, port
 
-    Every key resolves the same way: a profile's answer beats `[defaults]`, and
-    both beat crom's own launch policy. Flags resolve by switch name rather than
-    by concatenation, so each Chrome switch is emitted exactly once — crom
-    composes the command instead of handing Chrome two answers to the same
-    question.
+    Where two layers answer the same question, the profile's answer wins — per
+    switch for `flags`, per feature name for `features`, per variable for `env`,
+    and outright for `seed`. `flags` and `features` have a third layer beneath
+    both, crom's own launch policy, which they beat in turn. `drop_flags` is the
+    one key that never conflicts: every layer's drops apply.
+
+    Flags resolve by switch name rather than by concatenation, so each Chrome
+    switch is emitted exactly once — crom composes the command instead of
+    handing Chrome two answers to the same question.
+
+    The top-level keys do not layer. They are set once for the whole file, and
+    `[defaults]` has no counterpart for them — a `port` under `[defaults]` is an
+    unknown key, not an inherited default.
 
     \b
     What each key accepts
-      namespace      this project's name — lowercase letters, digits, and . _ -
+      namespace      this project's name: lowercase letters, digits, and . _ -
+                     starting with a letter or digit, at most 64 characters.
                      Required in a project config, and never `user`. Your own
                      config in ~/.config/crom is the `user` namespace and must
                      not set the key at all.
@@ -939,7 +943,8 @@ def config_cmd(session: _Session, ref: str | None, as_json: bool):
         in `flags` or `drop_flags` is refused.
       --enable-features, --disable-features
         Write `features` entries instead. crom folds every layer's table into
-        these two switches, so a `flags` list naming either is refused.
+        these two switches, so naming either in `flags` or `drop_flags` is
+        refused.
 
     Inside `flags` values and `env` values, ${CROM_NAMESPACE}, ${CROM_PROFILE},
     ${CROM_PORT}, ${CROM_PROFILE_DIR} and ${CROM_CONFIG_DIR} expand. A switch
