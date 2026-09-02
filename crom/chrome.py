@@ -8,6 +8,7 @@ Everything here takes a `ResolvedProfile`, whose `argv` is already complete, so 
 module never reads a config file or decides a port.
 """
 
+import json
 import os
 import re
 import signal
@@ -32,6 +33,17 @@ SHUTDOWN_TIMEOUT_SECONDS = 5.0
 # Enough to carry Chrome's complaint and the lines around it, small enough that a browser
 # which logged all day is quoted by its ending rather than its whole history.
 STDERR_TAIL_BYTES = 4096
+
+# How much of a reply from the CDP port we are willing to hold. Whatever is listening
+# there may not be Chrome, so the read is bounded against a server that streams forever.
+# The bound has to clear a real CDP version document, because a clipped one no longer
+# parses as JSON and crom would call its own browser a stranger: measured against
+# Chrome/152, that document is 428 bytes, so this leaves nearly twenty times the margin.
+PORT_REPLY_BYTES = 8192
+
+# One line of an unknown server's reply, long enough to recognise it by and short enough
+# that a minified page cannot become the error message.
+PORT_REPLY_SUMMARY_CHARS = 120
 
 
 # `ps` hands us one flat string per process with no argv boundaries, so the directory
@@ -139,19 +151,131 @@ def is_running(profile: ResolvedProfile) -> bool:
     return bool(find_pids(profile))
 
 
-def _cdp_ready(port: int) -> bool:
-    """True once Chrome's CDP HTTP endpoint answers on this port.
+def _printable(raw: bytes) -> str:
+    """Bytes crom does not control, rendered as text a terminal will only ever display.
+
+    One job, done once at each boundary where foreign bytes enter a message: Chrome's
+    stderr and whatever answers on the CDP port. Downstream then holds a printable string
+    by construction rather than by discipline. [LAW:parse-dont-validate]
+
+    Bad UTF-8 is replaced, not raised on — refusing to decode would fail while reporting a
+    failure. Control characters are dropped because these bytes reach a terminal that
+    `DEVNULL` used to shield: Chrome's log lines carry page-derived text and a stranger on
+    the port is by definition unvetted, so an escape sequence could repaint the error it
+    appears in. Newline and tab are the message's shape, not control of the terminal, and
+    stay. [LAW:single-enforcer] the sanitising happens here and nowhere else.
+    """
+    text = raw.decode("utf-8", errors="replace")
+    return "".join(ch for ch in text if ch in "\n\t" or ch.isprintable()).strip()
+
+
+def _lsof_hint(port: int) -> str:
+    """How to find out who holds a port, worded the same wherever crom has to ask."""
+    return f"Find it with: lsof -nP -iTCP:{port} -sTCP:LISTEN"
+
+
+@dataclass(frozen=True)
+class _Silent:
+    """Nothing is listening on the port — the ordinary state while Chrome is starting."""
+
+
+@dataclass(frozen=True)
+class _Answered:
+    """A Chrome DevTools endpoint answered on the port we asked for."""
+
+
+@dataclass(frozen=True)
+class _AnsweredByStranger:
+    """Something answered on the port, but not as a browser crom could drive."""
+
+    served: str
+
+
+@dataclass(frozen=True)
+class _Exited:
+    """The child process was gone before CDP ever replied."""
+
+    returncode: int
+
+
+@dataclass(frozen=True)
+class _NeverAnswered:
+    """The deadline passed with the child still alive and the port still silent."""
+
+
+# [LAW:types-are-the-program] Two questions, four endings, and the answers overlap because
+# the facts do. The probe reports what the port is doing right now; the wait reports how
+# the launch ended. Two of those are the same fact seen twice — a CDP endpoint answering
+# *is* a successful launch, and a stranger answering *is* a failed one — so they are one
+# variant each rather than a pair per union with an adapter in between. What the wait adds
+# is the two endings a single probe cannot see, because both are about elapsed time: a
+# child that died, and a port that stayed `_Silent` until the deadline.
+#
+# Before this union the wait returned pids or raised a timeout — two shapes for four
+# endings, and the endings with nowhere to go were the common ones: a Chrome that died in
+# 20ms got reported 30 seconds later as a port that had not opened, and a foreign server
+# on the port got reported as a successful launch.
+_PortAnswer = _Silent | _Answered | _AnsweredByStranger
+_LaunchOutcome = _Answered | _AnsweredByStranger | _Exited | _NeverAnswered
+
+
+def _advertises_devtools(reply: bytes) -> bool:
+    """Whether this reply is a CDP version document — one that names a browser websocket.
+
+    `webSocketDebuggerUrl` is the discriminator because it is the handle a CDP client
+    actually connects by: a reply that names one is drivable, and a reply that does not is
+    useless to crom whatever else it contains. Every way of not being that document —
+    not JSON, JSON that is not an object, an object without the key — is the same answer,
+    so they are caught together rather than enumerated into distinct diagnoses nobody
+    would act on differently.
+    """
+    try:
+        return str(json.loads(reply)["webSocketDebuggerUrl"]).startswith("ws://")
+    except (ValueError, TypeError, KeyError):
+        return False
+
+
+def _probe_port(port: int) -> _PortAnswer:
+    """Who is answering CDP's version endpoint on this port, if anyone.
 
     We probe the endpoint we intend to use rather than Chrome's DevToolsActivePort file:
     Chrome only writes that file to *report* a port it chose itself (the
     `--remote-debugging-port=0` case), not when we hand it a fixed port. The live
     endpoint is the honest readiness signal.
+
+    [LAW:parse-dont-validate] The reply is read for what it proves rather than counted as
+    an answer. This returned `resp.status == 200`, which accepted any HTTP server holding
+    the port, so a dev server on 9222 made `launch` report success for a browser nothing
+    could drive — a silent failure that surfaced later as a CDP client refusing to connect
+    to a profile crom had called running.
+
+    An HTTP status that is not 200 lands with the stranger rather than with silence, since
+    something is speaking HTTP there and it is not serving CDP. Measured against
+    Chrome/152 on macOS, that costs no real launch: sampling this endpoint every 5ms
+    across four startups yielded exactly two observations each time — connection refused,
+    then 200 with the version document — and never an intermediate reply. There is no
+    window in which a starting Chrome looks like a stranger.
+
+    What this cannot tell apart is a *different* Chrome on our port, which advertises the
+    same shape. `_require_port_available` rejects a port already held before launch, so
+    what remains is a listener that appeared inside the wait window, where the realistic
+    stranger is not a browser.
     """
     try:
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=1) as resp:
-            return resp.status == 200
+            reply = resp.read(PORT_REPLY_BYTES)
+    except urllib.error.HTTPError as e:
+        return _AnsweredByStranger(f"HTTP {e.code} {e.reason}")
     except (urllib.error.URLError, OSError):
-        return False
+        # A half-delivered response reads the same as nothing here, and calling it silence
+        # costs only another 100ms round. Reached far more often by the ordinary case:
+        # the port is refusing connections because Chrome has not opened it yet.
+        return _Silent()
+
+    if _advertises_devtools(reply):
+        return _Answered()
+    summary = textwrap.shorten(_printable(reply), PORT_REPLY_SUMMARY_CHARS, placeholder=" …")
+    return _AnsweredByStranger(summary or "an empty reply")
 
 
 def _require_port_available(profile: ResolvedProfile) -> None:
@@ -169,7 +293,7 @@ def _require_port_available(profile: ResolvedProfile) -> None:
             pass
     raise CromError(
         f"port {profile.port} (assigned to '{profile.ref}') is held by another process. "
-        f"Find it with: lsof -nP -iTCP:{profile.port} -sTCP:LISTEN"
+        f"{_lsof_hint(profile.port)}"
     )
 
 
@@ -205,21 +329,15 @@ class _StderrSink:
     def tail(self) -> str:
         """The last `STDERR_TAIL_BYTES` of what Chrome has said so far, safe to print.
 
-        One job, done once at the boundary: bytes crom does not control become text a
-        terminal will display, so downstream holds a printable string by construction
-        rather than by discipline. [LAW:parse-dont-validate]
-
-        Bad UTF-8 is replaced, not raised on — refusing to decode would fail while
-        reporting a failure. Control characters are dropped because `DEVNULL` used to
-        guarantee nothing Chrome emitted reached a terminal, and Chrome's log lines carry
-        page-derived text, so an escape sequence could repaint the error it appears in.
-        Newline and tab are the message's shape, not control of the terminal, and stay.
+        `_printable` does the rendering, so what Chrome writes and what a stranger on the
+        CDP port writes are made safe by one piece of code rather than two that could
+        drift apart. [LAW:single-enforcer]
         """
         try:
             with open(self.path, "rb") as reader:
                 reader.seek(0, os.SEEK_END)
                 reader.seek(max(0, reader.tell() - STDERR_TAIL_BYTES))
-                raw = reader.read().decode("utf-8", errors="replace")
+                raw = reader.read()
         except OSError as e:
             # Said, not swallowed. `""` already means "Chrome printed nothing", so
             # returning it here would collapse two different facts into one value the
@@ -227,7 +345,7 @@ class _StderrSink:
             # successful launch too, where a raw error would crash a browser that came
             # up fine over a diagnostic nobody needed.
             return f"(crom could not read what Chrome printed: {e})"
-        return "".join(ch for ch in raw if ch in "\n\t" or ch.isprintable()).strip()
+        return _printable(raw)
 
 
 @contextmanager
@@ -283,45 +401,30 @@ def _quote(transcript: str) -> str:
     return f"\nChrome said:\n{textwrap.indent(transcript, '    ')}"
 
 
-@dataclass(frozen=True)
-class _Answered:
-    """CDP replied on the port we asked for. The launch succeeded."""
-
-
-@dataclass(frozen=True)
-class _Exited:
-    """The child process was gone before CDP ever replied."""
-
-    returncode: int
-
-
-@dataclass(frozen=True)
-class _NeverAnswered:
-    """The deadline passed with the child still alive and the port still silent."""
-
-
-# [LAW:types-are-the-program] The wait has three real endings, so it resolves to a value
-# with three shapes. Before this union it returned pids or raised a timeout — two shapes
-# for three endings, and the ending with nowhere to go was the common one: a Chrome that
-# died in 20ms got reported, 30 seconds later, as a port that had not opened yet.
-_LaunchOutcome = _Answered | _Exited | _NeverAnswered
-
-
 def _await_startup(proc: subprocess.Popen[bytes], port: int) -> _LaunchOutcome:
-    """Watch a starting Chrome until it serves CDP, dies, or runs out of time.
+    """Watch a starting Chrome until the port answers, the child dies, or time runs out.
 
-    Liveness is sampled *before* readiness so that readiness gets the last word within a
+    Liveness is sampled *before* the port so that the port gets the last word within a
     round: a child observed alive and then found to have exited still counts as answered
     if the port replied in between. The two observations cannot be simultaneous, and this
     is the order in which their disagreement resolves toward the browser that is actually
     reachable. [LAW:no-ambient-temporal-coupling] the ordering is the mechanism, not a
     timing bet — no sleep tunes it and no retry papers over it.
+
+    A stranger ends the wait as soon as it is seen. Waiting it out would buy nothing: the
+    listener holding the port is why Chrome cannot have it, and it will not yield inside
+    the deadline. Only `_Silent` is worth another round, because only silence is a state
+    a starting browser passes through.
     """
     deadline = time.time() + LAUNCH_TIMEOUT_SECONDS
     while True:
         returncode = proc.poll()
-        if _cdp_ready(port):
-            return _Answered()
+        answer = _probe_port(port)
+        match answer:
+            case _Answered() | _AnsweredByStranger():
+                return answer
+            case _Silent():
+                pass
         if returncode is not None:
             return _Exited(returncode)
         if time.time() >= deadline:
@@ -333,11 +436,15 @@ def launch(profile: ResolvedProfile) -> tuple[int, ...]:
     """Start Chrome for this profile and return its PIDs once CDP answers.
 
     [LAW:no-silent-failure] we wait for the endpoint we promised the caller and raise if
-    it never comes up, rather than returning a port nothing is listening on. A browser
-    that died and a browser that is merely slow fail with different messages, because
-    they are different problems and only one of them is worth waiting the full timeout
-    for — and either way the message carries Chrome's own account of itself, which is
-    usually the only line in it a user can act on.
+    it never comes up, rather than returning a port nothing is listening on — or one that
+    something else is listening on, which used to read as success.
+
+    The three ways that can go wrong get three messages, because they are three problems
+    with three different next steps: read what the browser printed and fix the binary,
+    look at the flags a browser that is still running never got past, or find out who took
+    the port. A reader can tell which happened from the message alone, without going back
+    to the machine to look. Every one of them also carries Chrome's own account of itself,
+    which is usually the only line a user can act on directly.
     """
     _require_port_available(profile)
     profile.profile_dir.mkdir(parents=True, exist_ok=True)
@@ -376,8 +483,17 @@ def launch(profile: ResolvedProfile) -> tuple[int, ...]:
             )
         case _NeverAnswered():
             raise CromError(
-                f"Chrome did not open CDP port {profile.port} for '{profile.ref}' within "
-                f"{LAUNCH_TIMEOUT_SECONDS:.0f}s.{said}\nCommand was: {command}"
+                f"Chrome for '{profile.ref}' is still running but did not open CDP port "
+                f"{profile.port} within {LAUNCH_TIMEOUT_SECONDS:.0f}s.{said}\n"
+                f"Command was: {command}"
+            )
+        case _AnsweredByStranger(served):
+            raise CromError(
+                f"port {profile.port} (assigned to '{profile.ref}') is answering, but not "
+                f"as a Chrome DevTools endpoint — it served: {served}. Something else took "
+                f"the port while Chrome was starting, so the browser crom just launched "
+                f"cannot be reached there.\n{_lsof_hint(profile.port)}{said}\n"
+                f"Command was: {command}"
             )
 
 
