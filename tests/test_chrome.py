@@ -335,16 +335,14 @@ class ProcessBoundaryTest(unittest.TestCase):
 
         self.assertIn("myapp/dev", str(caught.exception))
 
-    def test_a_temp_file_that_cannot_be_opened_is_reported_not_crashed_through(self):
+    def test_a_sink_that_cannot_be_opened_is_reported_not_crashed_through(self):
         """The stderr sink is a filesystem boundary, and a launch can reach it on a host
         with a full disk or no descriptors left. Asserting on `launch` rather than on the
         constructor pins the contract — the CLI never sees a raw OSError — so it survives
-        a change of which temp-file call the sink is built from."""
-        with mock.patch(
-            "crom.chrome.tempfile.NamedTemporaryFile", side_effect=OSError("No space left")
-        ):
+        a change of which call the sink is opened by."""
+        with mock.patch.object(Path, "open", side_effect=OSError("No space left")):
             with mock.patch("crom.chrome._require_port_available"):
-                with self.assertRaisesRegex(CromError, "could not open a temporary file"):
+                with self.assertRaisesRegex(CromError, "could not open .*crom-stderr.log"):
                     chrome.launch(temp_profile(self))
 
 
@@ -1159,15 +1157,37 @@ class StderrCaptureTest(unittest.TestCase):
         self.assertIn("exited 6 during startup", message)  # the real outcome survives
         self.assertIn("could not read what Chrome printed", self.quoted(message))
 
-    def test_capture_leaves_no_file_behind(self):
-        """Capture costs a successful launch what `DEVNULL` did: nothing anyone can find."""
-        before = set(Path(tempfile.gettempdir()).glob("crom-chrome-stderr-*"))
-        profile = self.stub_profile("import sys; sys.stderr.write('noise'); sys.exit(1)")
-        with self.assertRaises(CromError):
+    def test_the_sink_is_left_in_the_profile_under_a_name_the_error_gives_out(self):
+        """The sink used to be an unlinked temp file, so everything Chrome said beyond the
+        quoted tail died with the browser. Naming it is the whole ticket: `du` can see it,
+        and a reader who needs more than the tail is told where the rest is."""
+        profile = self.stub_profile(
+            "import sys; sys.stderr.write('noise\\n'); sys.exit(1)", port=9317
+        )
+        with self.assertRaises(CromError) as caught:
             chrome.launch(profile)
 
-        after = set(Path(tempfile.gettempdir()).glob("crom-chrome-stderr-*"))
-        self.assertEqual(after - before, set())
+        log = profile.profile_dir / chrome.STDERR_FILENAME
+        self.assertEqual(log.read_text(), "noise\n")
+        self.assertIn(str(log), str(caught.exception))
+
+    def test_a_launch_does_not_inherit_the_previous_launchs_words(self):
+        """Truncation is what keeps a named file honest: it holds what *this* browser
+        said. Appending would make the quoted tail a mixture of two runs — the one thing
+        worse than no output is output from a launch that is not the one being diagnosed.
+
+        The marker travels in `env` so that both launches are the same stub against the
+        same directory and port, which is the state a second `crom up` actually meets.
+        """
+        stub = self.stub_profile(
+            "import os, sys; sys.stderr.write(os.environ['MARK'] + '\\n'); sys.exit(1)",
+            port=9318,
+        )
+        for mark in ("FIRST", "SECOND"):
+            with self.assertRaises(CromError):
+                chrome.launch(dataclasses.replace(stub, env={"MARK": mark}))
+
+        self.assertEqual((stub.profile_dir / chrome.STDERR_FILENAME).read_text(), "SECOND\n")
 
 
 if __name__ == "__main__":

@@ -307,7 +307,13 @@ silent — and `seed = "fresh"`, on the profile or in `[defaults]`, gets you an 
 ~/.config/crom/config.toml                    your profiles (the `user` namespace)
 ~/.local/state/crom/registry.json             port assignments + known namespaces
 ~/.local/state/crom/profiles/<ns>/<name>/     Chrome user-data-dirs
+~/.local/state/crom/profiles/<ns>/<name>/crom-stderr.log
+                                              what Chrome has printed since its last launch
 ```
+
+`crom-stderr.log` is rewritten each time crom starts that profile's browser, and goes when
+`crom rm` deletes the profile — `crom down` leaves it, so a browser that died has an
+account of itself. A failed launch quotes its tail and names the file.
 
 `XDG_CONFIG_HOME` and `XDG_STATE_HOME` are honored.
 
