@@ -303,10 +303,10 @@ class KillTest(unittest.TestCase):
 
 
 class ProcessBoundaryTest(unittest.TestCase):
-    """The two places crom hands work to the operating system.
+    """The places crom hands work to the operating system.
 
-    Both translate OS failures into CromError, and both are easy to undo in a refactor
-    without any test noticing, because the happy path is unaffected either way.
+    All of them translate OS failures into CromError, and all are easy to undo in a
+    refactor without any test noticing, because the happy path is unaffected either way.
     """
 
     def test_a_missing_ps_is_reported_not_crashed_through(self):
@@ -333,6 +333,18 @@ class ProcessBoundaryTest(unittest.TestCase):
                     chrome.launch(temp_profile(self))
 
         self.assertIn("myapp/dev", str(caught.exception))
+
+    def test_a_temp_file_that_cannot_be_opened_is_reported_not_crashed_through(self):
+        """The stderr sink is a filesystem boundary, and a launch can reach it on a host
+        with a full disk or no descriptors left. Asserting on `launch` rather than on the
+        constructor pins the contract — the CLI never sees a raw OSError — so it survives
+        a change of which temp-file call the sink is built from."""
+        with mock.patch(
+            "crom.chrome.tempfile.NamedTemporaryFile", side_effect=OSError("No space left")
+        ):
+            with mock.patch("crom.chrome._require_port_available"):
+                with self.assertRaisesRegex(CromError, "could not open a temporary file"):
+                    chrome.launch(temp_profile(self))
 
 
 class LaunchReadinessTest(unittest.TestCase):

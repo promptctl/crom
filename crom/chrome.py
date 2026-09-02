@@ -232,17 +232,19 @@ def _stderr_sink() -> Iterator[_StderrSink]:
     still watching, which is a different design than this one.
     """
     try:
-        fd, name = tempfile.mkstemp(prefix="crom-chrome-stderr-")
+        # Creating and opening in one call is what keeps the guard honest: a separate
+        # `mkstemp` + `os.fdopen` needs two, and a failure between them leaks the
+        # descriptor — in the one situation, exhaustion, where that is least affordable.
+        handle = tempfile.NamedTemporaryFile(prefix="crom-chrome-stderr-", delete=False)
     except OSError as e:
-        # A full or read-only temp dir is the one way this fails, and it would otherwise
-        # leave `launch` by a route the CLI does not catch: `CromGroup.invoke` handles
-        # `CromError` alone, so a raw OSError escapes the exit-code contract as a
-        # traceback. Translated here for the same reason `Popen` and `ps` are.
-        # [LAW:no-silent-failure]
+        # `CromGroup.invoke` handles `CromError` alone, so a raw OSError would leave
+        # `launch` as a traceback and bypass the exit-code contract. Translated here for
+        # the same reason `Popen` and `ps` are. [LAW:no-silent-failure]
         raise CromError(f"could not open a temporary file to capture Chrome's output: {e}") from e
-    path = Path(name)
+
+    path = Path(handle.name)
     try:
-        with os.fdopen(fd, "wb") as handle:
+        with handle:
             yield _StderrSink(handle=handle, path=path)
     finally:
         path.unlink()
