@@ -543,6 +543,31 @@ while True:
     conn.close()
 '''
 
+# Sends the headers, then pauses longer than one recv slice but well inside the overall
+# deadline, then sends a perfectly good CDP document. A browser on a loaded machine, in
+# other words — and the case where treating a per-recv timeout as "the peer is finished"
+# condemns a healthy launch on the strength of a prefix.
+_HEADERS_THEN_A_PAUSE = '''
+import socket, sys, time
+port = int([a for a in sys.argv if a.startswith("--remote-debugging-port=")][0].split("=")[1])
+body = (b'{"Browser": "Chrome/152.0.7977.66", '
+        b'"webSocketDebuggerUrl": "ws://127.0.0.1/devtools/browser/stub-uuid"}')
+server = socket.socket()
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server.bind(("127.0.0.1", port))
+server.listen(5)
+while True:
+    conn, _ = server.accept()
+    conn.recv(4096)
+    try:
+        conn.sendall(b"HTTP/1.1 200 OK\\r\\nContent-Length: %d\\r\\n\\r\\n" % len(body))
+        time.sleep(1.4)
+        conn.sendall(body)
+    except OSError:
+        pass
+    conn.close()
+'''
+
 # Trickles the *status line* one byte at a time and never completes it. The phase an
 # HTTP client parses before it hands anything back, and so the phase a deadline that
 # starts at the response body cannot reach — measured, this held a probe past 12s.
@@ -857,7 +882,7 @@ class StderrCaptureTest(unittest.TestCase):
 
         self.assertIn("not as a Chrome DevTools endpoint", str(caught.exception))
 
-    def test_a_stranger_trickling_bytes_cannot_outlast_the_launch_timeout(self):
+    def test_a_launch_against_a_trickling_peer_ends_on_its_own_timeout(self):
         """The bound a size cap cannot supply, and the reason `_read_reply` holds a clock.
 
         This server sends one byte every 0.5s, so every individual `recv` completes well
@@ -865,15 +890,20 @@ class StderrCaptureTest(unittest.TestCase):
         way would take hours, and `_await_startup` cannot intervene because it checks its
         deadline *between* probes and this is inside one — so `up` blocks far past the 30s
         it documents. Only a wall clock inside the read closes that gap.
+
+        It ends on the launch timeout rather than by naming a stranger, and that is the
+        deliberate trade: a reply that never finishes is a prefix, and a prefix cannot be
+        told from a slow browser's. Every stranger anyone actually meets completes its
+        reply or closes the socket, and keeps the fast, specific diagnosis.
         """
         profile = self.stub_profile(_TRICKLE_FOREVER, port=9307)
         with mock.patch.object(chrome, "LAUNCH_TIMEOUT_SECONDS", 3.0):
             # Bounded well under the hours the regression takes, and well over the seconds
             # the fix takes, so the gap between them is what the assertion reads.
             with self.assertRaises(CromError) as caught:
-                self.bounded(lambda: chrome.launch(profile), seconds=30.0)
+                self.bounded(lambda: chrome.launch(profile), seconds=60.0)
 
-        self.assertIn("not as a Chrome DevTools endpoint", str(caught.exception))
+        self.assertIn("did not open CDP port", str(caught.exception))
 
     def test_one_probe_costs_no_more_than_the_ceiling_the_constants_name(self):
         """The bound is a sum, and this is the test that holds it to the sum.
@@ -902,7 +932,8 @@ class StderrCaptureTest(unittest.TestCase):
         answer = self.bounded(lambda: chrome._probe_port(profile.port))
         elapsed = time.monotonic() - started
 
-        self.assertIsInstance(answer, chrome._AnsweredByStranger)
+        # Out of time mid-sentence, so the prefix is not evidence and stays retryable.
+        self.assertIsInstance(answer, chrome._Silent)
         # Straddled: the read outlived the deadline, which is the case under test.
         self.assertGreater(elapsed, chrome.PORT_REPLY_SECONDS)
         # And was still capped by the ceiling the constants document, slack for scheduling.
@@ -934,9 +965,28 @@ class StderrCaptureTest(unittest.TestCase):
         answer = self.bounded(lambda: chrome._probe_port(profile.port))
         elapsed = time.monotonic() - started
 
-        self.assertIsInstance(answer, chrome._AnsweredByStranger)
+        # Never a complete reply, so never evidence — and crucially never a hang either,
+        # which is the whole point: bounded, and retryable rather than terminal.
+        self.assertIsInstance(answer, chrome._Silent)
         ceiling = chrome.PORT_REPLY_SECONDS + chrome.PORT_RECV_SECONDS
         self.assertLess(elapsed, ceiling + 1.0)
+
+    def test_a_browser_that_pauses_mid_reply_is_not_condemned_as_a_stranger(self):
+        """A per-recv timeout says nothing about the peer being finished.
+
+        This server sends its headers, waits longer than one recv slice but well inside
+        the overall deadline, and then sends a perfectly good CDP document — a browser on
+        a loaded machine. Treating that timeout as the end of the reply hands `_classify`
+        a headers-only prefix, which is not a DevTools document, so a healthy launch fails
+        permanently as "answering, but not as a Chrome DevTools endpoint". The three
+        trickle fixtures all pace *under* the slice on purpose, so none of them can reach
+        this; it needs a pause that steps over it.
+        """
+        self.assertGreater(1.4, chrome.PORT_RECV_SECONDS)  # long enough to time a recv out
+        self.assertLess(1.4, chrome.PORT_REPLY_SECONDS)  # short enough to be in budget
+        profile = self.stub_profile(_HEADERS_THEN_A_PAUSE, port=9315)
+        with mock.patch.object(chrome, "LAUNCH_TIMEOUT_SECONDS", 10.0):
+            self.assertTrue(chrome.launch(profile))
 
     def test_a_peer_that_accepts_and_says_nothing_stays_retryable(self):
         """Silence and a stranger are the retryable and the terminal answer, and the line

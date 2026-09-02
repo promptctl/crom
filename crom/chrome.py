@@ -313,7 +313,27 @@ def _classify(reply: bytes) -> _PortAnswer:
     return _AnsweredByStranger(_describe(reply))
 
 
-def _read_reply(conn: socket.socket, deadline: float) -> bytes:
+@dataclass(frozen=True)
+class _Said:
+    """The peer finished. This is everything it was going to say, usable or not."""
+
+    reply: bytes
+
+
+@dataclass(frozen=True)
+class _StillSpeaking:
+    """The clock ran out mid-sentence, so what arrived is a prefix rather than a reply."""
+
+
+# [LAW:types-are-the-program] The two endings differ in what they license, not in their
+# bytes, so they cannot be one type carrying bytes. A prefix of a CDP document and a
+# prefix of a dev server's page look exactly alike — there is nothing in a truncated reply
+# to classify *with* — and classifying one anyway ends a launch on a guess, permanently,
+# because a stranger is terminal. Only `_Said` is evidence.
+_ReadOutcome = _Said | _StillSpeaking
+
+
+def _read_reply(conn: socket.socket, deadline: float) -> _ReadOutcome:
     """Whatever the port says, until the answer is known or the clock runs out.
 
     Four endings, and the clock is the one that had to exist. An HTTP client borrowed from
@@ -335,20 +355,28 @@ def _read_reply(conn: socket.socket, deadline: float) -> bytes:
     outcome ends the launch.
     """
     reply = b""
-    while len(reply) < PORT_REPLY_BYTES and time.monotonic() < deadline:
+    while time.monotonic() < deadline:
+        if len(reply) >= PORT_REPLY_BYTES:
+            # More than any real version document, so there is nothing left to wait for:
+            # whatever this is, it is not the browser, and it has said enough to say so.
+            return _Said(reply)
         try:
             chunk = conn.recv(PORT_REPLY_BYTES - len(reply))
+        except TimeoutError:
+            # Nothing arrived in this slice, which says nothing about the peer being
+            # finished — only the deadline gets to decide that, so it is asked again.
+            # Breaking here instead made a browser that paused a second mid-reply look
+            # like a stranger, and a stranger ends the launch.
+            continue
         except OSError:
-            # A peer that stops talking is described by what it already said, so the
-            # partial reply is kept rather than thrown away with the exception. An
-            # accepted connection that says nothing at all yields b"", which is silence.
-            break
+            # The peer broke the connection off. What it already said is all there is.
+            return _Said(reply)
         if not chunk:
-            break
+            return _Said(reply)
         reply += chunk
         if _advertises_devtools(_body_of(reply)):
-            break
-    return reply
+            return _Said(reply)
+    return _StillSpeaking()
 
 
 def _probe_port(port: int) -> _PortAnswer:
@@ -394,14 +422,21 @@ def _probe_port(port: int) -> _PortAnswer:
     try:
         with socket.create_connection(("127.0.0.1", port), PORT_RECV_SECONDS) as conn:
             conn.sendall(_VERSION_REQUEST)
-            reply = _read_reply(conn, deadline)
+            heard = _read_reply(conn, deadline)
     except OSError:
         # Overwhelmingly the ordinary case: the port refuses connections because Chrome
         # has not opened it yet. Also a connection that broke before it said anything,
         # which is the same fact — nothing on this port has spoken to us.
         return _Silent()
 
-    return _classify(reply)
+    match heard:
+        case _Said(reply):
+            return _classify(reply)
+        case _StillSpeaking():
+            # Not evidence of a stranger, so not treated as one. Silence is retryable and
+            # a stranger is terminal, which makes this the difference between a loaded
+            # machine costing another 100ms round and a launch that fails for good.
+            return _Silent()
 
 
 def _require_port_available(profile: ResolvedProfile) -> None:
