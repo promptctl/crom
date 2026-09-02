@@ -11,10 +11,13 @@ import os
 import shutil
 import signal
 import socket
+import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
+from collections.abc import Callable
 from pathlib import Path
 from unittest import mock
 
@@ -317,8 +320,6 @@ class ProcessBoundaryTest(unittest.TestCase):
                 chrome.scan()
 
     def test_a_failing_ps_is_reported_not_crashed_through(self):
-        import subprocess
-
         failure = subprocess.CalledProcessError(1, ["ps"], stderr="ps: bad option")
         with mock.patch("crom.chrome.subprocess.run", side_effect=failure):
             with self.assertRaisesRegex(CromError, "`ps` exited 1"):
@@ -370,13 +371,15 @@ class LaunchReadinessTest(unittest.TestCase):
 
     def test_a_browser_that_answers_is_returned_with_its_pids(self):
         """The port is rarely up on the first probe, so the loop has to keep waiting."""
-        with mock.patch.object(chrome, "_cdp_ready", side_effect=[False, True]):
+        with mock.patch.object(
+            chrome, "_probe_port", side_effect=[chrome._Silent(), chrome._Answered()]
+        ):
             self.assertEqual(chrome.launch(self.profile), (4242,))
 
     def test_a_chrome_that_exits_during_startup_is_reported_with_its_exit_code(self):
         self.proc.poll.return_value = 3
         started = time.monotonic()
-        with mock.patch.object(chrome, "_cdp_ready", return_value=False):
+        with mock.patch.object(chrome, "_probe_port", return_value=chrome._Silent()):
             with self.assertRaisesRegex(CromError, "exited 3 during startup"):
                 chrome.launch(self.profile)
         elapsed = time.monotonic() - started
@@ -397,24 +400,74 @@ class LaunchReadinessTest(unittest.TestCase):
         cannot express it; the ordering rationale lives in `_await_startup`'s docstring.
         """
         self.proc.poll.return_value = 0
-        with mock.patch.object(chrome, "_cdp_ready", return_value=True):
+        with mock.patch.object(chrome, "_probe_port", return_value=chrome._Answered()):
             self.assertEqual(chrome.launch(self.profile), (4242,))
 
-    def test_a_live_chrome_that_never_answers_still_reports_the_timeout(self):
+    def test_a_live_chrome_that_never_answers_names_the_timeout_and_says_it_is_alive(self):
+        """Being alive is what separates this ending from a death, so the message says so.
+
+        Without it the two readings differ only by absence — the reader has to notice that
+        no exit code was named and infer the rest, which is exactly the inspection this
+        message exists to save them.
+        """
         with (
             mock.patch.object(chrome, "LAUNCH_TIMEOUT_SECONDS", 0.3),
-            mock.patch.object(chrome, "_cdp_ready", return_value=False),
-            self.assertRaisesRegex(CromError, "did not open CDP port"),
+            mock.patch.object(chrome, "_probe_port", return_value=chrome._Silent()),
+            self.assertRaisesRegex(CromError, "still running but did not open CDP port"),
         ):
             chrome.launch(self.profile)
 
+    def test_a_stranger_on_the_port_is_not_reported_as_a_launched_browser(self):
+        """The silent failure this outcome exists to end.
 
-# Floods stderr past any pipe buffer, and only then answers on the CDP port — so a sink
-# that can block the writer is a sink that never lets this stub become ready.
-_FLOOD_THEN_SERVE = """
-import socket, sys
-sys.stderr.write("x" * 200000)
-sys.stderr.flush()
+        A bool probe counted any HTTP 200 as readiness, so `launch` returned pids for a
+        profile whose port belonged to something else and the trouble surfaced later, at
+        whichever CDP client could not connect. The mock cannot show that: `find_pids` is
+        stubbed to succeed here, so a `launch` that still trusted a bare answer would
+        return `(4242,)` and this assertion is the whole of what stops it.
+        """
+        with mock.patch.object(
+            chrome, "_probe_port", return_value=chrome._AnsweredByStranger("HTTP 404 Not Found")
+        ):
+            with self.assertRaises(CromError) as caught:
+                chrome.launch(self.profile)
+
+        message = str(caught.exception)
+        self.assertIn("not as a Chrome DevTools endpoint", message)
+        self.assertIn("HTTP 404 Not Found", message)  # what answered, quoted back
+        self.assertIn(f"lsof -nP -iTCP:{self.profile.port}", message)  # and how to find it
+
+    def test_a_stranger_ends_the_wait_without_serving_out_the_timeout(self):
+        """A listener holding the port is why Chrome cannot have it; waiting changes that
+        for nobody. Distinct from the timeout ending, which is worth its full 30s."""
+        started = time.monotonic()
+        with (
+            mock.patch.object(chrome, "LAUNCH_TIMEOUT_SECONDS", 30.0),
+            mock.patch.object(chrome, "_probe_port", return_value=chrome._AnsweredByStranger("x")),
+            self.assertRaises(CromError),
+        ):
+            chrome.launch(self.profile)
+        self.assertLess(time.monotonic() - started, 5.0)
+
+
+# The reply a real Chrome/152 serves on /json/version, kept to the field crom keys on.
+# `webSocketDebuggerUrl` is what makes an endpoint drivable, so a stub that omits it is a
+# stranger by the same rule that would reject a dev server — which is why this fixture
+# cannot be shortened to the `{}` it used to be.
+_CDP_VERSION_DOCUMENT = (
+    '{"Browser": "Chrome/152.0.7977.66", "Protocol-Version": "1.3", '
+    '"webSocketDebuggerUrl": "ws://127.0.0.1/devtools/browser/stub-uuid"}'
+)
+
+# Fills any pipe buffer before the port is ever bound, so a sink that can block the writer
+# is a sink that never lets the stub become ready.
+_FLOOD_STDERR = 'sys.stderr.write("x" * 200000); sys.stderr.flush()'
+
+
+# Trickles one byte at a time, slower than any real server and faster than the socket
+# timeout — the gap a per-`recv` timeout cannot close, since every single read is legal.
+_TRICKLE_FOREVER = '''
+import socket, sys, time
 port = int([a for a in sys.argv if a.startswith("--remote-debugging-port=")][0].split("=")[1])
 server = socket.socket()
 server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -423,9 +476,181 @@ server.listen(5)
 while True:
     conn, _ = server.accept()
     conn.recv(4096)
-    conn.sendall(b"HTTP/1.1 200 OK\\r\\nContent-Length: 2\\r\\n\\r\\n{}")
+    try:
+        conn.sendall(b"HTTP/1.1 200 OK\\r\\n\\r\\n")
+        while True:
+            conn.sendall(b"z")
+            time.sleep(0.5)
+    except OSError:
+        pass
     conn.close()
-"""
+'''
+
+# Answers on the CDP port without speaking HTTP at all — the shape of any other service
+# that happens to bind the port, and once the shape that escaped `launch` as a traceback.
+_NOT_HTTP = '''
+import socket, sys
+port = int([a for a in sys.argv if a.startswith("--remote-debugging-port=")][0].split("=")[1])
+server = socket.socket()
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server.bind(("127.0.0.1", port))
+server.listen(5)
+while True:
+    conn, _ = server.accept()
+    conn.recv(4096)
+    conn.sendall(b"SSH-2.0-OpenSSH_9.0\\r\\n")
+    conn.close()
+'''
+
+# Puts terminal escapes in the status line's reason phrase, which the stranger chooses
+# just as freely as the body — and which reaches the message down a different arm.
+_ESCAPES_IN_THE_REASON = r'''
+import socket, sys
+port = int([a for a in sys.argv if a.startswith("--remote-debugging-port=")][0].split("=")[1])
+server = socket.socket()
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server.bind(("127.0.0.1", port))
+server.listen(5)
+while True:
+    conn, _ = server.accept()
+    conn.recv(4096)
+    conn.sendall(b"HTTP/1.1 404 \x1b[2J\x1b[1;31mLAUNCH OK\x1b[0m\x07 evil-reason\r\n"
+                 b"Content-Length: 0\r\n\r\n")
+    conn.close()
+'''
+
+# Paces bytes just *under* the per-recv timeout rather than well under it, so a read is
+# reliably in flight when the overall deadline passes. `_TRICKLE_FOREVER` at 0.5s never
+# straddles that boundary, so it cannot show what one read costs after the clock runs out.
+_TRICKLE_PAST_THE_DEADLINE = '''
+import socket, sys, time
+port = int([a for a in sys.argv if a.startswith("--remote-debugging-port=")][0].split("=")[1])
+server = socket.socket()
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server.bind(("127.0.0.1", port))
+server.listen(5)
+while True:
+    conn, _ = server.accept()
+    conn.recv(4096)
+    try:
+        conn.sendall(b"HTTP/1.1 200 OK\\r\\n\\r\\n")
+        while True:
+            conn.sendall(b"z")
+            time.sleep(0.9)
+    except OSError:
+        pass
+    conn.close()
+'''
+
+# Sends the headers, then pauses longer than one recv slice but well inside the overall
+# deadline, then sends a perfectly good CDP document. A browser on a loaded machine, in
+# other words — and the case where treating a per-recv timeout as "the peer is finished"
+# condemns a healthy launch on the strength of a prefix.
+_HEADERS_THEN_A_PAUSE = '''
+import socket, sys, time
+port = int([a for a in sys.argv if a.startswith("--remote-debugging-port=")][0].split("=")[1])
+body = (b'{"Browser": "Chrome/152.0.7977.66", '
+        b'"webSocketDebuggerUrl": "ws://127.0.0.1/devtools/browser/stub-uuid"}')
+server = socket.socket()
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server.bind(("127.0.0.1", port))
+server.listen(5)
+while True:
+    conn, _ = server.accept()
+    conn.recv(4096)
+    try:
+        conn.sendall(b"HTTP/1.1 200 OK\\r\\nContent-Length: %d\\r\\n\\r\\n" % len(body))
+        time.sleep(1.4)
+        conn.sendall(body)
+    except OSError:
+        pass
+    conn.close()
+'''
+
+# Trickles the *status line* one byte at a time and never completes it. The phase an
+# HTTP client parses before it hands anything back, and so the phase a deadline that
+# starts at the response body cannot reach — measured, this held a probe past 12s.
+_TRICKLE_THE_STATUS_LINE = '''
+import socket, sys, time
+port = int([a for a in sys.argv if a.startswith("--remote-debugging-port=")][0].split("=")[1])
+server = socket.socket()
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server.bind(("127.0.0.1", port))
+server.listen(5)
+while True:
+    conn, _ = server.accept()
+    conn.recv(4096)
+    try:
+        for ch in b"HTTP/1.1 200 OK":
+            conn.sendall(bytes([ch]))
+            time.sleep(0.9)
+    except OSError:
+        pass
+    conn.close()
+'''
+
+# Accepts the connection and closes it having written nothing at all. The one case that
+# has to stay retryable rather than terminal: something answered the knock, but nothing on
+# this port has spoken, which is indistinguishable from a browser that is not up yet.
+_ACCEPT_AND_CLOSE = '''
+import socket, sys
+port = int([a for a in sys.argv if a.startswith("--remote-debugging-port=")][0].split("=")[1])
+server = socket.socket()
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server.bind(("127.0.0.1", port))
+server.listen(5)
+while True:
+    conn, _ = server.accept()
+    conn.close()
+'''
+
+# Announces no length and never closes, so a client that reads to the end of the body
+# reads until its own socket timeout instead. Not a `_serving_stub`, because what it does
+# is exactly the thing that stub cannot do: refuse to finish.
+_STREAM_FOREVER = '''
+import socket, sys
+port = int([a for a in sys.argv if a.startswith("--remote-debugging-port=")][0].split("=")[1])
+server = socket.socket()
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server.bind(("127.0.0.1", port))
+server.listen(5)
+while True:
+    conn, _ = server.accept()
+    conn.recv(4096)
+    try:
+        conn.sendall(b"HTTP/1.1 200 OK\\r\\n\\r\\n")
+        while True:
+            conn.sendall(b"z" * 4096)
+    except OSError:
+        pass
+    conn.close()
+'''
+
+
+def _serving_stub(body: str, preamble: str = "") -> str:
+    """A stub 'Chrome' that binds the CDP port and answers every request with `body`.
+
+    What it serves is a parameter because readiness now turns on the *content* of the
+    reply rather than on the fact of one: crom asks for a DevTools version document and
+    reads anything else as a stranger holding the port. One stub covers both sides of that
+    line, and `preamble` carries whatever the stub must do before it binds — as a value,
+    so there is no second stub shape and no flag deciding which one you get.
+    """
+    return f'''
+import socket, sys
+{preamble}
+port = int([a for a in sys.argv if a.startswith("--remote-debugging-port=")][0].split("=")[1])
+body = {body!r}.encode()
+server = socket.socket()
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server.bind(("127.0.0.1", port))
+server.listen(5)
+while True:
+    conn, _ = server.accept()
+    conn.recv(4096)
+    conn.sendall(b"HTTP/1.1 200 OK\\r\\nContent-Length: %d\\r\\n\\r\\n" % len(body) + body)
+    conn.close()
+'''
 
 
 class StderrCaptureTest(unittest.TestCase):
@@ -475,6 +700,37 @@ class StderrCaptureTest(unittest.TestCase):
         for pid in chrome.find_pids_for_dir(profile_dir):
             os.kill(pid, signal.SIGKILL)
 
+    def bounded(self, call: Callable[[], object], seconds: float = 30.0) -> object:
+        """Run `call` under a wall clock, returning what it returned or raising what it
+        raised — but failing the test outright if it never came back.
+
+        Every regression around reading the port shares a failure mode: it does not fail,
+        it hangs. A read that never returns takes the whole suite with it and reports
+        nothing, which is the one outcome that cannot describe itself. On a joinable
+        daemon thread the bound is enforceable and the failure names the test that hit it.
+
+        Which call is a parameter rather than a helper per call site, so `launch` and
+        `_probe_port` are bounded by the same code. [LAW:composability]
+        """
+        outcome: list[tuple[str, object]] = []
+
+        def attempt() -> None:
+            try:
+                outcome.append(("returned", call()))
+            except BaseException as e:  # noqa: BLE001 — re-raised below, on the test's thread
+                outcome.append(("raised", e))
+
+        worker = threading.Thread(target=attempt, daemon=True)
+        worker.start()
+        worker.join(seconds)
+        self.assertFalse(worker.is_alive(), f"the call did not return within {seconds:g}s")
+        kind, result = outcome[0]
+        if kind == "raised":
+            # Back on the calling thread, where `assertRaises` can see it and a genuine
+            # error is a test failure rather than a message on stderr nobody reads.
+            raise result  # type: ignore[misc]
+        return result
+
     def quoted(self, message: str) -> str:
         """What the error attributes to Chrome, isolated from the command echo.
 
@@ -519,13 +775,284 @@ class StderrCaptureTest(unittest.TestCase):
 
         Neither the port probe nor the process lookup is mocked here, and that is the
         whole design of the test: the stub floods stderr *before* it binds the port, so
-        readiness is downstream of surviving the write. Stubbing `_cdp_ready` would cut
+        readiness is downstream of surviving the write. Stubbing `_probe_port` would cut
         exactly the causal link under test — an earlier version of this test did, and it
         passed against a `stderr=PIPE` that deadlocks a real browser.
         """
-        profile = self.stub_profile(_FLOOD_THEN_SERVE, port=9302)
+        profile = self.stub_profile(
+            _serving_stub(_CDP_VERSION_DOCUMENT, _FLOOD_STDERR), port=9302
+        )
         with mock.patch.object(chrome, "LAUNCH_TIMEOUT_SECONDS", 5.0):
             self.assertTrue(chrome.launch(profile))
+
+    def test_a_real_listener_that_is_not_chrome_is_diagnosed_as_the_stranger_it_is(self):
+        """The fourth ending, against a process actually holding the port.
+
+        `LaunchReadinessTest` reaches this arm through a stubbed `_probe_port`, so nothing
+        there exercises the parse that decides a reply is not a DevTools document — the
+        assertions would pass against a probe that still answered on HTTP status alone.
+        Only a listener that really answers 200 with something else can show that.
+
+        It also has stderr to its name, because a stranger on the port does not stop
+        Chrome from having said something worth reading — the quotation belongs in this
+        arm exactly as it does in the other two.
+        """
+        profile = self.stub_profile(
+            _serving_stub(
+                "<!DOCTYPE html>\n<title>some other dev server</title>",
+                'sys.stderr.write("chrome had something to say too\\n")',
+            ),
+            port=9303,
+        )
+        with mock.patch.object(chrome, "LAUNCH_TIMEOUT_SECONDS", 5.0):
+            with self.assertRaises(CromError) as caught:
+                chrome.launch(profile)
+
+        message = str(caught.exception)
+        self.assertIn("not as a Chrome DevTools endpoint", message)
+        self.assertIn("<!DOCTYPE html>", message)  # what answered, quoted back
+        self.assertIn("chrome had something to say too", self.quoted(message))
+
+    def test_a_stranger_cannot_write_the_error_message_it_appears_in(self):
+        """Quoting the stranger hands a terminal bytes chosen by whatever holds the port.
+
+        This is the less obvious half of that hazard: Chrome's stderr is at least Chrome's,
+        but a listener crom did not launch is unvetted by definition, and it gets to pick
+        every byte of what the message repeats. It is sanitised by the same code as
+        Chrome's stderr, and this is the test that says so out loud.
+        """
+        profile = self.stub_profile(
+            _serving_stub("\x1b[2J\x1b[1;31mLAUNCH OK\x1b[0m\x07 evil-server"), port=9304
+        )
+        with mock.patch.object(chrome, "LAUNCH_TIMEOUT_SECONDS", 5.0):
+            with self.assertRaises(CromError) as caught:
+                chrome.launch(profile)
+
+        message = str(caught.exception)
+        self.assertIn("evil-server", message)  # the diagnostic survives
+        self.assertNotIn("\x1b", message)  # the escapes do not
+        self.assertNotIn("\x07", message)
+
+    def test_a_stranger_cannot_smuggle_escapes_through_the_status_line_either(self):
+        """The body is not the only text the stranger writes.
+
+        A non-200 reply reaches the message down its own arm, carrying a reason phrase the
+        stranger chose. Sanitising the body and not the reason leaves the same hole in a
+        second doorway — which is why every arm goes through `_summarise` rather than each
+        remembering. This is the arm that was already forgotten once.
+        """
+        profile = self.stub_profile(_ESCAPES_IN_THE_REASON, port=9311)
+        with mock.patch.object(chrome, "LAUNCH_TIMEOUT_SECONDS", 5.0):
+            with self.assertRaises(CromError) as caught:
+                chrome.launch(profile)
+
+        message = str(caught.exception)
+        self.assertIn("404", message)  # the diagnosis survives
+        self.assertIn("evil-reason", message)
+        self.assertNotIn("\x1b", message)  # the escapes do not
+        self.assertNotIn("\x07", message)
+
+    def test_a_stranger_serving_a_flood_cannot_become_the_error_message(self):
+        """A server holding the port answers with whatever size it likes, and the message
+        is headed for a terminal — so what is shown is one bounded line of it."""
+        profile = self.stub_profile(_serving_stub("z" * 400000), port=9305)
+        with mock.patch.object(chrome, "LAUNCH_TIMEOUT_SECONDS", 5.0):
+            with self.assertRaises(CromError) as caught:
+                chrome.launch(profile)
+
+        served = str(caught.exception).split("it served: ", 1)[1].split(". Something", 1)[0]
+        self.assertLessEqual(len(served), chrome.PORT_REPLY_SUMMARY_CHARS)
+
+    def test_a_stranger_that_never_stops_talking_is_diagnosed_anyway(self):
+        """The other bound, and the one the message cannot show: how much crom reads.
+
+        This server announces no length and never closes, so a read that asks for
+        everything never comes back at all: the socket timeout is per-recv and data keeps
+        arriving, so nothing ever times out and `up` hangs for as long as the stranger
+        cares to talk. Measured — restoring the unbounded read hangs this suite outright
+        rather than failing it. Reading a bounded slice is what lets crom answer a server
+        that has no intention of finishing, and truncation costs nothing, because a
+        truncated reply is not a DevTools document and neither was the whole.
+        """
+        profile = self.stub_profile(_STREAM_FOREVER, port=9306)
+        with mock.patch.object(chrome, "LAUNCH_TIMEOUT_SECONDS", 5.0):
+            with self.assertRaises(CromError) as caught:
+                self.bounded(lambda: chrome.launch(profile))
+
+        self.assertIn("not as a Chrome DevTools endpoint", str(caught.exception))
+
+    def test_a_launch_against_a_trickling_peer_ends_on_its_own_timeout(self):
+        """The bound a size cap cannot supply, and the reason `_read_reply` holds a clock.
+
+        This server sends one byte every 0.5s, so every individual `recv` completes well
+        inside the 1s socket timeout and nothing ever trips it. Filling the size cap that
+        way would take hours, and `_await_startup` cannot intervene because it checks its
+        deadline *between* probes and this is inside one — so `up` blocks far past the 30s
+        it documents. Only a wall clock inside the read closes that gap.
+
+        It ends on the launch timeout rather than by naming a stranger, and that is the
+        deliberate trade: a reply that never finishes is a prefix, and a prefix cannot be
+        told from a slow browser's. Every stranger anyone actually meets completes its
+        reply or closes the socket, and keeps the fast, specific diagnosis.
+        """
+        profile = self.stub_profile(_TRICKLE_FOREVER, port=9307)
+        with mock.patch.object(chrome, "LAUNCH_TIMEOUT_SECONDS", 3.0):
+            # Bounded well under the hours the regression takes, and well over the seconds
+            # the fix takes, so the gap between them is what the assertion reads.
+            with self.assertRaises(CromError) as caught:
+                self.bounded(lambda: chrome.launch(profile), seconds=60.0)
+
+        self.assertIn("did not open CDP port", str(caught.exception))
+
+    def test_one_probe_costs_no_more_than_the_ceiling_the_constants_name(self):
+        """The bound is a sum, and this is the test that holds it to the sum.
+
+        `_read_reply` checks its deadline between reads, so a read in flight when the
+        deadline passes still runs to its own timeout — the ceiling is
+        `PORT_REPLY_SECONDS + PORT_RECV_SECONDS`, not the first alone. A fixture pacing
+        well under the recv timeout never puts a read in that position and so would pass
+        against any ceiling at all; this one paces just under it, and the lower assertion
+        is what proves the straddle actually happened rather than the test flattering
+        itself.
+        """
+        profile = self.stub_profile(_TRICKLE_PAST_THE_DEADLINE, port=9312)
+        server = subprocess.Popen(
+            profile.argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        self.addCleanup(server.kill)
+        listening = time.monotonic() + 10
+        while time.monotonic() < listening:
+            with socket.socket() as knock:
+                if knock.connect_ex(("127.0.0.1", profile.port)) == 0:
+                    break
+            time.sleep(0.05)
+
+        started = time.monotonic()
+        answer = self.bounded(lambda: chrome._probe_port(profile.port))
+        elapsed = time.monotonic() - started
+
+        # Out of time mid-sentence, so the prefix is not evidence and stays retryable.
+        self.assertIsInstance(answer, chrome._Silent)
+        # Straddled: the read outlived the deadline, which is the case under test.
+        self.assertGreater(elapsed, chrome.PORT_REPLY_SECONDS)
+        # And was still capped by the ceiling the constants document, slack for scheduling.
+        ceiling = chrome.PORT_REPLY_SECONDS + chrome.PORT_RECV_SECONDS
+        self.assertLess(elapsed, ceiling + 1.0)
+
+    def test_a_status_line_that_never_finishes_cannot_outlast_the_ceiling(self):
+        """The hang the body-only deadline left open, one HTTP phase earlier.
+
+        Everything before the body — connect, request, status line, headers — was parsed
+        by a borrowed HTTP client whose only bound was per-recv, so a status line paced
+        under that timeout kept every read legal while the probe ran for hours. Measured
+        at 12s and still going, against a ceiling documented as 3s. The fixtures that
+        trickle a body cannot reach this: they all send a complete status line first.
+        """
+        profile = self.stub_profile(_TRICKLE_THE_STATUS_LINE, port=9314)
+        server = subprocess.Popen(
+            profile.argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        self.addCleanup(server.kill)
+        listening = time.monotonic() + 10
+        while time.monotonic() < listening:
+            with socket.socket() as knock:
+                if knock.connect_ex(("127.0.0.1", profile.port)) == 0:
+                    break
+            time.sleep(0.05)
+
+        started = time.monotonic()
+        answer = self.bounded(lambda: chrome._probe_port(profile.port))
+        elapsed = time.monotonic() - started
+
+        # Never a complete reply, so never evidence — and crucially never a hang either,
+        # which is the whole point: bounded, and retryable rather than terminal.
+        self.assertIsInstance(answer, chrome._Silent)
+        ceiling = chrome.PORT_REPLY_SECONDS + chrome.PORT_RECV_SECONDS
+        self.assertLess(elapsed, ceiling + 1.0)
+
+    def test_a_browser_that_pauses_mid_reply_is_not_condemned_as_a_stranger(self):
+        """A per-recv timeout says nothing about the peer being finished.
+
+        This server sends its headers, waits longer than one recv slice but well inside
+        the overall deadline, and then sends a perfectly good CDP document — a browser on
+        a loaded machine. Treating that timeout as the end of the reply hands `_classify`
+        a headers-only prefix, which is not a DevTools document, so a healthy launch fails
+        permanently as "answering, but not as a Chrome DevTools endpoint". The three
+        trickle fixtures all pace *under* the slice on purpose, so none of them can reach
+        this; it needs a pause that steps over it.
+        """
+        self.assertGreater(1.4, chrome.PORT_RECV_SECONDS)  # long enough to time a recv out
+        self.assertLess(1.4, chrome.PORT_REPLY_SECONDS)  # short enough to be in budget
+        profile = self.stub_profile(_HEADERS_THEN_A_PAUSE, port=9315)
+        with mock.patch.object(chrome, "LAUNCH_TIMEOUT_SECONDS", 10.0):
+            self.assertTrue(chrome.launch(profile))
+
+    def test_a_peer_that_accepts_and_says_nothing_stays_retryable(self):
+        """Silence and a stranger are the retryable and the terminal answer, and the line
+        between them has to be drawn by what was said, not by what was raised.
+
+        A peer that accepts and closes without writing used to reach `_Silent` only
+        because `RemoteDisconnected` inherits from `ConnectionResetError` and so was
+        caught by the `OSError` arm sitting above the `HTTPException` one — an ordering
+        called load-bearing in a comment and pinned by nothing. Reading the socket
+        directly makes it a read of zero bytes, but the boundary is worth a test either
+        way, since getting it wrong aborts launches that only needed another 100ms.
+        """
+        profile = self.stub_profile(_ACCEPT_AND_CLOSE, port=9313)
+        server = subprocess.Popen(
+            profile.argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        self.addCleanup(server.kill)
+        listening = time.monotonic() + 10
+        while time.monotonic() < listening:
+            with socket.socket() as knock:
+                if knock.connect_ex(("127.0.0.1", profile.port)) == 0:
+                    break
+            time.sleep(0.05)
+
+        self.assertIsInstance(chrome._probe_port(profile.port), chrome._Silent)
+
+    def test_a_listener_that_does_not_speak_http_is_named_by_what_it_said(self):
+        """A service holding the port without speaking HTTP is the plainest form of the
+        thing this outcome was added to name, so it gets the plainest diagnosis: the
+        banner it actually sent. Through an HTTP client this raised `BadStatusLine`, which
+        is neither an `OSError` nor a `URLError` and so escaped `launch` as a traceback."""
+        profile = self.stub_profile(_NOT_HTTP, port=9308)
+        with mock.patch.object(chrome, "LAUNCH_TIMEOUT_SECONDS", 5.0):
+            with self.assertRaises(CromError) as caught:
+                chrome.launch(profile)
+
+        message = str(caught.exception)
+        self.assertIn("not as a Chrome DevTools endpoint", message)
+        self.assertIn("SSH-2.0-OpenSSH", message)  # who is actually on the port
+
+    def test_a_chrome_whose_own_flags_inflate_its_reply_is_still_recognised(self):
+        """A configured `--user-agent` lands in `/json/version`, and the document grows.
+
+        Measured against Chrome/152: a 12,000-character agent — an ordinary thing to put
+        in `[defaults]` — makes the document 12,315 bytes. Read through a smaller cap it
+        stops parsing as JSON, and crom fails a launch that worked by calling its own
+        browser a stranger. The size cap has to clear a document the user can inflate.
+        """
+        document = (
+            '{"Browser": "Chrome/152.0.7977.66", "User-Agent": "' + "x" * 12000 + '", '
+            '"webSocketDebuggerUrl": "ws://127.0.0.1/devtools/browser/stub-uuid"}'
+        )
+        self.assertGreater(len(document), 8192)  # the bound this used to be read through
+        profile = self.stub_profile(_serving_stub(document), port=9309)
+        with mock.patch.object(chrome, "LAUNCH_TIMEOUT_SECONDS", 5.0):
+            self.assertTrue(chrome.launch(profile))
+
+    def test_a_stranger_cannot_answer_a_launch_with_a_traceback(self):
+        """Nesting deeper than the JSON decoder will follow raises `RecursionError`, which
+        is not a `ValueError` and so is not caught by the parse's other arms. It fits
+        inside the size cap now that the cap clears an inflated real document."""
+        profile = self.stub_profile(_serving_stub("[" * 20000 + "]" * 20000), port=9310)
+        with mock.patch.object(chrome, "LAUNCH_TIMEOUT_SECONDS", 5.0):
+            with self.assertRaises(CromError) as caught:
+                chrome.launch(profile)
+
+        self.assertIn("not as a Chrome DevTools endpoint", str(caught.exception))
 
     def test_the_quotation_is_bounded_by_the_tail_of_what_was_printed(self):
         """A browser that logged all day is quoted by its ending, not its whole history."""
