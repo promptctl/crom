@@ -13,16 +13,25 @@ import re
 import signal
 import socket
 import subprocess
+import tempfile
+import textwrap
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import IO
 
 from .model import CromError, ResolvedProfile
 
 LAUNCH_TIMEOUT_SECONDS = 30.0
 SHUTDOWN_TIMEOUT_SECONDS = 5.0
+
+# Enough to carry Chrome's complaint and the lines around it, small enough that a browser
+# which logged all day is quoted by its ending rather than its whole history.
+STDERR_TAIL_BYTES = 4096
 
 
 # `ps` hands us one flat string per process with no argv boundaries, so the directory
@@ -165,6 +174,70 @@ def _require_port_available(profile: ResolvedProfile) -> None:
 
 
 @dataclass(frozen=True)
+class _StderrSink:
+    """Where a starting Chrome's stderr goes, and the separate handle we read it back by.
+
+    A file, not a pipe, because Chrome outlives crom. Nothing drains a pipe after `up`
+    exits, so a browser that fills the OS buffer blocks on write and never opens CDP —
+    measured, a child that printed 200KB and stayed alive was still unreachable three
+    seconds later through an undrained `PIPE`, and reached us in 0.02s through a file. A
+    file has no buffer to fill and needs no reader to survive.
+
+    `handle` is the child's end and `path` the reader's, and they are two open file
+    descriptions on one inode by design rather than one shared between us. `fork`+`dup2`
+    hands the child our file *offset* as well as our file, so seeking `handle` in order to
+    read it rewinds where Chrome writes next: measured, a child printing `AAAA` then
+    `BBBB` around a parent `seek(0)` leaves a file containing only `BBBB`. Reading through
+    a second descriptor keeps our seeks ours.
+    """
+
+    handle: IO[bytes]
+    path: Path
+
+    def tail(self) -> str:
+        """The last `STDERR_TAIL_BYTES` of what Chrome has said so far.
+
+        Decoded leniently: this is diagnostic text on its way into an error message, and a
+        malformed byte in Chrome's output is not a reason to fail while reporting a
+        failure. [LAW:no-silent-failure] would be inverted by raising here.
+        """
+        with open(self.path, "rb") as reader:
+            reader.seek(0, os.SEEK_END)
+            reader.seek(max(0, reader.tell() - STDERR_TAIL_BYTES))
+            return reader.read().decode("utf-8", errors="replace").strip()
+
+
+@contextmanager
+def _stderr_sink() -> Iterator[_StderrSink]:
+    """Lend Chrome a stderr sink for the launch window that leaves nothing behind.
+
+    The file is unlinked on the way out while Chrome still holds it open. A launch that
+    succeeded goes on writing into an inode with no name — no artifact to find, none to
+    clean up, and the space reclaimed in full when the browser exits. So capture costs a
+    successful launch exactly what `DEVNULL` did: nothing anyone can see.
+    """
+    fd, name = tempfile.mkstemp(prefix="crom-chrome-stderr-")
+    path = Path(name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            yield _StderrSink(handle=handle, path=path)
+    finally:
+        path.unlink()
+
+
+def _quote(transcript: str) -> str:
+    """Render Chrome's own words as a message section, or nothing when it said nothing.
+
+    Both arms return a section, so callers interpolate it unconditionally rather than
+    branching on whether Chrome spoke. [LAW:dataflow-not-control-flow] the emptiness is a
+    value the message absorbs, not a case the message has to know about.
+    """
+    if not transcript:
+        return ""
+    return f"\nChrome said:\n{textwrap.indent(transcript, '    ')}"
+
+
+@dataclass(frozen=True)
 class _Answered:
     """CDP replied on the port we asked for. The launch succeeded."""
 
@@ -217,44 +290,48 @@ def launch(profile: ResolvedProfile) -> tuple[int, ...]:
     it never comes up, rather than returning a port nothing is listening on. A browser
     that died and a browser that is merely slow fail with different messages, because
     they are different problems and only one of them is worth waiting the full timeout
-    for.
+    for — and either way the message carries Chrome's own account of itself, which is
+    usually the only line in it a user can act on.
     """
     _require_port_available(profile)
     profile.profile_dir.mkdir(parents=True, exist_ok=True)
     command = " ".join(profile.argv)
 
-    try:
-        proc = subprocess.Popen(
-            profile.argv,
-            env={**os.environ, **profile.env},
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-    except OSError as e:
-        # `config` checks an explicit `chrome_binary` at parse time, so reaching here
-        # means the binary moved or lost its permissions between then and now. Raised as
-        # a CromError so it lands inside the CLI's exit-code contract rather than
-        # escaping as a raw traceback. [LAW:no-silent-failure]
-        raise CromError(
-            f"could not start Chrome for '{profile.ref}': {e}\nCommand was: {command}"
-        ) from e
+    with _stderr_sink() as sink:
+        try:
+            proc = subprocess.Popen(
+                profile.argv,
+                env={**os.environ, **profile.env},
+                stdout=subprocess.DEVNULL,
+                stderr=sink.handle,
+                start_new_session=True,
+            )
+        except OSError as e:
+            # `config` checks an explicit `chrome_binary` at parse time, so reaching here
+            # means the binary moved or lost its permissions between then and now. Raised
+            # as a CromError so it lands inside the CLI's exit-code contract rather than
+            # escaping as a raw traceback. [LAW:no-silent-failure]
+            raise CromError(
+                f"could not start Chrome for '{profile.ref}': {e}\nCommand was: {command}"
+            ) from e
 
-    match _await_startup(proc, profile.port):
+        outcome = _await_startup(proc, profile.port)
+        # Read unconditionally: one operation on every launch, and what varies is the text
+        # it returns. [LAW:dataflow-not-control-flow]
+        said = _quote(sink.tail())
+
+    match outcome:
         case _Answered():
             return find_pids(profile)
         case _Exited(returncode):
-            # [LAW:no-silent-failure] The exit code is the whole of what we know here;
-            # Chrome's own account of itself went to DEVNULL above and is the next
-            # ticket's business.
             raise CromError(
                 f"Chrome for '{profile.ref}' exited {returncode} during startup, before "
-                f"it opened CDP port {profile.port}.\nCommand was: {command}"
+                f"it opened CDP port {profile.port}.{said}\nCommand was: {command}"
             )
         case _NeverAnswered():
             raise CromError(
                 f"Chrome did not open CDP port {profile.port} for '{profile.ref}' within "
-                f"{LAUNCH_TIMEOUT_SECONDS:.0f}s.\nCommand was: {command}"
+                f"{LAUNCH_TIMEOUT_SECONDS:.0f}s.{said}\nCommand was: {command}"
             )
 
 

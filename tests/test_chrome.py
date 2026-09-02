@@ -6,9 +6,13 @@ prefixes of one another. Both decide whether `crom up` sees its own browser or l
 a second one on top of it.
 """
 
+import dataclasses
+import os
 import shutil
 import signal
 import socket
+import sys
+import tempfile
 import time
 import unittest
 from pathlib import Path
@@ -391,6 +395,129 @@ class LaunchReadinessTest(unittest.TestCase):
             self.assertRaisesRegex(CromError, "did not open CDP port"),
         ):
             chrome.launch(self.profile)
+
+
+# Floods stderr past any pipe buffer, and only then answers on the CDP port — so a sink
+# that can block the writer is a sink that never lets this stub become ready.
+_FLOOD_THEN_SERVE = """
+import socket, sys
+sys.stderr.write("x" * 200000)
+sys.stderr.flush()
+port = int([a for a in sys.argv if a.startswith("--remote-debugging-port=")][0].split("=")[1])
+server = socket.socket()
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server.bind(("127.0.0.1", port))
+server.listen(5)
+while True:
+    conn, _ = server.accept()
+    conn.recv(4096)
+    conn.sendall(b"HTTP/1.1 200 OK\\r\\nContent-Length: 2\\r\\n\\r\\n{}")
+    conn.close()
+"""
+
+
+class StderrCaptureTest(unittest.TestCase):
+    """What a failing launch is able to quote back from the browser that failed.
+
+    These run a real child process. `LaunchReadinessTest` mocks `Popen`, so nothing there
+    ever writes to the sink — every assertion about capture would pass against a `launch`
+    that still sent stderr to `DEVNULL`. What Chrome says can only be tested by letting
+    something actually say it.
+    """
+
+    def stub_profile(self, script: str, port: int = 9301) -> ResolvedProfile:
+        """A profile whose 'Chrome' is a Python one-liner we control."""
+        profile = temp_profile(self, port=port)
+        return dataclasses.replace(
+            profile,
+            chrome_binary=Path(sys.executable),
+            argv=(
+                sys.executable,
+                "-c",
+                script,
+                f"--user-data-dir={profile.profile_dir}",
+                f"--remote-debugging-port={port}",
+            ),
+        )
+
+    def quoted(self, message: str) -> str:
+        """What the error attributes to Chrome, isolated from the command echo.
+
+        Every launch error ends with `Command was: <argv>`, and a stub's argv *is* the
+        source that prints the strings it prints — so `assertIn(text, message)` passes on
+        the echo alone. Measured: with `stderr=DEVNULL` restored, every assertion in this
+        class written against the whole message still passed. Only this block is evidence
+        that anything was captured.
+        """
+        self.assertIn("Chrome said:\n", message)
+        return message.split("Chrome said:\n", 1)[1].split("\nCommand was:", 1)[0]
+
+    def test_what_chrome_printed_before_dying_is_quoted_in_the_error(self):
+        """The whole point: the actionable line survives the launch that failed."""
+        profile = self.stub_profile(
+            "import sys; sys.stderr.write('FATAL: unknown switch --nope\\n'); sys.exit(3)"
+        )
+        started = time.monotonic()
+        with self.assertRaises(CromError) as caught:
+            chrome.launch(profile)
+
+        self.assertIn("exited 3 during startup", str(caught.exception))
+        self.assertIn("FATAL: unknown switch --nope", self.quoted(str(caught.exception)))
+        self.assertLess(time.monotonic() - started, 5.0)
+
+    def test_a_silent_death_is_reported_without_an_empty_quotation(self):
+        """Nothing to quote reads as nothing, not as a `Chrome said:` heading over blank."""
+        profile = self.stub_profile("import sys; sys.exit(1)")
+        with self.assertRaises(CromError) as caught:
+            chrome.launch(profile)
+
+        self.assertIn("exited 1 during startup", str(caught.exception))
+        self.assertNotIn("Chrome said", str(caught.exception))
+
+    def test_a_chatty_browser_that_stays_alive_still_reaches_readiness(self):
+        """The hazard capture introduces, and the reason the sink is a file.
+
+        A pipe nobody drains stops the child at the OS buffer — ~64KB on macOS — so it
+        blocks on write and never opens CDP. Nothing about that is visible to a mocked
+        `Popen`, and it appears only against a browser chatty enough to fill the buffer,
+        which Chrome is.
+
+        Neither the port probe nor the process lookup is mocked here, and that is the
+        whole design of the test: the stub floods stderr *before* it binds the port, so
+        readiness is downstream of surviving the write. Stubbing `_cdp_ready` would cut
+        exactly the causal link under test — an earlier version of this test did, and it
+        passed against a `stderr=PIPE` that deadlocks a real browser.
+        """
+        profile = self.stub_profile(_FLOOD_THEN_SERVE, port=9302)
+        with mock.patch.object(chrome, "LAUNCH_TIMEOUT_SECONDS", 5.0):
+            pids = chrome.launch(profile)
+
+        for pid in pids:
+            self.addCleanup(os.kill, pid, signal.SIGKILL)
+        self.assertTrue(pids)
+
+    def test_the_quotation_is_bounded_by_the_tail_of_what_was_printed(self):
+        """A browser that logged all day is quoted by its ending, not its whole history."""
+        profile = self.stub_profile(
+            "import sys; sys.stderr.write('n' * 50000 + 'THE-LAST-WORD'); sys.exit(2)"
+        )
+        with self.assertRaises(CromError) as caught:
+            chrome.launch(profile)
+
+        section = self.quoted(str(caught.exception))
+        self.assertIn("THE-LAST-WORD", section)
+        # 50KB printed, and the error stays the size of the tail plus its indent.
+        self.assertLess(len(section), chrome.STDERR_TAIL_BYTES + 200)
+
+    def test_capture_leaves_no_file_behind(self):
+        """Capture costs a successful launch what `DEVNULL` did: nothing anyone can find."""
+        before = set(Path(tempfile.gettempdir()).glob("crom-chrome-stderr-*"))
+        profile = self.stub_profile("import sys; sys.stderr.write('noise'); sys.exit(1)")
+        with self.assertRaises(CromError):
+            chrome.launch(profile)
+
+        after = set(Path(tempfile.gettempdir()).glob("crom-chrome-stderr-*"))
+        self.assertEqual(after - before, set())
 
 
 if __name__ == "__main__":
