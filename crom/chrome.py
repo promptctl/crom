@@ -14,7 +14,6 @@ import re
 import signal
 import socket
 import subprocess
-import tempfile
 import textwrap
 import time
 from collections.abc import Iterator
@@ -31,6 +30,12 @@ SHUTDOWN_TIMEOUT_SECONDS = 5.0
 # Enough to carry Chrome's complaint and the lines around it, small enough that a browser
 # which logged all day is quoted by its ending rather than its whole history.
 STDERR_TAIL_BYTES = 4096
+
+# What Chrome's stderr is called inside the profile's user-data-dir. Prefixed because
+# Chrome writes `chrome_debug.log` into that same directory under `--enable-logging`, and
+# an operator reading a launch failure should be able to tell at a glance which of the two
+# files crom put there.
+STDERR_FILENAME = "crom-stderr.log"
 
 # How long crom keeps reading whatever answers on the CDP port, and how long any one
 # blocking socket operation inside that may take. One probe costs at most the sum, and it
@@ -506,58 +511,62 @@ class _StderrSink:
             return f"(crom could not read what Chrome printed: {e})"
         return _printable(raw)
 
+    def quoted(self) -> str:
+        """Chrome's own words as a message section, or nothing when it said nothing.
+
+        Both arms return a section, so callers interpolate it unconditionally rather than
+        branching on whether Chrome spoke. [LAW:dataflow-not-control-flow] the emptiness
+        is a value the message absorbs, not a case the message has to know about.
+
+        The tail is capped and the file is not, so the section names the file it was read
+        from: the quotation answers "what happened", the path answers "and what else did
+        it say". A silent Chrome gets neither, because an empty file is nothing to find.
+        """
+        transcript = self.tail()
+        if not transcript:
+            return ""
+        return (
+            f"\nChrome said:\n{textwrap.indent(transcript, '    ')}"
+            f"\nIts full output is at {self.path}"
+        )
+
 
 @contextmanager
-def _stderr_sink() -> Iterator[_StderrSink]:
-    """Lend Chrome a stderr sink for the launch window that leaves nothing behind.
+def _stderr_sink(profile_dir: Path) -> Iterator[_StderrSink]:
+    """Lend Chrome a stderr sink that outlives the launch under a name someone can find.
 
-    The file is unlinked on the way out while Chrome still holds it open, so a launch
-    that succeeded goes on writing into an inode with no name: nothing to find, nothing
-    to clean up, and the space reclaimed in full when the browser exits.
+    This file used to be a `NamedTemporaryFile` unlinked on the way out, which left a
+    successful launch writing into an inode with no name — invisible to `du` and `find`
+    until the browser died and took it with it. The space is the same either way; what
+    changed is that an operator can now see whose it is, and read it. It doubles as the
+    answer to "what did my Chrome say", which previously existed only inside a failed
+    launch's error message.
 
-    Unlike `DEVNULL` that is not free, and the cost is bounded by nothing crom holds —
-    it exits about a second after the browser starts, so there is no process left to
-    truncate or rotate anything. Measured against a real headless Chrome: 5.3KB after
-    four minutes on crom's default flags, essentially all of it during startup. Under
-    `--enable-logging=stderr --v=1` it is 676KB in ninety seconds. The driver is
-    activity, not uptime, so a busy profile configured for verbose logging can hold a
-    large invisible file for as long as it runs. Bounding it needs a sink someone is
-    still watching, which is a different design than this one.
+    Truncated per launch rather than appended to, and living inside the user-data-dir
+    rather than beside it, because both make the lifetime someone else already owns the
+    right one: the file holds what *this* browser said, and `rm` deletes it with the
+    profile it belongs to while `down` leaves it for the post-mortem. Neither needs a
+    cleanup rule of its own. [LAW:single-enforcer] one place deletes a profile's data.
+
+    Unbounded within a launch, and deliberately: bounding it needs a live process to
+    truncate or rotate, and crom exits about a second after the browser starts. Measured
+    against a real headless Chrome: 5.3KB after four minutes on crom's default flags,
+    essentially all of it during startup, against 676KB in ninety seconds under
+    `--enable-logging=stderr --v=1`. The driver is activity, not uptime. Visible and
+    unbounded is the trade — an operator can act on a large file they can see, and
+    cannot act on a browser's output crom threw away.
     """
+    path = profile_dir / STDERR_FILENAME
     try:
-        # Creating and opening in one call is what keeps the guard honest: a separate
-        # `mkstemp` + `os.fdopen` needs two, and a failure between them leaks the
-        # descriptor — in the one situation, exhaustion, where that is least affordable.
-        handle = tempfile.NamedTemporaryFile(prefix="crom-chrome-stderr-", delete=False)
+        handle = path.open("wb")
     except OSError as e:
         # `CromGroup.invoke` handles `CromError` alone, so a raw OSError would leave
         # `launch` as a traceback and bypass the exit-code contract. Translated here for
         # the same reason `Popen` and `ps` are. [LAW:no-silent-failure]
-        raise CromError(f"could not open a temporary file to capture Chrome's output: {e}") from e
+        raise CromError(f"could not open {path} to capture Chrome's output: {e}") from e
 
-    path = Path(handle.name)
-    try:
-        with handle:
-            yield _StderrSink(handle=handle, path=path)
-    finally:
-        # `missing_ok` because a tmp-cleaner having got there first is not a failure:
-        # the state unlink exists to establish already holds. Anything else — a temp
-        # filesystem that went read-only mid-launch — stays loud, even though it costs
-        # the error in flight, because that is the browser's filesystem breaking and not
-        # diagnostics plumbing. [LAW:no-silent-failure]
-        path.unlink(missing_ok=True)
-
-
-def _quote(transcript: str) -> str:
-    """Render Chrome's own words as a message section, or nothing when it said nothing.
-
-    Both arms return a section, so callers interpolate it unconditionally rather than
-    branching on whether Chrome spoke. [LAW:dataflow-not-control-flow] the emptiness is a
-    value the message absorbs, not a case the message has to know about.
-    """
-    if not transcript:
-        return ""
-    return f"\nChrome said:\n{textwrap.indent(transcript, '    ')}"
+    with handle:
+        yield _StderrSink(handle=handle, path=path)
 
 
 def _await_startup(proc: subprocess.Popen[bytes], port: int) -> _LaunchOutcome:
@@ -613,7 +622,7 @@ def launch(profile: ResolvedProfile) -> tuple[int, ...]:
     profile.profile_dir.mkdir(parents=True, exist_ok=True)
     command = " ".join(profile.argv)
 
-    with _stderr_sink() as sink:
+    with _stderr_sink(profile.profile_dir) as sink:
         try:
             proc = subprocess.Popen(
                 profile.argv,
@@ -634,7 +643,7 @@ def launch(profile: ResolvedProfile) -> tuple[int, ...]:
         outcome = _await_startup(proc, profile.port)
         # Read unconditionally: one operation on every launch, and what varies is the text
         # it returns. [LAW:dataflow-not-control-flow]
-        said = _quote(sink.tail())
+        said = sink.quoted()
 
     match outcome:
         case _Answered():
