@@ -8,7 +8,6 @@ Everything here takes a `ResolvedProfile`, whose `argv` is already complete, so 
 module never reads a config file or decides a port.
 """
 
-import http.client
 import json
 import os
 import re
@@ -18,8 +17,6 @@ import subprocess
 import tempfile
 import textwrap
 import time
-import urllib.error
-import urllib.request
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -36,11 +33,16 @@ SHUTDOWN_TIMEOUT_SECONDS = 5.0
 STDERR_TAIL_BYTES = 4096
 
 # How long crom keeps reading whatever answers on the CDP port, and how long any one
-# blocking socket operation inside that may take. One probe costs at most the sum: the
-# deadline is checked between reads, so a read already in flight when it passes still runs
-# to its own timeout. Stating the arithmetic is the point of having both names — the
-# second used to be a bare `timeout=1` at the `urlopen` call, which left the quantity that
-# actually matters, what one probe can cost, written down in neither place.
+# blocking socket operation inside that may take. One probe costs at most the sum, and it
+# is a sum because the deadline is checked between reads, so a read already in flight when
+# it passes still runs to its own timeout. Both names exist so that arithmetic can be read
+# somewhere; the second was once a bare `timeout=1` passed to an HTTP client, which left
+# the quantity that actually matters — what one probe can cost — written down nowhere.
+#
+# The ceiling covers connecting, sending, and reading, because `_probe_port` owns its
+# socket for all three. Borrowed, it covered only the phase after the headers: a status
+# line trickled one byte per 0.9s held a probe open past 12 measured seconds, every
+# individual recv legal, against a ceiling that then claimed 3s.
 #
 # The recv slice is not smaller because a real browser needs it. Measured against
 # Chrome/152 on loopback, worst time from the connection being accepted to the reply being
@@ -63,6 +65,14 @@ PORT_REPLY_BYTES = 65536
 # One line of an unknown server's reply, long enough to recognise it by and short enough
 # that a minified page cannot become the error message.
 PORT_REPLY_SUMMARY_CHARS = 120
+
+# HTTP/1.1 because Chrome's DevTools server answers nothing at all to HTTP/1.0 — measured.
+# `Connection: close` is a courtesy to every other server: Chrome ignores it and holds the
+# socket open, so the read cannot rely on it, but a listener that honours it lets the read
+# finish on end-of-reply rather than on the clock.
+_VERSION_REQUEST = (
+    b"GET /json/version HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+)
 
 
 # `ps` hands us one flat string per process with no argv boundaries, so the directory
@@ -271,30 +281,73 @@ def _advertises_devtools(reply: bytes) -> bool:
         return False
 
 
-def _read_reply(resp: http.client.HTTPResponse) -> bytes:
-    """Whatever the port is willing to say, within a bounded time and a bounded size.
+def _body_of(reply: bytes) -> bytes:
+    """What follows the header block, or nothing while the headers are still arriving."""
+    return reply.partition(b"\r\n\r\n")[2]
 
-    Three endings — enough bytes, end of the reply, or the clock — and the clock is the
-    one that had to exist. `resp.read(n)` blocks until it holds all n bytes, and the
-    socket timeout bounds each `recv` rather than the call, so a listener trickling one
-    byte just under that timeout keeps every individual read legal while the total runs to
-    hours. `_await_startup` cannot see it, because it checks its deadline between probes
-    and this is inside one. Bounding bytes never bounded that; only a clock does.
+
+def _describe(reply: bytes) -> str:
+    """One line naming what answered, for someone who has to go and find it.
+
+    The body first, because that is where a server puts the page identifying itself, and
+    the status line when there is no body — which is all a reply that never finished its
+    headers has to offer, and exactly what a listener speaking some other protocol
+    entirely hands over.
+    """
+    identifying = _body_of(reply) or reply.partition(b"\r\n")[0]
+    return _summarise(identifying.decode("utf-8", "replace")) or "an empty reply"
+
+
+def _classify(reply: bytes) -> _PortAnswer:
+    """What was said on the port, as the answer it amounts to.
+
+    [LAW:parse-dont-validate] the whole ladder lives here, so the three outcomes are read
+    off one value rather than assembled from where an exception happened to be caught.
+    Saying nothing is not the same as saying something crom cannot use: the first is a
+    port that has not come up yet and is worth asking again, the second ends the launch.
+    """
+    if not reply:
+        return _Silent()
+    if _advertises_devtools(_body_of(reply)):
+        return _Answered()
+    return _AnsweredByStranger(_describe(reply))
+
+
+def _read_reply(conn: socket.socket, deadline: float) -> bytes:
+    """Whatever the port says, until the answer is known or the clock runs out.
+
+    Four endings, and the clock is the one that had to exist. An HTTP client borrowed from
+    the library bounds each `recv` and never the call, so a listener trickling one byte
+    just under that timeout keeps every individual read legal while the total runs for
+    hours — measured, a status line paced at one byte per 0.9s held a probe open past 12s
+    against a 3s ceiling. `_await_startup` cannot intervene, because it checks its deadline
+    between probes and this is inside one. Bounding bytes never bounded that; only a clock
+    does, and only a socket this function owns can be held to one for the whole exchange
+    rather than for the part after the headers.
     [LAW:no-ambient-temporal-coupling] how long this may take is owned here rather than
     left to whatever is on the far end.
 
-    The same shape survives one layer down, bounded rather than removed: this deadline is
-    also checked between reads, so a read in flight when it passes runs on to its own
-    timeout. That is why the ceiling is `PORT_REPLY_SECONDS + PORT_RECV_SECONDS` and not
-    the first alone — a real bound, but the sum, and the constants say so.
+    Stopping as soon as the reply *is* a CDP document is what keeps the clock from costing
+    anything. Chrome ignores `Connection: close` and holds the socket open — measured — so
+    reading to end-of-reply would spend the full deadline on every healthy launch. There
+    is nothing to wait for once the question is answered, so it does not wait: a stranger
+    that holds the connection open spends the deadline, and spends it once, because that
+    outcome ends the launch.
     """
-    deadline = time.monotonic() + PORT_REPLY_SECONDS
     reply = b""
     while len(reply) < PORT_REPLY_BYTES and time.monotonic() < deadline:
-        chunk = resp.read1(PORT_REPLY_BYTES - len(reply))
+        try:
+            chunk = conn.recv(PORT_REPLY_BYTES - len(reply))
+        except OSError:
+            # A peer that stops talking is described by what it already said, so the
+            # partial reply is kept rather than thrown away with the exception. An
+            # accepted connection that says nothing at all yields b"", which is silence.
+            break
         if not chunk:
             break
         reply += chunk
+        if _advertises_devtools(_body_of(reply)):
+            break
     return reply
 
 
@@ -312,40 +365,43 @@ def _probe_port(port: int) -> _PortAnswer:
     could drive — a silent failure that surfaced later as a CDP client refusing to connect
     to a profile crom had called running.
 
-    An HTTP status that is not 200 lands with the stranger rather than with silence, since
-    something is speaking HTTP there and it is not serving CDP. Measured against
-    Chrome/152 on macOS, that costs no real launch: sampling this endpoint every 5ms
-    across four startups yielded exactly two observations each time — connection refused,
-    then 200 with the version document — and never an intermediate reply. There is no
-    window in which a starting Chrome looks like a stranger.
+    Anything that answers without being that document is a stranger rather than silence,
+    since something is speaking on the port and it is not serving CDP. Measured, that
+    costs no real launch — a starting browser is never briefly mistakable for a stranger:
+
+        macOS,  Chrome/152      4 startups,   5ms sampling
+        Linux,  Chromium/151   12 startups, tight loop, in a container, all cores loaded
+
+    Every run on both, without exception, produced exactly two observations: connection
+    refused, then a complete CDP document. The Linux runs are the stronger half — load
+    stretched startup from 0.2s to 0.5s, widening any partially-initialised window, and
+    49,598 samples landed inside it without once catching a non-200 or a malformed
+    document. That is evidence, not proof; what would overturn it is a single sample of a
+    starting browser answering something else, and a listener that hangs on the port for
+    the whole timeout instead of failing in half a second is what it would cost.
 
     What this cannot tell apart is a *different* Chrome on our port, which advertises the
     same shape. `_require_port_available` rejects a port already held before launch, so
     what remains is a listener that appeared inside the wait window, where the realistic
     stranger is not a browser.
-    """
-    try:
-        url = f"http://127.0.0.1:{port}/json/version"
-        with urllib.request.urlopen(url, timeout=PORT_RECV_SECONDS) as resp:
-            reply = _read_reply(resp)
-    except urllib.error.HTTPError as e:
-        return _AnsweredByStranger(f"HTTP {e.code} {_summarise(str(e.reason))}")
-    except (urllib.error.URLError, OSError):
-        # A half-delivered response reads the same as nothing here, and calling it silence
-        # costs only another 100ms round. Reached far more often by the ordinary case:
-        # the port is refusing connections because Chrome has not opened it yet.
-        return _Silent()
-    except http.client.HTTPException as e:
-        # Something accepted the connection and then said what HTTP could not parse, which
-        # is a stranger rather than silence — and it is how a service that does not speak
-        # HTTP at all shows up, the very case this outcome exists for. Below the `OSError`
-        # arm deliberately: `RemoteDisconnected` is both a `ConnectionResetError` and a
-        # `BadStatusLine`, and a connection that closed without saying anything is silence.
-        return _AnsweredByStranger(_summarise(f"{type(e).__name__}: {e}"))
 
-    if _advertises_devtools(reply):
-        return _Answered()
-    return _AnsweredByStranger(_summarise(reply.decode("utf-8", "replace")) or "an empty reply")
+    The socket is ours rather than an HTTP client's because the deadline has to cover the
+    whole exchange — see `_read_reply`. That also settles what a peer accepting and then
+    closing means: it is a read of zero bytes, so silence falls out of the data, instead of
+    resting on `RemoteDisconnected` being caught by one `except` arm and not the next.
+    """
+    deadline = time.monotonic() + PORT_REPLY_SECONDS
+    try:
+        with socket.create_connection(("127.0.0.1", port), PORT_RECV_SECONDS) as conn:
+            conn.sendall(_VERSION_REQUEST)
+            reply = _read_reply(conn, deadline)
+    except OSError:
+        # Overwhelmingly the ordinary case: the port refuses connections because Chrome
+        # has not opened it yet. Also a connection that broke before it said anything,
+        # which is the same fact — nothing on this port has spoken to us.
+        return _Silent()
+
+    return _classify(reply)
 
 
 def _require_port_available(profile: ResolvedProfile) -> None:
