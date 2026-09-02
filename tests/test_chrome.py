@@ -487,8 +487,7 @@ while True:
 '''
 
 # Answers on the CDP port without speaking HTTP at all — the shape of any other service
-# that happens to bind the port. `http.client` cannot parse the status line and raises
-# `BadStatusLine`, which is neither an `OSError` nor a `URLError`.
+# that happens to bind the port, and once the shape that escaped `launch` as a traceback.
 _NOT_HTTP = '''
 import socket, sys
 port = int([a for a in sys.argv if a.startswith("--remote-debugging-port=")][0].split("=")[1])

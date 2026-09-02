@@ -201,11 +201,9 @@ def _printable(text: str) -> str:
 def _summarise(text: str) -> str:
     """One short printable line of something a stranger on the port chose to say.
 
-    Every arm of `_probe_port` that quotes its stranger comes through here — the reply
-    body, an HTTP reason phrase, the offending line inside an `HTTPException`. All three
-    are chosen by whatever holds the port and all three land in an error headed for a
-    terminal, so they are one job rather than three call sites that each have to remember.
-    An arm added later reaches the sanitising by using this; one was already forgotten.
+    Every byte of it was written by whatever holds the port, and every byte of it lands in
+    an error headed for a terminal, so being made safe and being made short are one job
+    here rather than two that a message-building call site has to remember.
     """
     return textwrap.shorten(_printable(text), PORT_REPLY_SUMMARY_CHARS, placeholder=" …")
 
