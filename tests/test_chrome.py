@@ -9,6 +9,7 @@ a second one on top of it.
 import shutil
 import signal
 import socket
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -21,6 +22,32 @@ from crom.resolve import build_argv
 def ps_line(pid: int, argv) -> str:
     """Render argv the way `ps -Ao pid=,command=` does: space-joined, boundaries lost."""
     return f"{pid} {' '.join(argv)}"
+
+
+def temp_profile(test: unittest.TestCase, port: int = 9300) -> ResolvedProfile:
+    """A profile whose directory really exists, removed when `test` finishes.
+
+    Real rather than notional because `launch` creates the profile dir before it spawns
+    anything, so a read-only path fails these tests before they reach what they cover.
+    The cleanup is registered against the `mkdtemp` root, not the nested profile dir, so
+    the whole tree goes — and `mkdtemp`, unlike `TemporaryDirectory`, has no owner whose
+    lifetime could end first.
+    """
+    import tempfile
+
+    root = Path(tempfile.mkdtemp())
+    test.addCleanup(shutil.rmtree, root, ignore_errors=True)
+    profile_dir = root / "myapp" / "dev"
+    return ResolvedProfile(
+        ref=ProfileRef("myapp", "dev"),
+        port=port,
+        profile_dir=profile_dir,
+        chrome_binary=Path("/chrome"),
+        argv=("/chrome", f"--user-data-dir={profile_dir}"),
+        env={},
+        seed=SeedFresh(),
+        source=None,
+    )
 
 
 class GroupByUserDataDirTest(unittest.TestCase):
@@ -278,29 +305,6 @@ class ProcessBoundaryTest(unittest.TestCase):
     without any test noticing, because the happy path is unaffected either way.
     """
 
-    def _profile(self) -> ResolvedProfile:
-        # A real directory: `launch` creates the profile dir before spawning, so a
-        # read-only path would fail this test before it reached the boundary it covers.
-        # `launch` does that `mkdir` *before* the mocked `Popen` raises, so the tree is
-        # genuinely created — and `mkdtemp`, unlike `TemporaryDirectory`, has no owner by
-        # construction. The cleanup is registered against the mkdtemp root, not the
-        # nested profile dir, so the whole tree goes.
-        import tempfile
-
-        root = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
-        profile_dir = root / "myapp" / "dev"
-        return ResolvedProfile(
-            ref=ProfileRef("myapp", "dev"),
-            port=9300,
-            profile_dir=profile_dir,
-            chrome_binary=Path("/chrome"),
-            argv=("/chrome", f"--user-data-dir={profile_dir}"),
-            env={},
-            seed=SeedFresh(),
-            source=None,
-        )
-
     def test_a_missing_ps_is_reported_not_crashed_through(self):
         """`scan` is the single process-table reader, so every command that asks about
         process state arrives here — a raw error is a raw error from all of them."""
@@ -322,9 +326,71 @@ class ProcessBoundaryTest(unittest.TestCase):
         with mock.patch("crom.chrome.subprocess.Popen", side_effect=OSError("no such file")):
             with mock.patch("crom.chrome._require_port_available"):
                 with self.assertRaises(CromError) as caught:
-                    chrome.launch(self._profile())
+                    chrome.launch(temp_profile(self))
 
         self.assertIn("myapp/dev", str(caught.exception))
+
+
+class LaunchReadinessTest(unittest.TestCase):
+    """What `launch` concludes about a browser that has been started but is not up yet.
+
+    A dead Chrome and a slow Chrome used to be indistinguishable here: the wait loop
+    watched only the CDP port, so the only ending it could reach was "timed out". That
+    cost 30 seconds of wall clock and then named the wrong cause — the port, when the
+    process had been gone since millisecond twenty.
+    """
+
+    def setUp(self):
+        self.profile = temp_profile(self)
+        self.proc = mock.Mock()
+        self.proc.poll.return_value = None  # alive, unless a test says otherwise
+        for patch in (
+            mock.patch("crom.chrome.subprocess.Popen", return_value=self.proc),
+            mock.patch("crom.chrome._require_port_available"),
+            mock.patch.object(chrome, "find_pids", return_value=(4242,)),
+        ):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def test_a_browser_that_answers_is_returned_with_its_pids(self):
+        """The port is rarely up on the first probe, so the loop has to keep waiting."""
+        with mock.patch.object(chrome, "_cdp_ready", side_effect=[False, True]):
+            self.assertEqual(chrome.launch(self.profile), (4242,))
+
+    def test_a_chrome_that_exits_during_startup_is_reported_with_its_exit_code(self):
+        self.proc.poll.return_value = 3
+        started = time.monotonic()
+        with mock.patch.object(chrome, "_cdp_ready", return_value=False):
+            with self.assertRaisesRegex(CromError, "exited 3 during startup"):
+                chrome.launch(self.profile)
+        elapsed = time.monotonic() - started
+
+        # The point of the whole change: the answer arrives at the speed of the poll
+        # interval, not the launch timeout. A generous bound — the regression it guards
+        # against is 30s, so anything near it fails here.
+        self.assertLess(elapsed, 5.0)
+
+    def test_a_chrome_that_exits_after_opening_the_port_is_a_successful_launch(self):
+        """A dead child and a reachable port is a success, and the port is what decides.
+
+        macOS forwards a second launch to the already-running instance and exits 0, so
+        "the process we spawned is gone" does not imply "no browser is listening". An
+        implementation that fails on a dead child without consulting the port breaks a
+        launch that worked. What this does *not* pin down is the order of the two
+        observations inside a round — that race is microseconds wide and a static mock
+        cannot express it; the ordering rationale lives in `_await_startup`'s docstring.
+        """
+        self.proc.poll.return_value = 0
+        with mock.patch.object(chrome, "_cdp_ready", return_value=True):
+            self.assertEqual(chrome.launch(self.profile), (4242,))
+
+    def test_a_live_chrome_that_never_answers_still_reports_the_timeout(self):
+        with (
+            mock.patch.object(chrome, "LAUNCH_TIMEOUT_SECONDS", 0.3),
+            mock.patch.object(chrome, "_cdp_ready", return_value=False),
+            self.assertRaisesRegex(CromError, "did not open CDP port"),
+        ):
+            chrome.launch(self.profile)
 
 
 if __name__ == "__main__":
