@@ -627,6 +627,34 @@ while True:
 '''
 
 
+# Chrome's own launcher shape: the process crom starts hands the browser off and exits,
+# so the pid crom holds dies while a live browser goes on serving the port. Timed to land
+# the parent's death *inside* the first probe — the first connection is accepted and never
+# answered, so that probe spends `PORT_REPLY_SECONDS` and the 0.5s exit falls squarely in
+# the middle of it. That is the whole fixture: everything else here exists to make those
+# two clocks overlap. Not a `_serving_stub`, which has no way to die halfway through
+# serving. The stub's own timing is what makes the case reachable, so it is written down
+# here rather than left to the scheduler. [LAW:no-ambient-temporal-coupling]
+_HANDS_OFF_AND_DIES = f'''
+import os, socket, sys, time
+port = int([a for a in sys.argv if a.startswith("--remote-debugging-port=")][0].split("=")[1])
+server = socket.socket()
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server.bind(("127.0.0.1", port))
+server.listen(5)
+if os.fork():
+    time.sleep(0.5)
+    os._exit(3)
+body = {_CDP_VERSION_DOCUMENT!r}.encode()
+held, _ = server.accept()
+while True:
+    conn, _ = server.accept()
+    conn.recv(4096)
+    conn.sendall(b"HTTP/1.1 200 OK\\r\\nContent-Length: %d\\r\\n\\r\\n" % len(body) + body)
+    conn.close()
+'''
+
+
 def _serving_stub(body: str, preamble: str = "") -> str:
     """A stub 'Chrome' that binds the CDP port and answers every request with `body`.
 
@@ -796,6 +824,14 @@ class StderrCaptureTest(unittest.TestCase):
         It also has stderr to its name, because a stranger on the port does not stop
         Chrome from having said something worth reading — the quotation belongs in this
         arm exactly as it does in the other two.
+
+        The full 30s timeout is left standing so the clock is part of the assertion: a
+        stranger ends the wait when it is seen, and the listener holding the port will not
+        yield inside the deadline, so serving it out buys nobody anything. The mocked
+        sibling test pins that against a stubbed `_probe_port`; this one pins it for a
+        diagnosis that had to be parsed out of real bytes first. It holds only because
+        this stranger finishes its reply — one that trickles without ever finishing is a
+        prefix, and a prefix ends on the launch timeout by design.
         """
         profile = self.stub_profile(
             _serving_stub(
@@ -804,10 +840,12 @@ class StderrCaptureTest(unittest.TestCase):
             ),
             port=9303,
         )
-        with mock.patch.object(chrome, "LAUNCH_TIMEOUT_SECONDS", 5.0):
-            with self.assertRaises(CromError) as caught:
-                chrome.launch(profile)
+        started = time.monotonic()
+        with self.assertRaises(CromError) as caught:
+            self.bounded(lambda: chrome.launch(profile), seconds=60.0)
+        elapsed = time.monotonic() - started
 
+        self.assertLess(elapsed, 10.0)  # against the 30s a launch is otherwise given
         message = str(caught.exception)
         self.assertIn("not as a Chrome DevTools endpoint", message)
         self.assertIn("<!DOCTYPE html>", message)  # what answered, quoted back
@@ -1011,6 +1049,28 @@ class StderrCaptureTest(unittest.TestCase):
             time.sleep(0.05)
 
         self.assertIsInstance(chrome._probe_port(profile.port), chrome._Silent)
+
+    def test_a_browser_that_outlives_the_process_crom_started_is_still_a_launch(self):
+        """A launcher that hands off and exits is a browser, not a dead Chrome.
+
+        This is the one thing a mocked `Popen` cannot say. `_await_startup` samples
+        liveness *before* the port, so a child that exits while a probe is in flight is
+        still reported as `None` for that round and the port gets asked once more before
+        the launch is called dead. A static mock answers identically at both observation
+        points, so swapping the two lines leaves every other test in this file green —
+        only a process that really dies between them can tell the orders apart.
+
+        The stub makes that window wide instead of racing it: its first connection is
+        accepted and never answered, so probe one spends `PORT_REPLY_SECONDS`, and the
+        parent exits half a second into those two. Probe two then meets the forked child
+        serving CDP, and the launch succeeds against a pid that has been dead for a
+        second and a half. Sampling the port first fails it with `exited 3` instead.
+        """
+        profile = self.stub_profile(_HANDS_OFF_AND_DIES, port=9316)
+        with mock.patch.object(chrome, "LAUNCH_TIMEOUT_SECONDS", 10.0):
+            pids = self.bounded(lambda: chrome.launch(profile), seconds=30.0)
+
+        self.assertTrue(pids)
 
     def test_a_listener_that_does_not_speak_http_is_named_by_what_it_said(self):
         """A service holding the port without speaking HTTP is the plainest form of the

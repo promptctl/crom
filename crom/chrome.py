@@ -563,12 +563,16 @@ def _quote(transcript: str) -> str:
 def _await_startup(proc: subprocess.Popen[bytes], port: int) -> _LaunchOutcome:
     """Watch a starting Chrome until the port answers, the child dies, or time runs out.
 
-    Liveness is sampled *before* the port so that the port gets the last word within a
-    round: a child observed alive and then found to have exited still counts as answered
-    if the port replied in between. The two observations cannot be simultaneous, and this
-    is the order in which their disagreement resolves toward the browser that is actually
-    reachable. [LAW:no-ambient-temporal-coupling] the ordering is the mechanism, not a
-    timing bet — no sleep tunes it and no retry papers over it.
+    Liveness is sampled *before* the port, which buys a dying child one more probe: the
+    exit code read at the top of a round is from before that round's probe, so a child
+    that dies while the port is being asked still reads as alive here and the port is
+    asked again before the launch is called dead. That is not a spare round — Chrome's
+    own launcher hands the browser off and exits, and the browser it leaves behind is
+    what answers on the round after. (An answer outranks an exit within a single round
+    whichever way round the samples are taken, because the match reads the port's answer
+    first. The sample order decides only how many rounds the port gets.)
+    [LAW:no-ambient-temporal-coupling] the ordering is the mechanism, not a timing bet —
+    no sleep tunes it and no retry papers over it.
 
     A stranger ends the wait as soon as it is seen. Waiting it out would buy nothing: the
     listener holding the port is why Chrome cannot have it, and it will not yield inside
