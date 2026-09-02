@@ -195,28 +195,51 @@ class _StderrSink:
     path: Path
 
     def tail(self) -> str:
-        """The last `STDERR_TAIL_BYTES` of what Chrome has said so far.
+        """The last `STDERR_TAIL_BYTES` of what Chrome has said so far, safe to print.
 
-        Decoded leniently: this is diagnostic text on its way into an error message, and a
-        malformed byte in Chrome's output is not a reason to fail while reporting a
-        failure. [LAW:no-silent-failure] would be inverted by raising here.
+        One job, done once at the boundary: bytes crom does not control become text a
+        terminal will display, so downstream holds a printable string by construction
+        rather than by discipline. [LAW:parse-dont-validate]
+
+        Bad UTF-8 is replaced, not raised on — refusing to decode would fail while
+        reporting a failure. Control characters are dropped because `DEVNULL` used to
+        guarantee nothing Chrome emitted reached a terminal, and Chrome's log lines carry
+        page-derived text, so an escape sequence could repaint the error it appears in.
+        Newline and tab are the message's shape, not control of the terminal, and stay.
         """
         with open(self.path, "rb") as reader:
             reader.seek(0, os.SEEK_END)
             reader.seek(max(0, reader.tell() - STDERR_TAIL_BYTES))
-            return reader.read().decode("utf-8", errors="replace").strip()
+            raw = reader.read().decode("utf-8", errors="replace")
+        return "".join(ch for ch in raw if ch in "\n\t" or ch.isprintable()).strip()
 
 
 @contextmanager
 def _stderr_sink() -> Iterator[_StderrSink]:
     """Lend Chrome a stderr sink for the launch window that leaves nothing behind.
 
-    The file is unlinked on the way out while Chrome still holds it open. A launch that
-    succeeded goes on writing into an inode with no name — no artifact to find, none to
-    clean up, and the space reclaimed in full when the browser exits. So capture costs a
-    successful launch exactly what `DEVNULL` did: nothing anyone can see.
+    The file is unlinked on the way out while Chrome still holds it open, so a launch
+    that succeeded goes on writing into an inode with no name: nothing to find, nothing
+    to clean up, and the space reclaimed in full when the browser exits.
+
+    Unlike `DEVNULL` that is not free, and the cost is bounded by nothing crom holds —
+    it exits about a second after the browser starts, so there is no process left to
+    truncate or rotate anything. Measured against a real headless Chrome: 5.3KB after
+    four minutes on crom's default flags, essentially all of it during startup. Under
+    `--enable-logging=stderr --v=1` it is 676KB in ninety seconds. The driver is
+    activity, not uptime, so a busy profile configured for verbose logging can hold a
+    large invisible file for as long as it runs. Bounding it needs a sink someone is
+    still watching, which is a different design than this one.
     """
-    fd, name = tempfile.mkstemp(prefix="crom-chrome-stderr-")
+    try:
+        fd, name = tempfile.mkstemp(prefix="crom-chrome-stderr-")
+    except OSError as e:
+        # A full or read-only temp dir is the one way this fails, and it would otherwise
+        # leave `launch` by a route the CLI does not catch: `CromGroup.invoke` handles
+        # `CromError` alone, so a raw OSError escapes the exit-code contract as a
+        # traceback. Translated here for the same reason `Popen` and `ps` are.
+        # [LAW:no-silent-failure]
+        raise CromError(f"could not open a temporary file to capture Chrome's output: {e}") from e
     path = Path(name)
     try:
         with os.fdopen(fd, "wb") as handle:

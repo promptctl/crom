@@ -426,19 +426,42 @@ class StderrCaptureTest(unittest.TestCase):
     """
 
     def stub_profile(self, script: str, port: int = 9301) -> ResolvedProfile:
-        """A profile whose 'Chrome' is a Python one-liner we control."""
+        """A profile whose 'Chrome' is a Python script we control.
+
+        The script goes in a file and only its *path* goes in argv. Passing source with
+        `-c` puts its newlines into the process's command line, and `scan()` reads `ps`
+        output a line at a time keyed on a leading PID — macOS `ps` folds those newlines
+        away, Linux procps prints them, and there the one process spans several lines of
+        which only the first carries a PID. `find_pids` would then find nothing for a
+        stub that is running perfectly well.
+
+        Cleanup is registered here rather than from whatever `launch` returns, so a stub
+        that outlives its test is killed even when the assertion about it fails.
+        [LAW:dataflow-not-control-flow] the kill is not conditional on the result it is
+        supposed to be independent of — an earlier version stranded a live server on the
+        test port precisely when the test failed.
+        """
         profile = temp_profile(self, port=port)
+        fd, name = tempfile.mkstemp(suffix=".py", prefix="crom-stub-")
+        os.write(fd, script.encode())
+        os.close(fd)
+        self.addCleanup(os.unlink, name)
+        self.addCleanup(self.kill_stubs, profile.profile_dir)
         return dataclasses.replace(
             profile,
             chrome_binary=Path(sys.executable),
             argv=(
                 sys.executable,
-                "-c",
-                script,
+                name,
                 f"--user-data-dir={profile.profile_dir}",
                 f"--remote-debugging-port={port}",
             ),
         )
+
+    def kill_stubs(self, profile_dir: Path) -> None:
+        """Kill whatever is still running against this profile dir, if anything is."""
+        for pid in chrome.find_pids_for_dir(profile_dir):
+            os.kill(pid, signal.SIGKILL)
 
     def quoted(self, message: str) -> str:
         """What the error attributes to Chrome, isolated from the command echo.
@@ -490,11 +513,7 @@ class StderrCaptureTest(unittest.TestCase):
         """
         profile = self.stub_profile(_FLOOD_THEN_SERVE, port=9302)
         with mock.patch.object(chrome, "LAUNCH_TIMEOUT_SECONDS", 5.0):
-            pids = chrome.launch(profile)
-
-        for pid in pids:
-            self.addCleanup(os.kill, pid, signal.SIGKILL)
-        self.assertTrue(pids)
+            self.assertTrue(chrome.launch(profile))
 
     def test_the_quotation_is_bounded_by_the_tail_of_what_was_printed(self):
         """A browser that logged all day is quoted by its ending, not its whole history."""
@@ -508,6 +527,25 @@ class StderrCaptureTest(unittest.TestCase):
         self.assertIn("THE-LAST-WORD", section)
         # 50KB printed, and the error stays the size of the tail plus its indent.
         self.assertLess(len(section), chrome.STDERR_TAIL_BYTES + 200)
+
+    def test_terminal_escapes_in_what_chrome_printed_do_not_reach_the_message(self):
+        """Quoting Chrome hands its bytes to a terminal, which `DEVNULL` never did.
+
+        Chrome's log lines carry page-derived text, so the bytes are not all Chrome's
+        own. Left raw, an escape sequence could clear the screen or hide the error it is
+        printed inside — the message would be attacker-shaped rather than Chrome-shaped.
+        """
+        profile = self.stub_profile(
+            r"import sys; sys.stderr.write('\x1b[2J\x1b[1;31mFAKE PROMPT\x1b[0m\x07 real"
+            r" detail\n'); sys.exit(4)"
+        )
+        with self.assertRaises(CromError) as caught:
+            chrome.launch(profile)
+
+        section = self.quoted(str(caught.exception))
+        self.assertIn("real detail", section)  # the diagnostic survives
+        self.assertNotIn("\x1b", section)  # the escapes do not
+        self.assertNotIn("\x07", section)
 
     def test_capture_leaves_no_file_behind(self):
         """Capture costs a successful launch what `DEVNULL` did: nothing anyone can find."""
