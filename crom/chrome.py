@@ -16,6 +16,7 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
 
 from .model import CromError, ResolvedProfile
@@ -163,17 +164,67 @@ def _require_port_available(profile: ResolvedProfile) -> None:
     )
 
 
+@dataclass(frozen=True)
+class _Answered:
+    """CDP replied on the port we asked for. The launch succeeded."""
+
+
+@dataclass(frozen=True)
+class _Exited:
+    """The child process was gone before CDP ever replied."""
+
+    returncode: int
+
+
+@dataclass(frozen=True)
+class _NeverAnswered:
+    """The deadline passed with the child still alive and the port still silent."""
+
+
+# [LAW:types-are-the-program] The wait has three real endings, so it resolves to a value
+# with three shapes. Before this union it returned pids or raised a timeout — two shapes
+# for three endings, and the ending with nowhere to go was the common one: a Chrome that
+# died in 20ms got reported, 30 seconds later, as a port that had not opened yet.
+_LaunchOutcome = _Answered | _Exited | _NeverAnswered
+
+
+def _await_startup(proc: subprocess.Popen[bytes], port: int) -> _LaunchOutcome:
+    """Watch a starting Chrome until it serves CDP, dies, or runs out of time.
+
+    Liveness is sampled *before* readiness so that readiness gets the last word within a
+    round: a child observed alive and then found to have exited still counts as answered
+    if the port replied in between. The two observations cannot be simultaneous, and this
+    is the order in which their disagreement resolves toward the browser that is actually
+    reachable. [LAW:no-ambient-temporal-coupling] the ordering is the mechanism, not a
+    timing bet — no sleep tunes it and no retry papers over it.
+    """
+    deadline = time.time() + LAUNCH_TIMEOUT_SECONDS
+    while True:
+        returncode = proc.poll()
+        if _cdp_ready(port):
+            return _Answered()
+        if returncode is not None:
+            return _Exited(returncode)
+        if time.time() >= deadline:
+            return _NeverAnswered()
+        time.sleep(0.1)
+
+
 def launch(profile: ResolvedProfile) -> tuple[int, ...]:
     """Start Chrome for this profile and return its PIDs once CDP answers.
 
     [LAW:no-silent-failure] we wait for the endpoint we promised the caller and raise if
-    it never comes up, rather than returning a port nothing is listening on.
+    it never comes up, rather than returning a port nothing is listening on. A browser
+    that died and a browser that is merely slow fail with different messages, because
+    they are different problems and only one of them is worth waiting the full timeout
+    for.
     """
     _require_port_available(profile)
     profile.profile_dir.mkdir(parents=True, exist_ok=True)
+    command = " ".join(profile.argv)
 
     try:
-        subprocess.Popen(
+        proc = subprocess.Popen(
             profile.argv,
             env={**os.environ, **profile.env},
             stdout=subprocess.DEVNULL,
@@ -186,19 +237,25 @@ def launch(profile: ResolvedProfile) -> tuple[int, ...]:
         # a CromError so it lands inside the CLI's exit-code contract rather than
         # escaping as a raw traceback. [LAW:no-silent-failure]
         raise CromError(
-            f"could not start Chrome for '{profile.ref}': {e}\n"
-            f"Command was: {' '.join(profile.argv)}"
+            f"could not start Chrome for '{profile.ref}': {e}\nCommand was: {command}"
         ) from e
 
-    deadline = time.time() + LAUNCH_TIMEOUT_SECONDS
-    while time.time() < deadline:
-        if _cdp_ready(profile.port):
+    match _await_startup(proc, profile.port):
+        case _Answered():
             return find_pids(profile)
-        time.sleep(0.1)
-    raise CromError(
-        f"Chrome did not open CDP port {profile.port} for '{profile.ref}' within "
-        f"{LAUNCH_TIMEOUT_SECONDS:.0f}s.\nCommand was: {' '.join(profile.argv)}"
-    )
+        case _Exited(returncode):
+            # [LAW:no-silent-failure] The exit code is the whole of what we know here;
+            # Chrome's own account of itself went to DEVNULL above and is the next
+            # ticket's business.
+            raise CromError(
+                f"Chrome for '{profile.ref}' exited {returncode} during startup, before "
+                f"it opened CDP port {profile.port}.\nCommand was: {command}"
+            )
+        case _NeverAnswered():
+            raise CromError(
+                f"Chrome did not open CDP port {profile.port} for '{profile.ref}' within "
+                f"{LAUNCH_TIMEOUT_SECONDS:.0f}s.\nCommand was: {command}"
+            )
 
 
 def _await_exit(profile: ResolvedProfile) -> bool:
