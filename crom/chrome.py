@@ -4,8 +4,14 @@
 running." We identify a crom-managed Chrome by the absolute `--user-data-dir` path it
 was launched with — no pidfiles, no shadow state that can drift from reality.
 
-Everything here takes a `ResolvedProfile`, whose `argv` is already complete, so this
-module never reads a config file or decides a port.
+That authority is scoped to profiles crom launched, and one other question needs a
+different mechanism: "does *any* browser hold this directory." The user's own Chrome
+runs with no `--user-data-dir` in its argv, so `scan` cannot see it at all —
+`singleton_holder` reads Chrome's own process singleton instead. Two questions, two
+mechanisms, both about Chrome, so both live here.
+
+Nothing here reads a config file or decides a port — what to launch arrives already
+resolved.
 """
 
 import json
@@ -185,12 +191,101 @@ def is_running(profile: ResolvedProfile) -> bool:
     return bool(find_pids(profile))
 
 
-def _printable(text: str) -> str:
+# Chrome's own process singleton. At startup the browser creates this as a symlink whose
+# target is `<hostname>-<pid>` — a link that never resolves, the target string being the
+# whole payload — and removes it on clean exit. It is the only record of "someone is
+# writing this user-data-dir" that covers a Chrome crom did not launch.
+SINGLETON_LOCK = "SingletonLock"
+
+
+def _pid_alive(pid: str) -> bool | None:
+    """Is the process this text names running — or None when it names no pid to ask about.
+
+    Takes the raw text rather than an int because asking the OS *is* how we learn the
+    text was a pid at all: `str.isdigit` admits `'²'`, which `int` then rejects, and
+    admits digit strings far past the `pid_t` `os.kill` takes. Splitting the question
+    across two predicates let them disagree, and the disagreement left by exception.
+    [LAW:parse-dont-validate]
+    """
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (ValueError, OverflowError):
+        # Not a number, or not one this machine can hold in a pid: either way the caller
+        # is not looking at the convention Chrome writes.
+        return None
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # A fact about the process, not the path — the opposite reading to the one
+        # `singleton_holder` gives this same exception. Alive and owned by another user:
+        # what we lack is the right to signal it, which is not what we asked.
+        return True
+
+
+def singleton_holder(user_data_dir: Path) -> str | None:
+    """What holds this user-data-dir against a consistent read, described — or None.
+
+    The string is *evidence*, not a verdict: it says what was found on disk, and the
+    caller writes the sentence around it. That is what lets the four ways of being held
+    share one return type. [LAW:dataflow-not-control-flow]
+
+      absent, or unreachable          nobody has it open, or Chrome exited cleanly → None
+      `<host>-<pid>`, ours, alive     a browser is writing it                      → held
+      `<host>-<pid>`, ours, dead      residue of a crash; nothing is writing        → None
+      `<host>-<pid>`, another host    a pid this machine cannot ask about           → held
+      unreadable, not `<host>-<pid>`, or a pid no OS could hold  → not the convention → held
+
+    The last two are held because unknown is not the same as free, and only one of the
+    two mistakes is recoverable: refusing a still directory costs the caller a command,
+    while copying a moving one costs them a profile that fails weeks later.
+    [LAW:no-silent-failure]
+    """
+    try:
+        target = os.readlink(user_data_dir / SINGLETON_LOCK)
+    except (FileNotFoundError, NotADirectoryError, PermissionError):
+        # These say the path could not be resolved, which is a fact about the path and
+        # not about any lock — nothing holds a user-data-dir that is a regular file, and
+        # nothing is proven by a directory we were not allowed to look in. Reading them
+        # as held would send an operator off to quit a browser that was never open.
+        #
+        # Free is safe, not merely kinder: nothing can be observed inside a directory we
+        # may not enter, and any operation that would act on this same path fails against
+        # the same permission. [LAW:composability]
+        return None
+    except OSError as e:
+        # Anything else — EINVAL for a `SingletonLock` that exists but is not a symlink,
+        # EIO for a sick disk — found something or failed for a reason that does not
+        # block the copy. Unknown is not free. [LAW:no-silent-failure]
+        return f"{SINGLETON_LOCK} could not be read as a symlink: {e.strerror}"
+
+    # Sanitised before it leaves: a `path` seed can name an untrusted tree, and this
+    # evidence reaches a terminal through `_refuse`.
+    seen = f"{SINGLETON_LOCK} -> {printable(target)}"
+    # `rpartition`, because the host half carries hyphens of its own — `my-mac.local-123`
+    # splits after the pid, never before it.
+    host, _, pid = target.rpartition("-")
+    alive = _pid_alive(pid)
+    if not host or alive is None:
+        return f"{seen}, which is not the `<host>-<pid>` Chrome writes"
+    if host != socket.gethostname():
+        # A profile on a synced or network home directory, locked from elsewhere. Also
+        # what a same-machine hostname change looks like, so both names are quoted: macOS
+        # moves between `.local` and `.lan` with the network, and the operator reading
+        # this needs to see that the two strings differ only there.
+        return (
+            f"{seen}, which names host {host!r}; this machine is "
+            f"{socket.gethostname()!r}, so that process cannot be asked whether it is "
+            f"still running"
+        )
+    return f"{seen}, and that process is running" if alive else None
+
+
+def printable(text: str) -> str:
     """Text crom did not write, rendered so a terminal will only ever display it.
 
-    One job, done once wherever foreign text enters a message: Chrome's stderr, and
-    whatever answers on the CDP port. Downstream then holds a printable string by
-    construction rather than by discipline. [LAW:parse-dont-validate]
+    One job, done once wherever foreign text enters a message. Downstream then holds a
+    printable string by construction rather than by discipline. [LAW:parse-dont-validate]
 
     Control characters are dropped because this text reaches a terminal that `DEVNULL`
     used to shield: Chrome's log lines carry page-derived text, and a listener on the port
@@ -210,7 +305,7 @@ def _summarise(text: str) -> str:
     an error headed for a terminal, so being made safe and being made short are one job
     here rather than two that a message-building call site has to remember.
     """
-    return textwrap.shorten(_printable(text), PORT_REPLY_SUMMARY_CHARS, placeholder=" …")
+    return textwrap.shorten(printable(text), PORT_REPLY_SUMMARY_CHARS, placeholder=" …")
 
 
 def _lsof_hint(port: int) -> str:
@@ -517,7 +612,7 @@ class _StderrSink:
     def tail(self) -> str:
         """The last `STDERR_TAIL_BYTES` of what Chrome has said so far, safe to print.
 
-        `_printable` does the rendering, so what Chrome writes and what a stranger on the
+        `printable` does the rendering, so what Chrome writes and what a stranger on the
         CDP port writes are made safe by one piece of code rather than two that could
         drift apart. [LAW:single-enforcer]
         """
@@ -533,7 +628,7 @@ class _StderrSink:
             # successful launch too, where a raw error would crash a browser that came
             # up fine over a diagnostic nobody needed.
             return f"(crom could not read what Chrome printed: {e})"
-        return _printable(raw)
+        return printable(raw)
 
     def quoted(self) -> str:
         """Chrome's own words as a message section, or nothing when it said nothing.

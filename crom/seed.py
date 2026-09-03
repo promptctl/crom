@@ -4,18 +4,24 @@ Seeding is a create-time act, not a launch-time one: once the directory exists i
 the profile's own state and crom never overwrites it. Which is why the seed is worth
 choosing deliberately — copying a real Chrome profile duplicates hundreds of megabytes
 and every cookie in it, so `fresh` is the default and `chrome` is opt-in.
+
+A seed is copied only while nothing is writing it: crom reads the seed's ancestry before
+and after, and refuses — saying what it saw — if a browser holds it at either read.
 """
 
 import contextlib
 import os
 import shutil
+import stat
 import sys
 import tempfile
 from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 
+from . import chrome
 from .locking import exclusive
-from .model import CromError, ResolvedProfile, SeedChrome, SeedFresh, SeedPath
+from .model import CromError, ResolvedProfile, Seed, SeedChrome, SeedFresh, SeedPath
 
 # Where the user's real Chrome keeps its user-data-dir, per platform. POSIX only, as
 # crom is throughout: `chrome.scan` answers "is this profile running" by shelling out to
@@ -117,10 +123,92 @@ def _link_guard(source: Path, described: str):
     return guard
 
 
-def _copy(source: Path, dest: Path, described: str) -> None:
-    if not source.is_dir():
-        raise CromError(f"seed {described} does not exist: {source}")
-    dest.parent.mkdir(parents=True, exist_ok=True)
+@dataclass(frozen=True)
+class _Copy:
+    """One directory to duplicate."""
+
+    source: Path
+    dest: Path
+    described: str
+
+
+def _refuse(copy: _Copy, held: Path, holder: str, lead: str) -> CromError:
+    """The one thing crom says when it will not read a seed: what it saw, and the way out."""
+    return CromError(
+        chrome.printable(
+            f"seed {copy.described} {lead}:\n"
+            f"  {held}\n"
+            f"  {holder}\n"
+            f"crom will not copy a user-data-dir a browser is writing. Chrome keeps Cookies, "
+            f"History, Login Data and Web Data in SQLite databases it writes continuously, "
+            f"so a copy taken now can catch one mid-transaction — and the damage surfaces "
+            f"much later as missing history or a profile-error dialog, with nothing pointing "
+            f"back here.\n"
+            f'Quit that browser and run this again, or set `seed = "fresh"` for a '
+            f"profile that starts empty."
+        )
+    )
+
+
+def _held(source: Path) -> tuple[Path, str] | None:
+    """The nearest directory over `source` a browser is writing, and its evidence.
+
+    Chrome takes *one* singleton, at the user-data-dir root, and it governs everything
+    beneath — so the question a copy has to ask is not "is this directory a user-data-dir",
+    which is unanswerable for the arbitrary trees a `path` seed may name, but "is anything
+    above this one held". Walking ancestors answers that without ever classifying a
+    directory, which is what makes it total over both seed kinds: a `chrome` seed's root
+    is an ancestor of the profile it copies, and a `path` seed naming `Chrome/Default` —
+    or `Chrome/Default/Extensions` — finds the lock that a parent-only rule would miss.
+    """
+    for directory in (source, *source.parents):
+        holder = chrome.singleton_holder(directory)
+        if holder is not None:
+            return directory, holder
+    return None
+
+
+@contextlib.contextmanager
+def _undisturbed(copy: _Copy) -> Iterator[None]:
+    """Read the seed's ancestry before and after, and refuse unless both say idle.
+
+    One check would only prove the browser was closed at the instant crom looked. Chrome
+    takes its singleton at startup and holds it for the session, so a browser opened
+    while `copytree` was walking leaves the lock behind for the second read to find — and
+    `_staged` then discards the partial copy rather than commit a torn one.
+
+    What remains uncovered is a browser that both starts *and* exits cleanly inside the
+    copy, which erases its own evidence. That is the residue of this approach, not an
+    oversight; closing it would need a generation counter Chrome does not keep.
+    """
+    before = _held(copy.source)
+    if before is not None:
+        raise _refuse(copy, *before, "is in use")
+    yield
+    after = _held(copy.source)
+    if after is not None:
+        raise _refuse(copy, *after, "was opened by a browser while crom was copying it")
+
+
+def _copy(copy: _Copy) -> None:
+    # `os.stat` rather than `Path.is_dir`, because what `is_dir` does with an unreadable
+    # path is not settled across the Pythons crom supports: 3.12 raises, 3.14 answers
+    # False. Either would report a seed we were merely refused as one that is not there.
+    try:
+        present = stat.S_ISDIR(os.stat(copy.source).st_mode)
+    except (FileNotFoundError, NotADirectoryError):
+        present = False
+    except OSError as e:
+        raise CromError(
+            chrome.printable(
+                f"seed {copy.described} cannot be read: {copy.source}: {e.strerror}"
+            )
+        ) from e
+    if not present:
+        raise CromError(
+            chrome.printable(f"seed {copy.described} does not exist: {copy.source}")
+        )
+    copy.dest.parent.mkdir(parents=True, exist_ok=True)
     # `dest` is either absent or the freshly-made empty staging directory, never a
     # profile with contents of its own.
     #
@@ -128,8 +216,8 @@ def _copy(source: Path, dest: Path, described: str) -> None:
     # vets each directory's entries as `copytree` reaches them, so every link that gets
     # recreated is relative and resolves inside the tree.
     shutil.copytree(
-        source, dest, dirs_exist_ok=True, symlinks=True,
-        ignore=_link_guard(source, described),
+        copy.source, copy.dest, dirs_exist_ok=True, symlinks=True,
+        ignore=_link_guard(copy.source, copy.described),
     )
 
 
@@ -193,20 +281,32 @@ def materialize_under_lock(profile: ResolvedProfile) -> bool:
         return False
 
     with _staged(profile.profile_dir) as staging:
-        match profile.seed:
-            case SeedFresh():
-                # Nothing to fill: Chrome builds a first-run profile in the empty
-                # directory itself.
-                pass
-            case SeedChrome(profile=which):
-                # A Chrome user-data-dir holds one directory per profile; we copy the
-                # named one into the canonical slot so the browser opens straight into it.
-                _copy(
-                    chrome_user_data_dir() / which,
-                    staging / "Default",
-                    f"'chrome:{which}'",
-                )
-            case SeedPath(path=path):
-                # A path is expected to be a whole user-data-dir, copied verbatim.
-                _copy(path, staging, f"path '{path}'")
+        for copy in _plan(profile.seed, staging):
+            with _undisturbed(copy):
+                _copy(copy)
     return True
+
+
+def _plan(seed: Seed, staging: Path) -> tuple[_Copy, ...]:
+    """What a seed means as directories to duplicate — nought, or one.
+
+    A plan rather than three arms that each copy, so that everything true of *a* copy —
+    the stillness check today, whatever comes next — is written once at the one place the
+    plan is walked, and cannot be added to `chrome` while being forgotten for `path`.
+    [LAW:single-enforcer]
+
+    `fresh` is the empty plan rather than a case that skips the copy: the loop below runs
+    the same way for every seed, and the seed decides only what flows through it.
+    [LAW:dataflow-not-control-flow]
+    """
+    match seed:
+        case SeedFresh():
+            # Chrome builds a first-run profile in the empty directory itself.
+            return ()
+        case SeedChrome(profile=which):
+            # A Chrome user-data-dir holds one directory per profile; we copy the named
+            # one into the canonical slot so the browser opens straight into it.
+            root = chrome_user_data_dir()
+            return (_Copy(root / which, staging / "Default", f"'chrome:{which}'"),)
+        case SeedPath(path=path):
+            return (_Copy(path, staging, f"path '{path}'"),)
