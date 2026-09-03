@@ -5,7 +5,10 @@ mostly about the failure path: a copy that dies partway must not leave a stump b
 for the next run to mistake for a finished profile.
 """
 
+import os
 import shutil
+import subprocess
+import socket
 import sys
 import tempfile
 import threading
@@ -14,7 +17,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from crom import seed
+from crom import chrome, seed
 from crom.model import CromError, ProfileRef, ResolvedProfile, SeedChrome, SeedFresh, SeedPath
 
 
@@ -29,6 +32,13 @@ def profile(profile_dir: Path, spec_seed) -> ResolvedProfile:
         seed=spec_seed,
         source=None,
     )
+
+
+def _dead_pid() -> int:
+    """A pid that has certainly exited — spawned, waited on, and reaped."""
+    proc = subprocess.Popen([sys.executable, "-c", ""])
+    proc.wait()
+    return proc.pid
 
 
 class MaterializeTest(unittest.TestCase):
@@ -294,6 +304,123 @@ class ChromeUserDataDirTest(unittest.TestCase):
     def test_with_neither_installed_it_names_a_real_path_to_report(self):
         """The caller's "seed 'chrome' does not exist: …" has to name something."""
         self.assertEqual(seed.chrome_user_data_dir(), self.chrome)
+
+
+class LiveSeedTest(unittest.TestCase):
+    """A seed is copied only while nothing is writing it.
+
+    A user-data-dir holds SQLite databases the browser writes continuously, and a
+    recursive copy has no transaction: it can take a database mid-write, or a table
+    without the journal that makes sense of it. The copy reports success either way and
+    the damage surfaces weeks later, which is why this is refused rather than mitigated.
+    """
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.dest = self.root / "profiles" / "myapp" / "dev"
+        self.source = self.root / "user-data"
+        (self.source / "Default").mkdir(parents=True)
+        (self.source / "Default" / "Cookies").write_text("sqlite")
+
+    def hold(self, directory: Path) -> None:
+        """Leave behind exactly what a running Chrome leaves: `<hostname>-<our pid>`."""
+        os.symlink(
+            f"{socket.gethostname()}-{os.getpid()}", directory / chrome.SINGLETON_LOCK
+        )
+
+    def test_a_path_seed_whose_browser_is_running_is_refused(self):
+        self.hold(self.source)
+
+        with self.assertRaises(CromError) as caught:
+            seed.materialize(profile(self.dest, SeedPath(self.source)))
+
+        self.assertIn("is in use", str(caught.exception))
+        self.assertIn(str(self.source), str(caught.exception))
+
+    def test_the_refusal_names_both_ways_out(self):
+        """The message is the product: this is the first thing a new user can hit.
+
+        `_bootstrap_user_config` seeds `user/default` from the real Chrome, so the very
+        first `crom up` on a machine with the browser open lands here — and a refusal
+        that does not say what to do next is only half the fix.
+        """
+        self.hold(self.source)
+
+        with self.assertRaises(CromError) as caught:
+            seed.materialize(profile(self.dest, SeedPath(self.source)))
+
+        message = str(caught.exception)
+        self.assertIn("Quit that browser", message)
+        self.assertIn("seed = fresh", message)
+
+    def test_a_refused_seed_leaves_no_profile_behind(self):
+        """Refusing has to be as clean as failing: the directory's existence is the flag.
+
+        A stump here would be read as "already seeded" by the next `crom up`, which would
+        then launch Chrome on an empty profile without a word — the loud failure becoming
+        a silent one on the very next run.
+        """
+        self.hold(self.source)
+
+        with self.assertRaises(CromError):
+            seed.materialize(profile(self.dest, SeedPath(self.source)))
+
+        self.assertFalse(self.dest.exists())
+        self.assertEqual([p for p in self.dest.parent.iterdir() if p.is_dir()], [])
+
+    def test_a_browser_opened_during_the_copy_is_caught_and_the_copy_discarded(self):
+        """One check before the copy would only prove the browser was shut a moment ago.
+
+        Chrome takes its singleton at startup and holds it for the session, so a browser
+        opened while `copytree` was still walking leaves the lock behind for the second
+        read to find.
+        """
+        real_copytree = shutil.copytree
+
+        # `copytree` recurses into itself for subdirectories, and patching the module
+        # attribute catches those inner calls too — hence `*args`, and hence the latch:
+        # a browser starts once, on whichever directory the walk reaches first.
+        started = []
+
+        def opens_chrome_midway(*args, **kwargs):
+            if not started:
+                started.append(self.hold(self.source))
+            return real_copytree(*args, **kwargs)
+
+        with mock.patch.object(seed.shutil, "copytree", side_effect=opens_chrome_midway):
+            with self.assertRaises(CromError) as caught:
+                seed.materialize(profile(self.dest, SeedPath(self.source)))
+
+        self.assertIn("while crom was copying", str(caught.exception))
+        self.assertFalse(self.dest.exists())
+        self.assertEqual([p for p in self.dest.parent.iterdir() if p.is_dir()], [])
+
+    def test_a_chrome_seed_reads_the_lock_from_the_user_data_dir_not_the_profile(self):
+        """The singleton sits at the user-data-dir root, one level above what is copied.
+
+        A `chrome` seed copies `<user-data-dir>/<profile>`, so looking for the lock
+        beside the copy source would find nothing and copy a live profile every time.
+        """
+        self.hold(self.source)
+        with mock.patch.dict(seed._CHROME_USER_DATA, {sys.platform: (self.source,)}):
+            with self.assertRaises(CromError) as caught:
+                seed.materialize(profile(self.dest, SeedChrome(profile="Default")))
+
+        self.assertIn("is in use", str(caught.exception))
+
+    def test_a_stale_lock_from_a_crashed_browser_does_not_block_seeding(self):
+        """Nothing but the next Chrome ever removes that file — refusing would be forever."""
+        os.symlink(f"{socket.gethostname()}-{_dead_pid()}", self.source / chrome.SINGLETON_LOCK)
+
+        self.assertTrue(seed.materialize(profile(self.dest, SeedPath(self.source))))
+        self.assertTrue((self.dest / "Default" / "Cookies").is_file())
+
+    def test_a_fresh_seed_is_unaffected_by_any_running_browser(self):
+        """`fresh` reads no directory at all, so there is nothing that could be moving."""
+        self.hold(self.source)
+
+        self.assertTrue(seed.materialize(profile(self.dest, SeedFresh())))
 
 
 if __name__ == "__main__":

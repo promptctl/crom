@@ -4,6 +4,12 @@
 running." We identify a crom-managed Chrome by the absolute `--user-data-dir` path it
 was launched with — no pidfiles, no shadow state that can drift from reality.
 
+That authority is scoped to profiles crom launched, and one other question needs a
+different mechanism: "does *any* browser hold this directory." The user's own Chrome
+runs with no `--user-data-dir` in its argv, so `scan` cannot see it at all —
+`singleton_holder` reads Chrome's own process singleton instead. Two questions, two
+mechanisms, both about Chrome, so both live here.
+
 Everything here takes a `ResolvedProfile`, whose `argv` is already complete, so this
 module never reads a config file or decides a port.
 """
@@ -183,6 +189,69 @@ def find_pids(profile: ResolvedProfile) -> tuple[int, ...]:
 
 def is_running(profile: ResolvedProfile) -> bool:
     return bool(find_pids(profile))
+
+
+# Chrome's own process singleton. At startup the browser creates this as a symlink whose
+# target is `<hostname>-<pid>` — a link that never resolves, the target string being the
+# whole payload — and removes it on clean exit. It is the only record of "someone is
+# writing this user-data-dir" that covers a Chrome crom did not launch.
+SINGLETON_LOCK = "SingletonLock"
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Alive and owned by another user: what we lack is the right to signal it, which
+        # is not what we asked.
+        return True
+
+
+def singleton_holder(user_data_dir: Path) -> str | None:
+    """What holds this user-data-dir against a consistent read, described — or None.
+
+    The string is *evidence*, not a verdict: it says what was found on disk, and the
+    caller writes the sentence around it. That is what lets the four ways of being held
+    share one return type. [LAW:dataflow-not-control-flow]
+
+      absent                          nobody has it open, or Chrome exited cleanly → None
+      `<host>-<pid>`, ours, alive     a browser is writing it                      → held
+      `<host>-<pid>`, ours, dead      residue of a crash; nothing is writing        → None
+      `<host>-<pid>`, another host    a pid this machine cannot ask about           → held
+      unreadable, or not `<host>-<pid>`  not the convention Chrome writes           → held
+
+    The last two are held because unknown is not the same as free, and only one of the
+    two mistakes is recoverable: refusing a still directory costs the caller a command,
+    while copying a moving one costs them a profile that fails weeks later.
+    [LAW:no-silent-failure]
+    """
+    try:
+        target = os.readlink(user_data_dir / SINGLETON_LOCK)
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        return f"{SINGLETON_LOCK} could not be read as a symlink: {e.strerror}"
+
+    seen = f"{SINGLETON_LOCK} -> {target}"
+    # `rpartition`, because the host half carries hyphens of its own — `my-mac.local-123`
+    # splits after the pid, never before it.
+    host, _, pid = target.rpartition("-")
+    if not host or not pid.isdigit():
+        return f"{seen}, which is not the `<host>-<pid>` Chrome writes"
+    if host != socket.gethostname():
+        # A profile on a synced or network home directory, locked from elsewhere. Also
+        # what a same-machine hostname change looks like, so both names are quoted: macOS
+        # moves between `.local` and `.lan` with the network, and the operator reading
+        # this needs to see that the two strings differ only there.
+        return (
+            f"{seen}, which names host {host!r}; this machine is "
+            f"{socket.gethostname()!r}, so that process cannot be asked whether it is "
+            f"still running"
+        )
+    return f"{seen}, and pid {pid} is running" if _pid_alive(int(pid)) else None
 
 
 def _printable(text: str) -> str:

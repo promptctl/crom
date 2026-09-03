@@ -1287,5 +1287,83 @@ class StderrCaptureTest(unittest.TestCase):
         self.assertEqual((stub.profile_dir / chrome.STDERR_FILENAME).read_text(), "SECOND\n")
 
 
+class SingletonHolderTest(unittest.TestCase):
+    """Every state Chrome's `SingletonLock` can be found in, and what each one means.
+
+    The lock is how crom answers "is anything writing this user-data-dir" for a browser
+    it did not launch — the user's own Chrome carries no `--user-data-dir` in its argv,
+    so `scan` cannot see it at all. Held or free is the whole answer, and the cases that
+    cannot be resolved locally count as held: refusing a still directory costs a command,
+    copying a moving one costs a profile.
+    """
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+
+    def lock(self, target: str) -> None:
+        os.symlink(target, self.dir / chrome.SINGLETON_LOCK)
+
+    def dead_pid(self) -> int:
+        """A pid that has certainly exited — spawned, waited on, and reaped."""
+        proc = subprocess.Popen([sys.executable, "-c", ""])
+        proc.wait()
+        return proc.pid
+
+    def test_no_lock_means_nothing_holds_the_directory(self):
+        """The steady state after a clean quit: Chrome removes the lock on its way out."""
+        self.assertIsNone(chrome.singleton_holder(self.dir))
+
+    def test_a_lock_naming_a_live_pid_on_this_host_is_held(self):
+        self.lock(f"{socket.gethostname()}-{os.getpid()}")
+
+        held = chrome.singleton_holder(self.dir)
+        self.assertIsNotNone(held)
+        self.assertIn(str(os.getpid()), held)
+
+    def test_a_lock_naming_a_dead_pid_is_crash_residue_and_holds_nothing(self):
+        """Chrome killed or crashed leaves the lock behind; the directory is still idle.
+
+        Treating this as held would strand the seed permanently — nothing ever cleans
+        the file up but the next Chrome to start.
+        """
+        self.lock(f"{socket.gethostname()}-{self.dead_pid()}")
+
+        self.assertIsNone(chrome.singleton_holder(self.dir))
+
+    def test_a_lock_from_another_host_is_held_and_quotes_both_names(self):
+        """A synced home directory, or a machine that renamed itself.
+
+        Both strings are in the message because those are the same situation from here,
+        and only seeing them side by side tells the operator which one they are in.
+        """
+        self.lock("some-other-box.local-4321")
+
+        held = chrome.singleton_holder(self.dir)
+        self.assertIn("some-other-box.local", held)
+        self.assertIn(socket.gethostname(), held)
+
+    def test_a_lock_that_is_not_a_symlink_is_held(self):
+        (self.dir / chrome.SINGLETON_LOCK).write_text("not a link")
+
+        self.assertIsNotNone(chrome.singleton_holder(self.dir))
+
+    def test_a_lock_whose_target_is_not_host_and_pid_is_held(self):
+        self.lock("gibberish")
+
+        self.assertIsNotNone(chrome.singleton_holder(self.dir))
+
+    def test_a_hyphenated_hostname_is_split_after_the_pid_not_before_it(self):
+        """`rpartition`, not `partition` — hostnames carry hyphens of their own.
+
+        Splitting at the first hyphen reads `my-mac.local-999` as host `my` and pid
+        `mac.local-999`, which parses as nothing and reports every such machine held.
+        """
+        self.lock("my-mac.local-999")
+
+        held = chrome.singleton_holder(self.dir)
+        self.assertIn("names host 'my-mac.local'", held)
+
+
 if __name__ == "__main__":
     unittest.main()
