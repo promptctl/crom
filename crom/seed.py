@@ -5,9 +5,8 @@ the profile's own state and crom never overwrites it. Which is why the seed is w
 choosing deliberately — copying a real Chrome profile duplicates hundreds of megabytes
 and every cookie in it, so `fresh` is the default and `chrome` is opt-in.
 
-A seed is copied only while nothing is writing it. Seeding either produces a consistent
-copy or refuses and says what it saw; it never reports success over a profile taken from
-under a live browser.
+A seed is copied only while nothing is writing it: crom reads the seed's ancestry before
+and after, and refuses — saying what it saw — if a browser holds it at either read.
 """
 
 import contextlib
