@@ -351,6 +351,30 @@ class KillTest(unittest.TestCase):
         self.assertNotIn("still running", message)  # nothing was, and it must not say so
 
 
+class PortCheckBoundaryTest(unittest.TestCase):
+    """The socket the port check needs is an OS resource like any other in this module.
+
+    A refused bind is an answer; a socket that cannot be made is not. Both arrive as
+    `OSError`, and only the first one means anything about the port.
+    """
+
+    def test_a_probe_socket_that_cannot_be_made_is_reported_not_crashed_through(self):
+        with (
+            mock.patch.object(chrome.socket, "socket", side_effect=OSError("too many open files")),
+            self.assertRaisesRegex(CromError, "could not check whether port 9300 is free"),
+        ):
+            chrome._port_is_free(9300)
+
+    def test_a_stop_inherits_that_report_rather_than_a_traceback(self):
+        """`down` and `rm` sit behind this now, and both live inside the exit-code contract."""
+        with (
+            mock.patch.object(chrome, "find_pids", return_value=()),
+            mock.patch.object(chrome.socket, "socket", side_effect=OSError("too many open files")),
+            self.assertRaises(CromError),
+        ):
+            chrome.kill(RequirePortAvailableTest._profile(9300))
+
+
 class PortIsPartOfBeingStoppedTest(unittest.TestCase):
     """The same wait, against a real socket rather than a stubbed predicate.
 

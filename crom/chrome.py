@@ -454,12 +454,21 @@ def _port_is_free(port: int) -> bool:
     [LAW:one-source-of-truth] the pre-launch check and the post-stop wait ask the same
     question here, so they cannot come to disagree about what a free port is.
     """
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            probe.bind(("127.0.0.1", port))
-        except OSError:
-            return False
+    # Two `OSError`s with nothing in common but their type. A refused bind is the answer
+    # — the port is held — while a socket that cannot be made at all (fd exhaustion) means
+    # the question could not be asked, and reporting that as "held" would be an answer
+    # shaped like a fact about the port for a failure that has nothing to do with it.
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                probe.bind(("127.0.0.1", port))
+            except OSError:
+                return False
+    except OSError as e:
+        # [LAW:no-silent-failure] `kill` reaches here too, so a raw OSError would leave
+        # `down` and `rm` outside the CLI's exit-code contract as a traceback.
+        raise CromError(f"could not check whether port {port} is free: {e}") from e
     return True
 
 
@@ -751,16 +760,19 @@ def kill(profile: ResolvedProfile) -> tuple[int, ...]:
 
     Escalation is a table walked the same way each round — signal whatever is still
     alive, then wait for it — rather than a graceful path and a separate forced one.
-    [LAW:dataflow-not-control-flow] A profile that was never running finds nothing to
-    signal, waits on nothing, and returns `()` on the first round, which is what makes
-    `rm` and `down` safe to call unconditionally.
+    [LAW:dataflow-not-control-flow] A profile that was never running signals nothing and
+    returns `()` as soon as its port answers free, which is what makes `rm` and `down`
+    safe to call unconditionally.
 
     The uniform rule has a price, taken deliberately: a stopped profile whose port some
     unrelated program happens to be sitting on is reported as a stop that could not be
     established, rather than as "was not running". Nothing here can tell that program
     apart from a socket the browser left behind — both are simply a port that will not
     bind — and of the two available lies, promising a relaunchable profile that is not one
-    is the one that costs a caller its next command. [LAW:no-silent-failure]
+    is the one that costs a caller its next command. Saying so costs both rounds, since a
+    profile with nothing to signal has nothing to escalate — a bounded 10s on a stop that
+    has already failed, against the 30s `launch` spends before reporting its own failure.
+    [LAW:no-silent-failure]
 
     Residual, and deliberately not chased: `find_pids` matches only the main browser and
     skips Chrome's `--type=` helpers, so a crashpad handler can briefly outlive this.
