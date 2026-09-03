@@ -450,6 +450,26 @@ class LiveSeedTest(unittest.TestCase):
         # The refusal names the directory actually held, not the one the seed named.
         self.assertIn(str(self.source), str(caught.exception))
 
+    @unittest.skipIf(os.geteuid() == 0, "root traverses any directory, so nothing is denied")
+    def test_an_unreachable_seed_names_the_seed_rather_than_a_browser(self):
+        """The walk reads directories the user never named, so its errors must not lie.
+
+        An unsearchable ancestor makes every read in the walk fail; reporting that as a
+        running browser would send the user to quit one, naming a directory they may not
+        recognise, for what is a permissions problem on the path they asked for.
+        """
+        blocked = self.root / "blocked"
+        (blocked / "seed").mkdir(parents=True)
+        self.addCleanup(os.chmod, blocked, 0o755)
+        os.chmod(blocked, 0o000)
+
+        with self.assertRaises(CromError) as caught:
+            seed.materialize(profile(self.dest, SeedPath(blocked / "seed")))
+
+        self.assertNotIn("browser", str(caught.exception))
+        self.assertIn("cannot be read", str(caught.exception))
+        self.assertIn(str(blocked / "seed"), str(caught.exception))
+
     def test_a_fresh_seed_is_unaffected_by_any_running_browser(self):
         """`fresh` reads no directory at all, so there is nothing that could be moving."""
         self.hold(self.source)

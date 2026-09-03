@@ -13,6 +13,7 @@ under a live browser.
 import contextlib
 import os
 import shutil
+import stat
 import sys
 import tempfile
 from collections.abc import Iterator
@@ -189,7 +190,18 @@ def _undisturbed(copy: _Copy) -> Iterator[None]:
 
 
 def _copy(copy: _Copy) -> None:
-    if not copy.source.is_dir():
+    # `os.stat` rather than `Path.is_dir`, because what `is_dir` does with an unreadable
+    # path is not settled across the Pythons crom supports: 3.12 raises, 3.14 answers
+    # False. Either would report a seed we were merely refused as one that is not there.
+    try:
+        present = stat.S_ISDIR(os.stat(copy.source).st_mode)
+    except FileNotFoundError:
+        present = False
+    except OSError as e:
+        raise CromError(
+            f"seed {copy.described} cannot be read: {copy.source}: {e.strerror}"
+        ) from e
+    if not present:
         raise CromError(f"seed {copy.described} does not exist: {copy.source}")
     copy.dest.parent.mkdir(parents=True, exist_ok=True)
     # `dest` is either absent or the freshly-made empty staging directory, never a
