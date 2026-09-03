@@ -198,10 +198,22 @@ def is_running(profile: ResolvedProfile) -> bool:
 SINGLETON_LOCK = "SingletonLock"
 
 
-def _pid_alive(pid: int) -> bool:
+def _pid_alive(pid: str) -> bool | None:
+    """Is the process this text names running — or None when it names no pid to ask about.
+
+    Takes the raw text rather than an int because asking the OS *is* how we learn the
+    text was a pid at all: `str.isdigit` admits `'²'`, which `int` then rejects, and
+    admits digit strings far past the `pid_t` `os.kill` takes. Splitting the question
+    across two predicates let them disagree, and the disagreement left by exception.
+    [LAW:parse-dont-validate]
+    """
     try:
-        os.kill(pid, 0)
+        os.kill(int(pid), 0)
         return True
+    except (ValueError, OverflowError):
+        # Not a number, or not one this machine can hold in a pid: either way the caller
+        # is not looking at the convention Chrome writes.
+        return None
     except ProcessLookupError:
         return False
     except PermissionError:
@@ -221,7 +233,7 @@ def singleton_holder(user_data_dir: Path) -> str | None:
       `<host>-<pid>`, ours, alive     a browser is writing it                      → held
       `<host>-<pid>`, ours, dead      residue of a crash; nothing is writing        → None
       `<host>-<pid>`, another host    a pid this machine cannot ask about           → held
-      unreadable, or not `<host>-<pid>`  not the convention Chrome writes           → held
+      unreadable, not `<host>-<pid>`, or a pid no OS could hold  → not the convention → held
 
     The last two are held because unknown is not the same as free, and only one of the
     two mistakes is recoverable: refusing a still directory costs the caller a command,
@@ -243,7 +255,8 @@ def singleton_holder(user_data_dir: Path) -> str | None:
     # `rpartition`, because the host half carries hyphens of its own — `my-mac.local-123`
     # splits after the pid, never before it.
     host, _, pid = target.rpartition("-")
-    if not host or not pid.isdigit():
+    alive = _pid_alive(pid)
+    if not host or alive is None:
         return f"{seen}, which is not the `<host>-<pid>` Chrome writes"
     if host != socket.gethostname():
         # A profile on a synced or network home directory, locked from elsewhere. Also
@@ -255,7 +268,7 @@ def singleton_holder(user_data_dir: Path) -> str | None:
             f"{socket.gethostname()!r}, so that process cannot be asked whether it is "
             f"still running"
         )
-    return f"{seen}, and pid {pid} is running" if _pid_alive(int(pid)) else None
+    return f"{seen}, and pid {pid} is running" if alive else None
 
 
 def _printable(text: str) -> str:

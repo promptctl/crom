@@ -1364,6 +1364,20 @@ class SingletonHolderTest(unittest.TestCase):
 
         self.assertIsNotNone(chrome.singleton_holder(self.dir))
 
+    def test_a_pid_no_os_could_hold_is_not_the_convention_rather_than_a_traceback(self):
+        """`'²'.isdigit()` is True and `int('²')` raises; a huge pid overflows `pid_t`.
+
+        Both used to leave by exception, so a malformed lock reached the user as a raw
+        traceback instead of the refusal every other malformed shape produces.
+        """
+        for pid in ("²", str(10**30)):
+            with self.subTest(pid=pid):
+                directory = Path(tempfile.mkdtemp())
+                self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+                os.symlink(f"{socket.gethostname()}-{pid}", directory / chrome.SINGLETON_LOCK)
+
+                self.assertIn("not the `<host>-<pid>`", chrome.singleton_holder(directory))
+
     def test_a_hyphenated_hostname_is_split_after_the_pid_not_before_it(self):
         """`rpartition`, not `partition` — hostnames carry hyphens of their own.
 
