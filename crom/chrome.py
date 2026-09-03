@@ -217,8 +217,9 @@ def _pid_alive(pid: str) -> bool | None:
     except ProcessLookupError:
         return False
     except PermissionError:
-        # Alive and owned by another user: what we lack is the right to signal it, which
-        # is not what we asked.
+        # A fact about the process, not the path — the opposite reading to the one
+        # `singleton_holder` gives this same exception. Alive and owned by another user:
+        # what we lack is the right to signal it, which is not what we asked.
         return True
 
 
@@ -229,7 +230,7 @@ def singleton_holder(user_data_dir: Path) -> str | None:
     caller writes the sentence around it. That is what lets the four ways of being held
     share one return type. [LAW:dataflow-not-control-flow]
 
-      absent, or no such directory    nobody has it open, or Chrome exited cleanly → None
+      absent, or unreachable          nobody has it open, or Chrome exited cleanly → None
       `<host>-<pid>`, ours, alive     a browser is writing it                      → held
       `<host>-<pid>`, ours, dead      residue of a crash; nothing is writing        → None
       `<host>-<pid>`, another host    a pid this machine cannot ask about           → held
@@ -242,13 +243,21 @@ def singleton_holder(user_data_dir: Path) -> str | None:
     """
     try:
         target = os.readlink(user_data_dir / SINGLETON_LOCK)
-    except (FileNotFoundError, NotADirectoryError):
-        # ENOTDIR is a fact about the path, not about the lock: nothing holds a
-        # user-data-dir that is a regular file. Answering "held" here would send the
-        # caller's operator off to quit a browser that was never open, where `_copy`'s
-        # existence check downstream has the true diagnosis waiting.
+    except (FileNotFoundError, NotADirectoryError, PermissionError):
+        # These say the path could not be resolved, which is a fact about the path and
+        # not about any lock — nothing holds a user-data-dir that is a regular file, and
+        # nothing is proven by a directory we were not allowed to look in. Reading them
+        # as held would send an operator off to quit a browser that was never open.
+        #
+        # Free is safe for all three, not merely kinder: every path this walks is built
+        # from components of the seed's own path, so whatever refuses us here refuses
+        # `copytree` the same way. The copy cannot proceed, so it cannot proceed over a
+        # live profile — and `_copy` reports the seed the user actually named.
         return None
     except OSError as e:
+        # Anything else — EINVAL for a `SingletonLock` that exists but is not a symlink,
+        # EIO for a sick disk — found something or failed for a reason that does not
+        # block the copy. Unknown is not free. [LAW:no-silent-failure]
         return f"{SINGLETON_LOCK} could not be read as a symlink: {e.strerror}"
 
     # Sanitised here, at the one point text crom did not write enters a message: a

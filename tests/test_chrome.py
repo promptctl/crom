@@ -1388,6 +1388,15 @@ class SingletonHolderTest(unittest.TestCase):
 
         self.assertNotIn("\x1b", chrome.singleton_holder(self.dir))
 
+    def test_a_directory_we_may_not_look_in_holds_nothing(self):
+        """EACCES says the path could not be resolved, not that a browser has it.
+
+        Safe as well as honest: whatever refuses the read refuses `copytree` the same
+        way, so there is no copy left to take from under a live browser.
+        """
+        with mock.patch("os.readlink", side_effect=PermissionError):
+            self.assertIsNone(chrome.singleton_holder(self.dir))
+
     def test_a_hyphenated_hostname_is_split_after_the_pid_not_before_it(self):
         """`rpartition`, not `partition` — hostnames carry hyphens of their own.
 
