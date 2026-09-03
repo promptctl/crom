@@ -18,6 +18,7 @@ import threading
 import time
 import unittest
 from collections.abc import Callable
+from itertools import chain, repeat
 from pathlib import Path
 from unittest import mock
 
@@ -252,6 +253,13 @@ class KillTest(unittest.TestCase):
         timeout = mock.patch.object(chrome, "SHUTDOWN_TIMEOUT_SECONDS", 0.2)
         timeout.start()
         self.addCleanup(timeout.stop)
+        # The port half of the stop contract is stubbed free here so each test states the
+        # one fact it is about. Left real, every test in this class would bind port 9300
+        # on the machine running it and start failing the day something else wants it.
+        # `PortIsPartOfBeingStoppedTest` covers the same wait against a genuine socket.
+        port = mock.patch.object(chrome, "_port_is_free", lambda _port: True)
+        port.start()
+        self.addCleanup(port.stop)
 
     def test_a_process_that_exits_during_the_grace_period_is_never_force_killed(self):
         scans = [(11, 22), ()]  # alive when we look, gone on the next scan
@@ -293,7 +301,7 @@ class KillTest(unittest.TestCase):
         """
         with (
             mock.patch.object(chrome, "find_pids", return_value=(11,)),
-            self.assertRaisesRegex(CromError, "survived SIGKILL"),
+            self.assertRaisesRegex(CromError, "SIGKILL"),
         ):
             chrome.kill(self.profile)
 
@@ -303,6 +311,71 @@ class KillTest(unittest.TestCase):
         with mock.patch.object(chrome, "find_pids", return_value=()):
             self.assertEqual(chrome.kill(self.profile), ())
         self.assertEqual(self.signals, [])
+
+    def test_a_port_the_browser_has_not_let_go_of_yet_is_waited_out(self):
+        """The wait covers the port, not just the process table.
+
+        The scans model the ordinary shape of the race this exists for: the browser is
+        gone from `ps` on the first look, and the CDP socket outlives it by a moment. If
+        the wait ended at the process table it would return inside that moment, and the
+        relaunch that follows would find the port taken. Waiting costs one more round and
+        needs no SIGKILL — the browser is already dead, only its socket is not.
+        """
+        freed = chain([False, False], repeat(True))
+        with (
+            mock.patch.object(chrome, "find_pids", side_effect=lambda p: (11,) if not self.signals else ()),
+            mock.patch.object(chrome, "_port_is_free", lambda _port: next(freed)),
+        ):
+            killed = chrome.kill(self.profile)
+
+        self.assertEqual(killed, (11,))
+        self.assertEqual(self.signals, [(11, signal.SIGTERM)])  # never escalated
+
+    def test_a_port_still_held_once_the_processes_are_gone_is_not_a_stop(self):
+        """[LAW:no-silent-failure] an empty process table is not the whole promise.
+
+        Returning here would hand `up` a port it cannot bind and blame the next command
+        for it. The message has to say which half failed, because a stop that left a
+        process and a stop that left a socket are chased in completely different places.
+        """
+        with (
+            mock.patch.object(chrome, "find_pids", return_value=()),
+            mock.patch.object(chrome, "_port_is_free", lambda _port: False),
+            self.assertRaises(CromError) as caught,
+        ):
+            chrome.kill(self.profile)
+
+        message = str(caught.exception)
+        self.assertIn("port 9300 is still held", message)
+        self.assertIn("lsof", message)  # the message tells the user how to find the holder
+        self.assertNotIn("still running", message)  # nothing was, and it must not say so
+
+
+class PortIsPartOfBeingStoppedTest(unittest.TestCase):
+    """The same wait, against a real socket rather than a stubbed predicate.
+
+    `KillTest` stubs `_port_is_free` so its scenarios stay about the escalation. That
+    stub is only worth anything if the real predicate is wired to a real kernel, and the
+    wiring is exactly what a refactor can quietly cut without any mocked test noticing.
+    """
+
+    def test_a_profile_whose_port_will_not_bind_is_reported_by_that_port(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as holder:
+            holder.bind(("127.0.0.1", 0))
+            holder.listen(1)
+            taken = holder.getsockname()[1]
+            # No mocked process table: no Chrome anywhere holds this fabricated
+            # user-data-dir, so the process half is genuinely satisfied and only the
+            # socket stands between this profile and a clean stop.
+            profile = RequirePortAvailableTest._profile(taken)
+
+            with (
+                mock.patch.object(chrome, "SHUTDOWN_TIMEOUT_SECONDS", 0.2),
+                self.assertRaises(CromError) as caught,
+            ):
+                chrome.kill(profile)
+
+        self.assertIn(f"port {taken} is still held", str(caught.exception))
 
 
 class ProcessBoundaryTest(unittest.TestCase):
