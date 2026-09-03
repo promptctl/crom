@@ -10,8 +10,8 @@ runs with no `--user-data-dir` in its argv, so `scan` cannot see it at all —
 `singleton_holder` reads Chrome's own process singleton instead. Two questions, two
 mechanisms, both about Chrome, so both live here.
 
-Everything here takes a `ResolvedProfile`, whose `argv` is already complete, so this
-module never reads a config file or decides a port.
+Nothing here reads a config file or decides a port — what to launch arrives already
+resolved.
 """
 
 import json
