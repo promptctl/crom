@@ -280,7 +280,7 @@ def singleton_holder(user_data_dir: Path) -> str | None:
             f"{socket.gethostname()!r}, so that process cannot be asked whether it is "
             f"still running"
         )
-    return f"{seen}, and pid {pid} is running" if alive else None
+    return f"{seen}, and that process is running" if alive else None
 
 
 def _printable(text: str) -> str:

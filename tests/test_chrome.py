@@ -1388,6 +1388,16 @@ class SingletonHolderTest(unittest.TestCase):
 
         self.assertNotIn("\x1b", chrome.singleton_holder(self.dir))
 
+    def test_the_evidence_never_carries_a_control_character_out_of_the_pid(self):
+        """`int` accepts more than digits: a vertical tab around `1` is pid 1 to the OS.
+
+        The pid half of the target lands in the same sentence as the target itself, so a
+        pid the kernel will answer for is not yet one that is safe to print.
+        """
+        self.lock(f"{socket.gethostname()}-\x0b1")
+
+        self.assertNotIn("\x0b", chrome.singleton_holder(self.dir))
+
     def test_a_directory_we_may_not_look_in_holds_nothing(self):
         """EACCES says the path could not be resolved, not that a browser has it.
 
@@ -1406,7 +1416,7 @@ class SingletonHolderTest(unittest.TestCase):
         self.lock(f"{socket.gethostname()}-4321")
 
         with mock.patch("os.kill", side_effect=PermissionError):
-            self.assertIn("4321 is running", chrome.singleton_holder(self.dir))
+            self.assertIn("-4321, and that process is running", chrome.singleton_holder(self.dir))
 
     def test_a_hyphenated_hostname_is_split_after_the_pid_not_before_it(self):
         """`rpartition`, not `partition` — hostnames carry hyphens of their own.
