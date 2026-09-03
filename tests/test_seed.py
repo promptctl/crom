@@ -352,7 +352,7 @@ class LiveSeedTest(unittest.TestCase):
 
         message = str(caught.exception)
         self.assertIn("Quit that browser", message)
-        self.assertIn("seed = fresh", message)
+        self.assertIn('seed = "fresh"', message)
 
     def test_a_refused_seed_leaves_no_profile_behind(self):
         """Refusing has to be as clean as failing: the directory's existence is the flag.

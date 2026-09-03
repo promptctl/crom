@@ -150,8 +150,8 @@ def _refuse(copy: _Copy, holder: str, lead: str) -> CromError:
         f"a copy taken now can catch one mid-transaction — and the damage surfaces much "
         f"later as missing history or a profile-error dialog, with nothing pointing back "
         f"here.\n"
-        f"Quit that browser and run this again, or set `seed = fresh` for a profile that "
-        f"starts empty."
+        f'Quit that browser and run this again, or set `seed = "fresh"` for a profile '
+        f"that starts empty."
     )
 
 
