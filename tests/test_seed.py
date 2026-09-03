@@ -470,6 +470,22 @@ class LiveSeedTest(unittest.TestCase):
         self.assertIn("cannot be read", str(caught.exception))
         self.assertIn(str(blocked / "seed"), str(caught.exception))
 
+    def test_a_refusal_never_carries_an_escape_sequence_out_of_a_directory_name(self):
+        """Every name in this sentence is foreign text; a POSIX name is any bytes but NUL.
+
+        A `.crom.toml` may arrive with a cloned repository, so the tree it points at is
+        the attacker's: they name a directory with an escape sequence and plant the lock
+        beside it themselves, and the refusal repaints the terminal it prints on.
+        """
+        spoofed = self.root / "\x1b[2Jpwned"
+        (spoofed / "Default").mkdir(parents=True)
+        self.hold(spoofed)
+
+        with self.assertRaises(CromError) as caught:
+            seed.materialize(profile(self.dest, SeedPath(spoofed / "Default")))
+
+        self.assertNotIn("\x1b", str(caught.exception))
+
     def test_a_fresh_seed_is_unaffected_by_any_running_browser(self):
         """`fresh` reads no directory at all, so there is nothing that could be moving."""
         self.hold(self.source)

@@ -136,16 +136,18 @@ class _Copy:
 def _refuse(copy: _Copy, held: Path, holder: str, lead: str) -> CromError:
     """The one thing crom says when it will not read a seed: what it saw, and the way out."""
     return CromError(
-        f"seed {copy.described} {lead}:\n"
-        f"  {held}\n"
-        f"  {holder}\n"
-        f"crom will not copy a user-data-dir a browser is writing. Chrome keeps Cookies, "
-        f"History, Login Data and Web Data in SQLite databases it writes continuously, so "
-        f"a copy taken now can catch one mid-transaction — and the damage surfaces much "
-        f"later as missing history or a profile-error dialog, with nothing pointing back "
-        f"here.\n"
-        f'Quit that browser and run this again, or set `seed = "fresh"` for a profile '
-        f"that starts empty."
+        chrome.printable(
+            f"seed {copy.described} {lead}:\n"
+            f"  {held}\n"
+            f"  {holder}\n"
+            f"crom will not copy a user-data-dir a browser is writing. Chrome keeps Cookies, "
+            f"History, Login Data and Web Data in SQLite databases it writes continuously, "
+            f"so a copy taken now can catch one mid-transaction — and the damage surfaces "
+            f"much later as missing history or a profile-error dialog, with nothing pointing "
+            f"back here.\n"
+            f'Quit that browser and run this again, or set `seed = "fresh"` for a '
+            f"profile that starts empty."
+        )
     )
 
 

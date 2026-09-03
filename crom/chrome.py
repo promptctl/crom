@@ -259,10 +259,9 @@ def singleton_holder(user_data_dir: Path) -> str | None:
         # block the copy. Unknown is not free. [LAW:no-silent-failure]
         return f"{SINGLETON_LOCK} could not be read as a symlink: {e.strerror}"
 
-    # Sanitised here, at the one point text crom did not write enters a message: a
-    # `path` seed can name an untrusted tree, whose lock target reaches a terminal
-    # through `_refuse`. [LAW:single-enforcer]
-    seen = f"{SINGLETON_LOCK} -> {_printable(target)}"
+    # Sanitised before it leaves: a `path` seed can name an untrusted tree, and this
+    # evidence reaches a terminal through `_refuse`.
+    seen = f"{SINGLETON_LOCK} -> {printable(target)}"
     # `rpartition`, because the host half carries hyphens of its own — `my-mac.local-123`
     # splits after the pid, never before it.
     host, _, pid = target.rpartition("-")
@@ -282,12 +281,11 @@ def singleton_holder(user_data_dir: Path) -> str | None:
     return f"{seen}, and that process is running" if alive else None
 
 
-def _printable(text: str) -> str:
+def printable(text: str) -> str:
     """Text crom did not write, rendered so a terminal will only ever display it.
 
-    One job, done once wherever foreign text enters a message: Chrome's stderr, and
-    whatever answers on the CDP port. Downstream then holds a printable string by
-    construction rather than by discipline. [LAW:parse-dont-validate]
+    One job, done once wherever foreign text enters a message. Downstream then holds a
+    printable string by construction rather than by discipline. [LAW:parse-dont-validate]
 
     Control characters are dropped because this text reaches a terminal that `DEVNULL`
     used to shield: Chrome's log lines carry page-derived text, and a listener on the port
@@ -307,7 +305,7 @@ def _summarise(text: str) -> str:
     an error headed for a terminal, so being made safe and being made short are one job
     here rather than two that a message-building call site has to remember.
     """
-    return textwrap.shorten(_printable(text), PORT_REPLY_SUMMARY_CHARS, placeholder=" …")
+    return textwrap.shorten(printable(text), PORT_REPLY_SUMMARY_CHARS, placeholder=" …")
 
 
 def _lsof_hint(port: int) -> str:
@@ -614,7 +612,7 @@ class _StderrSink:
     def tail(self) -> str:
         """The last `STDERR_TAIL_BYTES` of what Chrome has said so far, safe to print.
 
-        `_printable` does the rendering, so what Chrome writes and what a stranger on the
+        `printable` does the rendering, so what Chrome writes and what a stranger on the
         CDP port writes are made safe by one piece of code rather than two that could
         drift apart. [LAW:single-enforcer]
         """
@@ -630,7 +628,7 @@ class _StderrSink:
             # successful launch too, where a raw error would crash a browser that came
             # up fine over a diagnostic nobody needed.
             return f"(crom could not read what Chrome printed: {e})"
-        return _printable(raw)
+        return printable(raw)
 
     def quoted(self) -> str:
         """Chrome's own words as a message section, or nothing when it said nothing.
