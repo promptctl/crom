@@ -416,6 +416,22 @@ class LiveSeedTest(unittest.TestCase):
         self.assertTrue(seed.materialize(profile(self.dest, SeedPath(self.source))))
         self.assertTrue((self.dest / "Default" / "Cookies").is_file())
 
+    def test_a_seed_that_is_a_file_is_reported_as_missing_not_as_in_use(self):
+        """The stillness check runs first, so it is the one that must not misread a file.
+
+        `readlink` on `<file>/SingletonLock` raises ENOTDIR, and reading that as held
+        would answer a question the operator did not ask — telling them to quit a
+        browser instead of that the path they named is not a user-data-dir.
+        """
+        file = self.root / "a-file"
+        file.write_text("")
+
+        with self.assertRaises(CromError) as caught:
+            seed.materialize(profile(self.dest, SeedPath(file)))
+
+        self.assertIn("does not exist", str(caught.exception))
+        self.assertNotIn("Quit that browser", str(caught.exception))
+
     def test_a_fresh_seed_is_unaffected_by_any_running_browser(self):
         """`fresh` reads no directory at all, so there is nothing that could be moving."""
         self.hold(self.source)

@@ -1314,6 +1314,17 @@ class SingletonHolderTest(unittest.TestCase):
         """The steady state after a clean quit: Chrome removes the lock on its way out."""
         self.assertIsNone(chrome.singleton_holder(self.dir))
 
+    def test_a_path_that_is_not_a_directory_holds_nothing(self):
+        """A seed pointing at a regular file: `readlink` raises ENOTDIR, not ENOENT.
+
+        Reading that as held would tell the operator to quit a browser, burying the one
+        thing they need to hear — that the path they named is not a user-data-dir.
+        """
+        file = self.dir / "not-a-user-data-dir"
+        file.write_text("")
+
+        self.assertIsNone(chrome.singleton_holder(file))
+
     def test_a_lock_naming_a_live_pid_on_this_host_is_held(self):
         self.lock(f"{socket.gethostname()}-{os.getpid()}")
 

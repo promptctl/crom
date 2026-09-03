@@ -217,7 +217,7 @@ def singleton_holder(user_data_dir: Path) -> str | None:
     caller writes the sentence around it. That is what lets the four ways of being held
     share one return type. [LAW:dataflow-not-control-flow]
 
-      absent                          nobody has it open, or Chrome exited cleanly → None
+      absent, or no such directory    nobody has it open, or Chrome exited cleanly → None
       `<host>-<pid>`, ours, alive     a browser is writing it                      → held
       `<host>-<pid>`, ours, dead      residue of a crash; nothing is writing        → None
       `<host>-<pid>`, another host    a pid this machine cannot ask about           → held
@@ -230,7 +230,11 @@ def singleton_holder(user_data_dir: Path) -> str | None:
     """
     try:
         target = os.readlink(user_data_dir / SINGLETON_LOCK)
-    except FileNotFoundError:
+    except (FileNotFoundError, NotADirectoryError):
+        # ENOTDIR is a fact about the path, not about the lock: nothing holds a
+        # user-data-dir that is a regular file. Answering "held" here would send the
+        # caller's operator off to quit a browser that was never open, where `_copy`'s
+        # existence check downstream has the true diagnosis waiting.
         return None
     except OSError as e:
         return f"{SINGLETON_LOCK} could not be read as a symlink: {e.strerror}"
