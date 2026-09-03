@@ -1397,6 +1397,17 @@ class SingletonHolderTest(unittest.TestCase):
         with mock.patch("os.readlink", side_effect=PermissionError):
             self.assertIsNone(chrome.singleton_holder(self.dir))
 
+    def test_a_pid_owned_by_another_user_is_alive_and_holds_the_directory(self):
+        """The non-obvious arm: being refused the right to signal a process proves it exists.
+
+        `os.kill` answers a different question here than `readlink` does above — this
+        `PermissionError` is a fact about the process, that one about the path.
+        """
+        self.lock(f"{socket.gethostname()}-4321")
+
+        with mock.patch("os.kill", side_effect=PermissionError):
+            self.assertIn("4321 is running", chrome.singleton_holder(self.dir))
+
     def test_a_hyphenated_hostname_is_split_after_the_pid_not_before_it(self):
         """`rpartition`, not `partition` — hostnames carry hyphens of their own.
 
