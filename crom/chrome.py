@@ -249,10 +249,9 @@ def singleton_holder(user_data_dir: Path) -> str | None:
         # nothing is proven by a directory we were not allowed to look in. Reading them
         # as held would send an operator off to quit a browser that was never open.
         #
-        # Free is safe for all three, not merely kinder: every path this walks is built
-        # from components of the seed's own path, so whatever refuses us here refuses
-        # `copytree` the same way. The copy cannot proceed, so it cannot proceed over a
-        # live profile — and `_copy` reports the seed the user actually named.
+        # Free is safe, not merely kinder: nothing can be observed inside a directory we
+        # may not enter, and any operation that would act on this same path fails against
+        # the same permission. [LAW:composability]
         return None
     except OSError as e:
         # Anything else — EINVAL for a `SingletonLock` that exists but is not a symlink,

@@ -1401,8 +1401,7 @@ class SingletonHolderTest(unittest.TestCase):
     def test_a_directory_we_may_not_look_in_holds_nothing(self):
         """EACCES says the path could not be resolved, not that a browser has it.
 
-        Safe as well as honest: whatever refuses the read refuses `copytree` the same
-        way, so there is no copy left to take from under a live browser.
+        Safe as well as honest: nothing can be observed in a directory crom may not enter.
         """
         with mock.patch("os.readlink", side_effect=PermissionError):
             self.assertIsNone(chrome.singleton_holder(self.dir))
