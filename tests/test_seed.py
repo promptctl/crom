@@ -501,6 +501,41 @@ class LiveSeedTest(unittest.TestCase):
 
         self.assertNotIn("\x1b", str(caught.exception))
 
+    def test_a_missing_seed_never_carries_an_escape_sequence_out_of_its_name(self):
+        """Being absent is the cheapest way to reach a message: the name is the whole attack.
+
+        No lock to plant and no permissions to arrange — a `.crom.toml` naming a directory
+        that was never there reaches this sentence, and every seed that is simply typo'd
+        arrives the same way.
+        """
+        spoofed = self.root / "\x1b[2Jpwned"
+
+        with self.assertRaises(CromError) as caught:
+            seed.materialize(profile(self.dest, SeedPath(spoofed / "Default")))
+
+        self.assertIn("does not exist", str(caught.exception))
+        self.assertNotIn("\x1b", str(caught.exception))
+
+    @unittest.skipIf(os.geteuid() == 0, "root traverses any directory, so nothing is denied")
+    def test_an_unreadable_seed_never_carries_an_escape_sequence_out_of_its_name(self):
+        """An unsearchable ancestor is what reaches this arm: every other way is read as held.
+
+        `singleton_holder` answers *held* for a `SingletonLock` it cannot read at all, so a
+        symlink loop or a sick disk is refused before the copy begins and speaks through
+        `_refuse`. Only the errors it reads as free — a permissions wall — arrive here.
+        """
+        blocked = self.root / "blocked"
+        spoofed = blocked / "\x1b[2Jpwned"
+        spoofed.mkdir(parents=True)
+        self.addCleanup(os.chmod, blocked, 0o755)
+        os.chmod(blocked, 0o000)
+
+        with self.assertRaises(CromError) as caught:
+            seed.materialize(profile(self.dest, SeedPath(spoofed)))
+
+        self.assertIn("cannot be read", str(caught.exception))
+        self.assertNotIn("\x1b", str(caught.exception))
+
     def test_a_fresh_seed_is_unaffected_by_any_running_browser(self):
         """`fresh` reads no directory at all, so there is nothing that could be moving."""
         self.hold(self.source)

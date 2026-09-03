@@ -200,10 +200,14 @@ def _copy(copy: _Copy) -> None:
         present = False
     except OSError as e:
         raise CromError(
-            f"seed {copy.described} cannot be read: {copy.source}: {e.strerror}"
+            chrome.printable(
+                f"seed {copy.described} cannot be read: {copy.source}: {e.strerror}"
+            )
         ) from e
     if not present:
-        raise CromError(f"seed {copy.described} does not exist: {copy.source}")
+        raise CromError(
+            chrome.printable(f"seed {copy.described} does not exist: {copy.source}")
+        )
     copy.dest.parent.mkdir(parents=True, exist_ok=True)
     # `dest` is either absent or the freshly-made empty staging directory, never a
     # profile with contents of its own.
