@@ -442,23 +442,47 @@ def _probe_port(port: int) -> _PortAnswer:
             return _Silent()
 
 
+def _port_is_free(port: int) -> bool:
+    """Whether a listener could take this port right now.
+
+    Asked by binding rather than by connecting, because those are different questions and
+    the difference is the whole point: connecting asks whether anyone is *answering*,
+    binding asks whether the port is *available* — which is the question a launch actually
+    puts to the kernel. They part company whenever a socket outlives whoever was serving
+    through it, so a port that `_probe_port` calls silent can still refuse the bind.
+
+    [LAW:one-source-of-truth] the pre-launch check and the post-stop wait ask the same
+    question here, so they cannot come to disagree about what a free port is.
+    """
+    # Two `OSError`s with nothing in common but their type. A refused bind is the answer
+    # — the port is held — while a socket that cannot be made at all (fd exhaustion) means
+    # the question could not be asked, and reporting that as "held" would be an answer
+    # shaped like a fact about the port for a failure that has nothing to do with it.
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                probe.bind(("127.0.0.1", port))
+            except OSError:
+                return False
+    except OSError as e:
+        # [LAW:no-silent-failure] `kill` reaches here too, so a raw OSError would leave
+        # `down` and `rm` outside the CLI's exit-code contract as a traceback.
+        raise CromError(f"could not check whether port {port} is free: {e}") from e
+    return True
+
+
 def _require_port_available(profile: ResolvedProfile) -> None:
     """Fail immediately, and by name, when something else already holds the port.
 
     Without this the launch simply times out after 30s and blames the wrong thing.
     [LAW:no-silent-failure] the diagnosis belongs at the moment of failure.
     """
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            probe.bind(("127.0.0.1", profile.port))
-            return
-        except OSError:
-            pass
-    raise CromError(
-        f"port {profile.port} (assigned to '{profile.ref}') is held by another process. "
-        f"{_lsof_hint(profile.port)}"
-    )
+    if not _port_is_free(profile.port):
+        raise CromError(
+            f"port {profile.port} (assigned to '{profile.ref}') is held by another "
+            f"process. {_lsof_hint(profile.port)}"
+        )
 
 
 @dataclass(frozen=True)
@@ -669,12 +693,49 @@ def launch(profile: ResolvedProfile) -> tuple[int, ...]:
             )
 
 
-def _await_exit(profile: ResolvedProfile) -> bool:
-    """Wait up to the shutdown timeout for no main Chrome to hold this profile."""
+def _still_held(profile: ResolvedProfile) -> tuple[str, ...]:
+    """Whatever still contradicts "this profile is stopped", named for whoever must chase it.
+
+    Being stopped has two halves — the profile runs no process, and it holds no port — and
+    they end independently. A listening socket belongs to the file description, not to the
+    process that opened it, so the CDP port stays bound for as long as *anything* holds a
+    copy of it; the browser leaving the process table is not by itself the port coming
+    back. That gap is what a relaunch falls into: it binds against a socket whose owner is
+    already dead, or reaches CDP and is answered on behalf of a corpse.
+
+    Both halves are read in one place so that the wait and the failure message cannot come
+    to disagree about what stopped means. [LAW:one-source-of-truth] An empty tuple is the
+    whole promise kept, which is the only condition `kill` returns on.
+
+    The lines are worded for the one place they are ever printed — the error `kill` raises
+    once escalation is spent — which is why the process line may speak of SIGKILL. Every
+    earlier round reads these only for emptiness.
+    """
+    pids = find_pids(profile)
+    listed = ", ".join(map(str, pids))
+    return tuple(
+        detail
+        for detail, unmet in (
+            (
+                f"pid(s) {listed} are still running — SIGTERM then SIGKILL did not end "
+                f"them. Inspect them with: ps -p {listed}",
+                bool(pids),
+            ),
+            (
+                f"port {profile.port} is still held. {_lsof_hint(profile.port)}",
+                not _port_is_free(profile.port),
+            ),
+        )
+        if unmet
+    )
+
+
+def _await_release(profile: ResolvedProfile) -> tuple[str, ...]:
+    """Wait up to the shutdown timeout for the profile to give up process and port alike."""
     deadline = time.time() + SHUTDOWN_TIMEOUT_SECONDS
-    while time.time() < deadline and find_pids(profile):
+    while time.time() < deadline and _still_held(profile):
         time.sleep(0.1)
-    return not find_pids(profile)
+    return _still_held(profile)
 
 
 def kill(profile: ResolvedProfile) -> tuple[int, ...]:
@@ -690,11 +751,28 @@ def kill(profile: ResolvedProfile) -> tuple[int, ...]:
     profile. [LAW:no-ambient-temporal-coupling] a transition `rm` depends on is owned
     here rather than assumed to have completed by the time the caller looks.
 
+    The port is half of that postcondition, and the half nobody owned. `up` after a `down`
+    on the same port — which is all a restart is — races whatever still holds the CDP
+    socket, and loses in one of two ways: it cannot bind and blames a foreign process, or
+    the readiness probe is answered by the browser that is on its way out and it reports a
+    live endpoint belonging to a corpse. Waiting on `_still_held` rather than on the
+    process table alone is what makes "stopped" mean "relaunchable".
+
     Escalation is a table walked the same way each round — signal whatever is still
     alive, then wait for it — rather than a graceful path and a separate forced one.
-    [LAW:dataflow-not-control-flow] A profile that was never running finds nothing to
-    signal, waits on nothing, and returns `()` on the first round, which is what makes
-    `rm` and `down` safe to call unconditionally.
+    [LAW:dataflow-not-control-flow] A profile that was never running signals nothing and
+    returns `()` as soon as its port answers free, which is what makes `rm` and `down`
+    safe to call unconditionally.
+
+    The uniform rule has a price, taken deliberately: a stopped profile whose port some
+    unrelated program happens to be sitting on is reported as a stop that could not be
+    established, rather than as "was not running". Nothing here can tell that program
+    apart from a socket the browser left behind — both are simply a port that will not
+    bind — and of the two available lies, promising a relaunchable profile that is not one
+    is the one that costs a caller its next command. Saying so costs both rounds, since a
+    profile with nothing to signal has nothing to escalate — a bounded 10s on a stop that
+    has already failed, against the 30s `launch` spends before reporting its own failure.
+    [LAW:no-silent-failure]
 
     Residual, and deliberately not chased: `find_pids` matches only the main browser and
     skips Chrome's `--type=` helpers, so a crashpad handler can briefly outlive this.
@@ -704,10 +782,12 @@ def kill(profile: ResolvedProfile) -> tuple[int, ...]:
     """
     pids = find_pids(profile)
     survivors = pids
+    unmet: tuple[str, ...] = ()
     for sig in (signal.SIGTERM, signal.SIGKILL):
         for pid in survivors:
             _signal(pid, sig)
-        if _await_exit(profile):
+        unmet = _await_release(profile)
+        if not unmet:
             return pids
         # Re-read only between rounds. Rescanning before the first round would spend a
         # second `ps` to re-learn what `pids` already holds, and open a window in which a
@@ -718,14 +798,20 @@ def kill(profile: ResolvedProfile) -> tuple[int, ...]:
     # to `down`, which would print "Stopped", and to `rm`, which would go on to delete a
     # live browser's directory.
     #
-    # The message says nothing about deleting: `rm` aborting before its delete is `rm`'s
-    # business, and a module that names one caller's next step is coupled to that caller.
+    # The message carries the observations `_await_release` ended on, so it names the half
+    # that failed instead of the half this code happens to check last — a port still held
+    # under a process table that is already empty reads as exactly that.
+    #
+    # It says nothing about deleting: `rm` aborting before its delete is `rm`'s business,
+    # and a module that names one caller's next step is coupled to that caller.
     # [LAW:composability]
-    remaining = ", ".join(map(str, find_pids(profile)))
-    raise CromError(
-        f"could not stop '{profile.ref}': pid(s) {remaining} survived SIGKILL after "
-        f"{SHUTDOWN_TIMEOUT_SECONDS:.0f}s.\nInspect it with: ps -p {remaining}"
-    )
+    # The header states only what is true in both arms. A profile that was never running
+    # but whose port will not come free was signalled nothing, and saying "SIGKILL was
+    # sent" there sends its reader looking for a browser that does not exist; what
+    # escalation was spent belongs on the line that only appears when there was something
+    # to spend it on.
+    detail = "\n".join(f"  - {line}" for line in unmet)
+    raise CromError(f"could not stop '{profile.ref}':\n{detail}")
 
 
 def _signal(pid: int, sig: int) -> None:
