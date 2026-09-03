@@ -1378,6 +1378,16 @@ class SingletonHolderTest(unittest.TestCase):
 
                 self.assertIn("not the `<host>-<pid>`", chrome.singleton_holder(directory))
 
+    def test_the_evidence_never_carries_an_escape_sequence_out_of_the_lock(self):
+        """The target is foreign text: a `path` seed can name a tree crom did not write.
+
+        It reaches a terminal through the refusal, so an escape sequence in it could
+        repaint the very message it appears in.
+        """
+        self.lock("\x1b[2Jspoofed-1")
+
+        self.assertNotIn("\x1b", chrome.singleton_holder(self.dir))
+
     def test_a_hyphenated_hostname_is_split_after_the_pid_not_before_it(self):
         """`rpartition`, not `partition` — hostnames carry hyphens of their own.
 

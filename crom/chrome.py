@@ -251,7 +251,10 @@ def singleton_holder(user_data_dir: Path) -> str | None:
     except OSError as e:
         return f"{SINGLETON_LOCK} could not be read as a symlink: {e.strerror}"
 
-    seen = f"{SINGLETON_LOCK} -> {target}"
+    # Sanitised here, at the one point text crom did not write enters a message: a
+    # `path` seed can name an untrusted tree, whose lock target reaches a terminal
+    # through `_refuse`. [LAW:single-enforcer]
+    seen = f"{SINGLETON_LOCK} -> {_printable(target)}"
     # `rpartition`, because the host half carries hyphens of its own — `my-mac.local-123`
     # splits after the pid, never before it.
     host, _, pid = target.rpartition("-")
