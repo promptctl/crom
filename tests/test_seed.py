@@ -432,6 +432,24 @@ class LiveSeedTest(unittest.TestCase):
         self.assertIn("does not exist", str(caught.exception))
         self.assertNotIn("Quit that browser", str(caught.exception))
 
+    def test_a_seed_below_a_running_user_data_dir_is_refused(self):
+        """Chrome's one lock sits at the root and governs everything under it.
+
+        `config` accepts a path seed naming a profile inside a user-data-dir, where there
+        is no lock to find — so checking only the named directory would copy `Default`
+        out from under the browser writing it and report success.
+        """
+        inner = self.source / "Default" / "Extensions"
+        inner.mkdir(parents=True)
+        self.hold(self.source)
+
+        with self.assertRaises(CromError) as caught:
+            seed.materialize(profile(self.dest, SeedPath(inner)))
+
+        self.assertIn("is in use", str(caught.exception))
+        # The refusal names the directory actually held, not the one the seed named.
+        self.assertIn(str(self.source), str(caught.exception))
+
     def test_a_fresh_seed_is_unaffected_by_any_running_browser(self):
         """`fresh` reads no directory at all, so there is nothing that could be moving."""
         self.hold(self.source)

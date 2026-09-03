@@ -125,25 +125,18 @@ def _link_guard(source: Path, described: str):
 
 @dataclass(frozen=True)
 class _Copy:
-    """One directory to duplicate, and the user-data-dir whose stillness makes it safe.
-
-    `user_data_dir` is carried rather than derived from `source`, because the two seed
-    kinds relate them differently — a `chrome` seed copies one profile *out of* a
-    user-data-dir, a `path` seed copies a whole one — and a rule that happens to hold for
-    one of them is a map that drifts on the day a third kind arrives.
-    """
+    """One directory to duplicate."""
 
     source: Path
     dest: Path
     described: str
-    user_data_dir: Path
 
 
-def _refuse(copy: _Copy, holder: str, lead: str) -> CromError:
+def _refuse(copy: _Copy, held: Path, holder: str, lead: str) -> CromError:
     """The one thing crom says when it will not read a seed: what it saw, and the way out."""
     return CromError(
         f"seed {copy.described} {lead}:\n"
-        f"  {copy.user_data_dir}\n"
+        f"  {held}\n"
         f"  {holder}\n"
         f"crom will not copy a user-data-dir a browser is writing. Chrome keeps Cookies, "
         f"History, Login Data and Web Data in SQLite databases it writes continuously, so "
@@ -155,9 +148,27 @@ def _refuse(copy: _Copy, holder: str, lead: str) -> CromError:
     )
 
 
+def _held(source: Path) -> tuple[Path, str] | None:
+    """The nearest directory over `source` a browser is writing, and its evidence.
+
+    Chrome takes *one* singleton, at the user-data-dir root, and it governs everything
+    beneath — so the question a copy has to ask is not "is this directory a user-data-dir",
+    which is unanswerable for the arbitrary trees a `path` seed may name, but "is anything
+    above this one held". Walking ancestors answers that without ever classifying a
+    directory, which is what makes it total over both seed kinds: a `chrome` seed's root
+    is an ancestor of the profile it copies, and a `path` seed naming `Chrome/Default` —
+    or `Chrome/Default/Extensions` — finds the lock that a parent-only rule would miss.
+    """
+    for directory in (source, *source.parents):
+        holder = chrome.singleton_holder(directory)
+        if holder is not None:
+            return directory, holder
+    return None
+
+
 @contextlib.contextmanager
 def _undisturbed(copy: _Copy) -> Iterator[None]:
-    """Read the seed's user-data-dir before and after, and refuse unless both say idle.
+    """Read the seed's ancestry before and after, and refuse unless both say idle.
 
     One check would only prove the browser was closed at the instant crom looked. Chrome
     takes its singleton at startup and holds it for the session, so a browser opened
@@ -168,13 +179,13 @@ def _undisturbed(copy: _Copy) -> Iterator[None]:
     copy, which erases its own evidence. That is the residue of this approach, not an
     oversight; closing it would need a generation counter Chrome does not keep.
     """
-    before = chrome.singleton_holder(copy.user_data_dir)
+    before = _held(copy.source)
     if before is not None:
-        raise _refuse(copy, before, "is in use")
+        raise _refuse(copy, *before, "is in use")
     yield
-    after = chrome.singleton_holder(copy.user_data_dir)
+    after = _held(copy.source)
     if after is not None:
-        raise _refuse(copy, after, "was opened by a browser while crom was copying it")
+        raise _refuse(copy, *after, "was opened by a browser while crom was copying it")
 
 
 def _copy(copy: _Copy) -> None:
@@ -277,11 +288,8 @@ def _plan(seed: Seed, staging: Path) -> tuple[_Copy, ...]:
             return ()
         case SeedChrome(profile=which):
             # A Chrome user-data-dir holds one directory per profile; we copy the named
-            # one into the canonical slot so the browser opens straight into it — and the
-            # directory whose stillness matters is the parent that holds the singleton.
+            # one into the canonical slot so the browser opens straight into it.
             root = chrome_user_data_dir()
-            return (_Copy(root / which, staging / "Default", f"'chrome:{which}'", root),)
+            return (_Copy(root / which, staging / "Default", f"'chrome:{which}'"),)
         case SeedPath(path=path):
-            # A path is expected to be a whole user-data-dir, copied verbatim — so it is
-            # its own singleton-bearing root.
-            return (_Copy(path, staging, f"path '{path}'", path),)
+            return (_Copy(path, staging, f"path '{path}'"),)
