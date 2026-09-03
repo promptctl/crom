@@ -196,7 +196,7 @@ def _copy(copy: _Copy) -> None:
     # False. Either would report a seed we were merely refused as one that is not there.
     try:
         present = stat.S_ISDIR(os.stat(copy.source).st_mode)
-    except FileNotFoundError:
+    except (FileNotFoundError, NotADirectoryError):
         present = False
     except OSError as e:
         raise CromError(

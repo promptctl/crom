@@ -470,6 +470,21 @@ class LiveSeedTest(unittest.TestCase):
         self.assertIn("cannot be read", str(caught.exception))
         self.assertIn(str(blocked / "seed"), str(caught.exception))
 
+    def test_a_seed_path_through_a_regular_file_is_reported_as_missing(self):
+        """ENOTDIR says the path is not there, not that crom was refused it.
+
+        A typo routing the seed through a file — `.../notes.txt/Default` — is a path
+        mistake, and calling it unreadable sends the user after a permissions fix.
+        """
+        file = self.root / "a-file"
+        file.write_text("")
+
+        with self.assertRaises(CromError) as caught:
+            seed.materialize(profile(self.dest, SeedPath(file / "Default")))
+
+        self.assertIn("does not exist", str(caught.exception))
+        self.assertNotIn("cannot be read", str(caught.exception))
+
     def test_a_refusal_never_carries_an_escape_sequence_out_of_a_directory_name(self):
         """Every name in this sentence is foreign text; a POSIX name is any bytes but NUL.
 
