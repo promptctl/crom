@@ -301,18 +301,22 @@ starts copying, `crom up` prints
 `Creating <ref> from seed 'default' …` on stderr, so the copy is announced rather than
 silent — and `seed = "fresh"`, on the profile or in `[defaults]`, gets you an empty one.
 
-crom refuses to start the copy while a browser is running on the profile you are copying
-from. A live profile holds databases Chrome writes continuously, and a plain copy can
-catch one mid-write; the copy would report success, and the damage would surface days
-later as missing history or logins that stopped working, with nothing to connect it back
-to the copy. So crom looks for the lock file Chrome keeps in a running user-data-dir, and
-if it finds a live one it stops, names the directory, quotes what it saw, and gives you
-two ways on: quit the browser and run again, or `seed = "fresh"` for a profile that starts
-empty. A lock left behind by a Chrome that crashed does not stop anything — crom checks
-whether the process it names is still alive. It checks once more after the copy, so a
-browser opened halfway through is caught too and the half-copied profile is thrown away.
-The first `crom up` on a machine is where you are most likely to meet this, because the
-default profile is seeded from the Chrome you probably have open right now.
+crom refuses to start the copy while a browser is running on the Chrome installation you
+are copying from — the whole user-data-dir, not just the profile you named, so
+`seed = "chrome:Work"` is refused while a Personal window is open. A live profile holds
+databases Chrome writes continuously, and a plain copy can catch one mid-write; the copy
+would report success, and the damage would surface days later as missing history or
+logins that stopped working, with nothing to connect it back to the copy. So crom looks
+for the lock file Chrome keeps in a running user-data-dir, and if it finds a live one it
+stops, names the directory, quotes what it saw, and gives you two ways on: quit the
+browser and run again, or `seed = "fresh"` for a profile that starts empty. A lock left
+behind by a Chrome that crashed does not stop anything — crom checks whether the process
+it names is still alive. It checks once more after the copy: a browser that opened
+partway through and is still open is caught, and the half-copied profile is thrown away.
+One that opens and quits entirely inside the copy window is not — Chrome takes its lock
+with it, so by the time crom looks again there is nothing left to see. The first `crom up`
+on a machine is where you are most likely to meet this, because the default profile is
+seeded from the Chrome you probably have open right now.
 
 ## Where things live
 
