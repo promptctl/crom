@@ -6,6 +6,7 @@ external system, not an implementation detail of crom.
 """
 
 import contextlib
+import errno
 import json
 import os
 import re
@@ -1806,6 +1807,33 @@ class CliTest(unittest.TestCase):
         ):
             result = self.invoke("list", expect=1)
         self.assertEqual(result.stderr.strip(), "Error: /bin/ps: Permission denied")
+
+    def test_a_reader_leaving_a_pipeline_is_not_a_failure_to_report(self):
+        """`crom list | head` ends the conventional Unix way: no message, exit 1.
+
+        Click installs a `PacifyFlushWrapper` and exits for an `errno.EPIPE` write, and
+        broadening the boundary to `OSError` took that over. Measured against the real
+        binary with stdout on a reader-less pipe, `crom list` went from exit 1 and an
+        empty stderr to exit 120 and `Error: Broken pipe` — 120 rather than 1 because
+        the wrapper never got installed, so interpreter shutdown then failed to flush
+        stdout as well. Two regressions from one widened `except`.
+        """
+        self.crom("init")
+        with mock.patch(
+            "crom.chrome.scan", side_effect=BrokenPipeError(errno.EPIPE, "Broken pipe")
+        ):
+            result = self.invoke("list", expect=1)
+        self.assertEqual(result.stderr, "")
+
+        # And the other half of the carve-out: `BrokenPipeError` is raised for ESHUTDOWN
+        # too, which is a socket crom really did fail to write and no reader leaving.
+        # Click declines it (its own test is `errno.EPIPE`), so handing that class back
+        # wholesale would return the traceback this PR closed.
+        with mock.patch(
+            "crom.chrome.scan", side_effect=BrokenPipeError(errno.ESHUTDOWN, "Cannot send")
+        ):
+            result = self.invoke("list", expect=1)
+        self.assertEqual(result.stderr.strip(), "Error: Cannot send")
 
 
 

@@ -13,6 +13,7 @@ exit codes are a contract a script can branch on:
     2  usage error (click's own)
 """
 
+import errno
 import json
 import os
 import shlex
@@ -124,12 +125,22 @@ class CromGroup(click.Group):
         names something the user can go fix. Anything else arriving here is crom being
         wrong about its own state, and a traceback is the honest report of that.
         [LAW:no-silent-failure]
+
+        A broken pipe is neither, which is why it is handed back: `crom list | head` is
+        a reader leaving on purpose, and the conventional end to that is silence.
         """
         try:
             return super().invoke(ctx)
         except CromError as error:
             raise _failure(error, str(error)) from error
         except OSError as error:
+            # `errno` and not `BrokenPipeError`, because click's own handler keys on
+            # `errno.EPIPE` for any `OSError` while `BrokenPipeError` also carries
+            # `ESHUTDOWN`: re-raising the wider class hands click an error it declines
+            # too, and the traceback comes back. [LAW:one-source-of-truth] the set click
+            # owns is spelled the way click spells it.
+            if error.errno == errno.EPIPE:
+                raise
             # The path and the reason, in the shape crom's own filesystem errors already
             # take (`configwrite._writing`). An `OSError` carries neither reliably —
             # `os.kill` names no file, `shutil.Error` carries no `strerror` — so the
