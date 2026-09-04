@@ -354,13 +354,23 @@ def restart_cmd(session: _Session, ref: str, as_json: bool):
         # is what was stopped. That is what `stopped` carries.
         _, pids = _start_under_lock(profile)
 
-    running = ", ".join(map(str, stopped))
+    was = ", ".join(map(str, stopped))
+    now = ", ".join(map(str, pids))
     message = (
-        f"Restarted {profile.ref} on {profile.cdp_url} (was pid {running}, now pid {pids[0]})"
+        f"Restarted {profile.ref} on {profile.cdp_url} (was pid {was}, now pid {now})"
         if stopped
         else f"{profile.ref} was not running; started it on {profile.cdp_url}"
     )
-    _emit(as_json, profile.describe(running=True, pids=pids), [message])
+    # `stopped` rides alongside the record rather than inside it: what a restart replaced is
+    # a fact about this command, not about the profile, and `describe()` is the shape every
+    # command's JSON shares. Without it a `--json` caller cannot tell a browser that was
+    # replaced from one that was merely started, which is the single distinction this
+    # command exists to report. [LAW:one-source-of-truth] `describe()` stays canonical.
+    _emit(
+        as_json,
+        {**profile.describe(running=True, pids=pids), "stopped": list(stopped)},
+        [message],
+    )
 
 
 @main.command("show")
@@ -380,19 +390,33 @@ def show_cmd(session: _Session, ref: str, as_json: bool):
     # already makes while holding it.
     with seed.profile_lock(profile):
         started, pids = _start_under_lock(profile)
+        if started:
+            # Said before the raise rather than assembled with the result afterwards, so
+            # the fact survives a raise that fails. Withheld Automation access is likeliest
+            # on a first run — the same run likeliest to have started the browser — and a
+            # user shown only the raise error would go hunting for a launch failure that
+            # never happened. On stderr because for `show` the answer is the raise itself;
+            # a launch on the way to it is progress, like `_start_under_lock`'s own
+            # "Creating … from seed" line. [CLI binding]
+            click.echo(f"Started {profile.ref} on {profile.cdp_url}", err=True)
         windows = window.raise_profile(profile, pids)
 
-    # Launching is mentioned only when it happened, because a `show` that found the browser
-    # already running has nothing to report about starting it — this is the convergence
-    # README describes: the command in the way gets run, and said.
-    launched = [f"Started {profile.ref} on {profile.cdp_url}"] if started else []
     raised = (
         f"Raised {profile.ref}"
         if windows
         else f"Raised {profile.ref}, but it has no open windows to show — it is running "
         f"headless, or its last window was closed."
     )
-    _emit(as_json, profile.describe(running=True, pids=pids), [*launched, raised])
+    # The window count rides alongside the record for the same reason `restart` carries
+    # what it stopped: the human line already distinguishes a raise that found a window
+    # from one that did not, and a `--json` caller confirming the window actually came
+    # forward — the whole point of the command — could otherwise only get there by parsing
+    # the prose. [FRAMING:representation] one result, and both maps of it say the same.
+    _emit(
+        as_json,
+        {**profile.describe(running=True, pids=pids), "started": started, "windows": windows},
+        [raised],
+    )
 
 
 @main.command("list")

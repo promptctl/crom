@@ -237,7 +237,8 @@ profile back.
 
 A profile you refer to but never declared gets declared, exactly as `crom add <name>`
 with no options would declare it — a bare stanza, so `[defaults]` still governs its seed.
-That covers `crom up`, `crom port`, `crom env`, `crom mcp`, and `crom config <ref>`, and
+That covers `crom up`, `crom restart`, `crom show`, `crom port`, `crom env`, `crom mcp`,
+and `crom config <ref>`, and
 the case it fires in most is a bare `crom up` in a project whose `.crom.toml` declares no
 profiles at all, which used to exit 3 for want of the `default` all of those commands
 default to. The cost is that a mistyped ref no longer errors: it writes a declaration into

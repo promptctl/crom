@@ -1372,6 +1372,80 @@ class CliTest(unittest.TestCase):
 
         self.assertEqual(events, ["lock", "raise", "unlock"])
 
+    def test_restart_names_every_pid_on_both_sides_of_the_message(self):
+        """The two halves of one message must agree about how many browsers exist.
+
+        `find_pids` and `chrome.launch` are documented as returning the main browser
+        process(es), plural, so reporting `pids[0]` for the new browser while joining every
+        stopped one gives a reader a message that quietly disagrees with itself.
+        """
+        self.crom("init")
+        self.crom("add", "ci")
+
+        with (
+            mock.patch("crom.cli.seed.materialize_under_lock"),
+            mock.patch("crom.cli.chrome.kill", return_value=(998, 999)),
+            mock.patch("crom.cli.chrome.find_pids", return_value=()),
+            mock.patch("crom.cli.chrome.launch", return_value=(1234, 1235)),
+        ):
+            output = self.crom("restart", "ci")
+
+        self.assertIn("was pid 998, 999", output)
+        self.assertIn("now pid 1234, 1235", output)
+
+    def test_restart_json_carries_what_it_stopped(self):
+        """`--json` must be able to tell a browser that was replaced from one that was
+        merely started — the single distinction this command exists to report, and one the
+        profile record alone cannot carry because it describes the profile, not the act."""
+        self.crom("init")
+        self.crom("add", "ci")
+
+        with (
+            mock.patch("crom.cli.seed.materialize_under_lock"),
+            mock.patch("crom.cli.chrome.kill", return_value=(999,)),
+            mock.patch("crom.cli.chrome.find_pids", return_value=()),
+            mock.patch("crom.cli.chrome.launch", return_value=(1234,)),
+        ):
+            record = json.loads(self.invoke("restart", "ci", "--json").stdout)
+
+        self.assertEqual(record["stopped"], [999])
+        self.assertEqual(record["pids"], [1234])
+
+    def test_show_json_carries_whether_a_window_came_forward(self):
+        """A script confirming the window actually appeared — the whole point of `show` —
+        would otherwise have to parse the human sentence to learn it."""
+        self.crom("init")
+        self.crom("add", "ci")
+
+        with (
+            mock.patch("crom.cli.seed.materialize_under_lock"),
+            mock.patch("crom.cli.chrome.find_pids", return_value=(999,)),
+            mock.patch("crom.cli.window.raise_profile", return_value=0),
+        ):
+            record = json.loads(self.invoke("show", "ci", "--json").stdout)
+
+        self.assertEqual(record["windows"], 0)
+        self.assertFalse(record["started"])
+
+    def test_show_reports_the_launch_even_when_the_raise_then_fails(self):
+        """Withheld Automation access is likeliest on a first run — the same run likeliest
+        to have started the browser. Told only that the raise failed, a user goes looking
+        for a launch failure that never happened, on a machine now running a browser
+        nobody mentioned. [LAW:no-silent-failure]"""
+        self.crom("init")
+        self.crom("add", "ci")
+
+        with (
+            mock.patch("crom.cli.seed.materialize_under_lock"),
+            mock.patch("crom.cli.chrome.find_pids", return_value=()),
+            mock.patch("crom.cli.chrome.launch", return_value=(1234,)),
+            mock.patch("crom.cli.window.raise_profile", side_effect=CromError("no Automation access")),
+        ):
+            result = self.invoke("show", "ci", expect=1)
+
+        self.assertIn("Started myproj/ci", result.output)
+        self.assertIn("no Automation access", result.output)
+
     def test_show_says_so_when_there_is_no_window_to_bring_forward(self):
         """A browser running headless is raised successfully and shows the user nothing.
         Reporting 'Raised' alone would be crom claiming a window that is not there, and
