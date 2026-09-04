@@ -64,6 +64,7 @@ EXIT_FAILURE = 1
 EXIT_NOT_FOUND = 3
 EXIT_CONFLICT = 4
 
+
 class _Answer(NamedTuple):
     """What crom answers for one class of error: the code a script branches on, and the
     kind that says what happened when the code cannot."""
@@ -81,7 +82,8 @@ class _Answer(NamedTuple):
 # both exit 1, and `kind` is the only field that separates them — which matters, because
 # one means the user's request was wrong and the other means the machine got in the way.
 # Exit codes are a published four-value vocabulary that cannot grow without breaking the
-# contract; kinds can, which is where `.3`'s finer slugs will land.
+# contract; kinds can, which is where a finer slug belongs once four classes stop
+# being enough to say what went wrong.
 _ANSWERS = (
     _Answer(NotFound, EXIT_NOT_FOUND, "not_found"),
     _Answer(Conflict, EXIT_CONFLICT, "conflict"),
