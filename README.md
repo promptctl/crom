@@ -115,6 +115,7 @@ eval "$(crom env dev)"        # see below for what it exports
 crom port dev                 # just the number
 crom up dev --json            # the full record, for anything that parses
 crom mcp dev                  # writes .mcp.json pointing chrome-devtools-mcp at it
+crom --version                # just the version, for a bug report
 ```
 
 `crom env` exports `CROM_NAMESPACE`, `CROM_PROFILE`, `CROM_REF`, `CROM_PORT`,
@@ -153,8 +154,94 @@ is deliberate: one broken declaration is reported rather than sinking the whole 
 since `crom list` is what you run *because* something is wrong. Check for `error` before
 reading `port` and friends.
 
+`crom --version` prints the version alone on one line, so a script reads it without
+splitting a sentence. It reports the crom you have installed rather than any checkout you
+happen to be standing in, which is the number a bug report needs.
+
+### When a command fails
+
 Exit codes are a contract: `0` success, `1` failure, `2` bad usage, `3` no such profile
 or namespace, `4` a port or declaration conflict.
+
+Pass `--json` and a failed command also answers on stdout, in one shape for every
+failure:
+
+```json
+{
+  "error": {
+    "code": 3,
+    "kind": "not_found",
+    "reason": "namespace_unknown",
+    "fields": {"known": ["user"]},
+    "message": "unknown namespace 'nosuchns'. Known namespaces: user"
+  }
+}
+```
+
+stderr still carries the same sentence, byte for byte. `--json` adds the machine's copy
+and never trades the human's away, so a wrapper can parse stdout and still show its own
+user what crom said.
+
+`code` is the exit code repeated, so a caller holding only the parsed document does not
+also need the process's status. `kind` says what the code cannot: `failure` and `os_error`
+are both exit `1`, and only `kind` separates crom refusing your request from the machine
+refusing crom. The other two kinds are `not_found` and `conflict`, at exit `3` and `4`.
+
+`reason` is one word for what actually went wrong. Exit `1` covers "there is no usable
+Chrome", "Chrome started and died" and "the config file will not parse" — three different
+next moves under one number — and the reason is where that distinction lives, so the
+numeric contract never has to grow to carry it.
+
+Two vocabularies share that key, and you can tell them apart by case: crom's own reasons
+are lowercase, like `port_conflict`, `chrome_launch_failed` and `seed_missing`, while an
+`os_error` answers with the errno name the OS already owns, `ENOENT` or `EACCES` or
+`EISDIR`, rather than a second spelling crom invented beside it. It is `null` for the
+occasional `OSError` carrying no errno, since a stand-in like `"unknown"` would be a slug
+you could branch on by mistake.
+
+`fields` is what crom looked up on the way to refusing, kept as data rather than only as
+English — the namespaces that do exist, the profiles a config declares. It is always
+present, and `{}` for the reasons that looked nothing up, so every failure reads the same
+way instead of making you test for the key first. Six reasons carry anything at all:
+
+| reason | carries | what those hold |
+| --- | --- | --- |
+| `config_missing` | `path` | The config file crom went looking at, which is not simply what you typed: it may have been resolved from `CROM_CONFIG` or discovered by walking up from the working directory. |
+| `namespace_unknown` | `known` | The namespaces that do exist. Not the one you asked for — that came from your own argument. |
+| `profile_unknown` | `source`, `declared` | The config in effect, and the profiles it declares. `source` is `null` for a user config that has not been written yet. |
+| `namespace_claimed` | `namespace`, `claimed_by` | The namespace, and the path of the config file already registered against it. The namespace is here because a bare `crom init` derives it from the directory name, so you may never have typed it. |
+| `port_conflict` | `port` | The number two claims landed on. Not who the other claimant is: across the three ways this fires it is a second profile, a reservation crom holds for `user/default`, or a ledger entry, so naming it once would mean inventing it twice. |
+| `declaration_differs` | `settings` | Which settings differ, in the config file's own key names. The declared and requested values stay in the sentence: they are for a human deciding which is right, and a script acting on them would be editing your config from the text of a refusal. |
+
+A value is a string, an integer, an array of strings, or `null`. Nothing nests deeper
+than that.
+
+`message` is the one key not to parse. It is written for a person, it is the same sentence
+crom put on stderr, and it is free to be reworded; anything in it a script needs is in
+`reason` and `fields` already, which is what they are there for.
+
+What you can rely on: exit codes keep their meanings, a published `reason` is never
+renamed, a field name is never renamed, and the values `settings` uses are the config
+file's own key names, which do not change either. Reasons and fields do get *added*, so
+branch on the ones you know and fall back to `kind` — it is coarse precisely so that an
+unfamiliar reason still lands somewhere sensible.
+
+Not every failure gets an envelope, and the rule is that one appears exactly when a
+command that takes `--json` was given it and parsed it. `up`, `down`, `restart`, `show`,
+`list` and `config` take the flag; `add`, `rm`, `init`, `port`, `env`, `mcp` and `forget`
+answer in prose only. Bad usage — exit `2`, an unknown flag or a missing argument — is
+parsing itself failing, so the flag never takes effect and the answer stays prose even
+with `--json` sitting on the command line. `crom --version` is not a command and answers
+in prose for the same reason. A broken pipe is deliberately outside all of it: when
+`crom list | head` loses its reader mid-write, crom ends silently with exit `1` and
+nothing on either stream, because a reader that has already left is the one failure with
+nowhere to put a document.
+
+One gap worth knowing, because it looks like an envelope and is not. The `error` string a
+`crom list --json` element carries for a declaration it could not resolve is a sentence
+with no `reason` and no `fields`, inside a document that exited `0` — a failure carried as
+a value rather than raised as one, and the one place left in crom's output where a failure
+is only English.
 
 ## Commands
 
