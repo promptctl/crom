@@ -21,7 +21,7 @@ from pathlib import Path
 
 from . import report
 from .locking import exclusive
-from .model import MAX_PORT, MIN_PORT, USER_NAMESPACE, Conflict, CromError, ProfileRef
+from .model import MAX_PORT, MIN_PORT, USER_NAMESPACE, ProfileRef, Reason
 from .paths import registry_file
 
 SCHEMA_VERSION = 2
@@ -67,15 +67,17 @@ def _read(path: Path) -> dict:
     try:
         data = json.loads(path.read_text())
     except json.JSONDecodeError as e:
-        raise CromError(
+        raise Reason.REGISTRY_INVALID.error(
             f"{path}: the port ledger is not valid JSON ({e}).\n"
             f"Repair or delete the file; crom rebuilds it, but every profile then gets "
             f"a freshly assigned port."
         ) from e
     if not isinstance(data, dict):
-        raise CromError(f"{path}: the port ledger is a JSON {type(data).__name__}, not an object")
+        raise Reason.REGISTRY_INVALID.error(
+            f"{path}: the port ledger is a JSON {type(data).__name__}, not an object"
+        )
     if data.get("version") != SCHEMA_VERSION:
-        raise CromError(
+        raise Reason.REGISTRY_UNSUPPORTED.error(
             f"{path}: unsupported registry version {data.get('version')!r} "
             f"(this crom speaks version {SCHEMA_VERSION})"
         )
@@ -93,12 +95,12 @@ def _read(path: Path) -> dict:
     for key, required in (("ports", "port"), ("namespaces", "config")):
         table = data.setdefault(key, {})
         if not isinstance(table, dict):
-            raise CromError(
+            raise Reason.REGISTRY_INVALID.error(
                 f"{path}: the port ledger's `{key}` is a {type(table).__name__}, not an object"
             )
         for name, entry in table.items():
             if not isinstance(entry, dict) or required not in entry:
-                raise CromError(
+                raise Reason.REGISTRY_INVALID.error(
                     f"{path}: the port ledger's `{key}.{name}` must be an object with a "
                     f"`{required}`.\nRepair or delete the file; crom rebuilds it, but "
                     f"every profile then gets a freshly assigned port."
@@ -115,11 +117,11 @@ def _read(path: Path) -> dict:
         # crom makes, without an error anywhere. [LAW:no-silent-failure]
         port = entry["port"]
         if not isinstance(port, int) or isinstance(port, bool):
-            raise CromError(
+            raise Reason.REGISTRY_INVALID.error(
                 f"{path}: the port ledger's `ports.{name}.port` is {port!r}, not an integer"
             )
         if not (MIN_PORT <= port <= MAX_PORT):
-            raise CromError(
+            raise Reason.REGISTRY_INVALID.error(
                 f"{path}: the port ledger's `ports.{name}.port` is {port}, "
                 f"outside the legal range {MIN_PORT}..{MAX_PORT}"
             )
@@ -128,7 +130,7 @@ def _read(path: Path) -> dict:
         # Presence was checked above for both keys but the type only for `ports.port` —
         # the same claim owed to both halves of that loop.
         if not isinstance(entry["config"], str):
-            raise CromError(
+            raise Reason.REGISTRY_INVALID.error(
                 f"{path}: the port ledger's `namespaces.{name}.config` is "
                 f"{entry['config']!r}, not a string path"
             )
@@ -199,7 +201,7 @@ def remember_namespace(namespace: str, source: Path, log=report.to_stderr) -> No
         recorded = data["namespaces"].get(namespace, {}).get("config")
         if recorded is not None and recorded != str(source):
             if Path(recorded).is_file():
-                raise Conflict(
+                raise Reason.NAMESPACE_CLAIMED.error(
                     f"namespace '{namespace}' is already claimed by {recorded}.\n"
                     f"{source} cannot use it too — they would share profile directories "
                     f"and ports. Rename this project's `namespace`."
@@ -246,7 +248,7 @@ def forget_namespace(namespace: str) -> int:
     back on different numbers.
     """
     if namespace == USER_NAMESPACE:
-        raise Conflict(
+        raise Reason.NAMESPACE_RESERVED.error(
             f"namespace '{USER_NAMESPACE}' is reserved for your personal profiles and "
             f"cannot be forgotten — dropping it would release the ports they are using. "
             f"Remove individual profiles with `crom rm {USER_NAMESPACE}/<name>`."
@@ -333,7 +335,7 @@ def _reject_base_port_pin(key: str, pinned: int | None) -> None:
     all" guarantee stops being true, with nothing reporting that it changed.
     """
     if pinned == BASE_PORT and key != _DEFAULT_REF:
-        raise Conflict(
+        raise Reason.PORT_CONFLICT.error(
             f"port {BASE_PORT} is reserved for '{_DEFAULT_REF}', which a bare `crom` "
             f"expects to find there without a lookup.\n"
             f"Pin a different port for '{key}', or remove the pin to let crom assign one."
@@ -345,7 +347,7 @@ def _reject_foreign_claim(key: str, port: int, ports: dict[str, dict]) -> None:
         if other_key == key or entry["port"] != port:
             continue
         origin = entry.get("source") or "assigned by crom"
-        raise Conflict(
+        raise Reason.PORT_CONFLICT.error(
             f"port {port} is already held by profile '{other_key}' ({origin}).\n"
             f"Change the `port` for '{key}', or remove it to let crom assign a free one."
         )
@@ -361,4 +363,4 @@ def _allocate(ref: ProfileRef, ports: dict[str, dict]) -> int:
     for port in range(preferred, MAX_PORT + 1):
         if port not in reserved and _port_is_free(port):
             return port
-    raise Conflict(f"no free port available at or above {preferred} for '{ref}'")
+    raise Reason.PORT_EXHAUSTED.error(f"no free port available at or above {preferred} for '{ref}'")

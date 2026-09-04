@@ -20,6 +20,7 @@ from crom.model import (
     Layer,
     NotFound,
     ProfileSpec,
+    Reason,
     SeedChrome,
     SeedFresh,
     SeedPath,
@@ -126,9 +127,13 @@ class LockingTest(unittest.TestCase):
         blocker = root / "file"
         blocker.write_text("not a directory")
 
-        with self.assertRaisesRegex(CromError, "could not take the lock"):
+        with self.assertRaisesRegex(CromError, "could not take the lock") as caught:
             with locking.exclusive(blocker / "child" / "target"):
                 pass
+        # `_writing` answers `CONFIG_UNWRITABLE` for its own `OSError` a few functions
+        # away, and this lock is taken under the config file among others — so that
+        # relabelling would read as right while telling the user a fine file is broken.
+        self.assertIs(caught.exception.reason, Reason.LOCK_UNAVAILABLE)
 
     def test_a_filesystem_that_refuses_locking_is_reported_not_crashed_through(self):
         """The guarantee has to cover acquiring the lock, not only creating the file.
@@ -140,9 +145,10 @@ class LockingTest(unittest.TestCase):
         """
         root = Path(tempfile.mkdtemp())
         with mock.patch("crom.locking.fcntl.flock", side_effect=OSError("ENOLCK")):
-            with self.assertRaisesRegex(CromError, "could not take the lock"):
+            with self.assertRaisesRegex(CromError, "could not take the lock") as caught:
                 with locking.exclusive(root / "target"):
                     pass
+        self.assertIs(caught.exception.reason, Reason.LOCK_UNAVAILABLE)
 
     def test_a_failure_to_unlock_does_not_replace_the_real_error(self):
         """Closing the descriptor releases the lock on every path out, so an explicit
@@ -224,8 +230,11 @@ class HeaderInvariantTest(unittest.TestCase):
         self.target = self.root / ".crom.toml"
 
     def test_creating_a_config_without_a_header_is_refused(self):
-        with self.assertRaisesRegex(CromError, "will not create a config without a header"):
+        with self.assertRaisesRegex(
+            CromError, "will not create a config without a header"
+        ) as caught:
             configwrite.ensure_profile(self.target, ProfileSpec(name="ci", seed=SeedFresh()))
+        self.assertIs(caught.exception.reason, Reason.CONFIG_HEADER_REQUIRED)
         self.assertFalse(self.target.exists())
 
     def test_an_existing_file_needs_no_header(self):
@@ -291,8 +300,24 @@ class MalformedConfigTest(unittest.TestCase):
 
     def test_unparseable_toml_is_reported_against_the_file(self):
         self.target.write_text("this is not = = valid toml [[[")
-        with self.assertRaisesRegex(CromError, "cannot be read as TOML"):
+        with self.assertRaisesRegex(CromError, "cannot be read as TOML") as caught:
             configwrite.declares(self.target, "ci")
+        self.assertIs(caught.exception.reason, Reason.CONFIG_INVALID)
+
+    def test_a_config_that_cannot_be_read_is_not_reported_as_malformed(self):
+        """The other half of `_load`'s `except`, which catches `ParseError` alone.
+
+        "Repair the file" is the wrong remedy for a file whose contents are fine and
+        whose permissions are not, and no slug here would be right — so the `OSError`
+        travels to the CLI boundary intact and is answered there with the errno name
+        the OS already published. Widening this back to `OSError` would relabel a
+        permissions problem as a syntax one and send the user to edit a file they
+        still cannot open, which is why the escape is the assertion.
+        """
+        self.target.write_text('namespace = "myapp"\n')
+        with mock.patch.object(Path, "read_text", side_effect=PermissionError(13, "denied")):
+            with self.assertRaises(PermissionError):
+                configwrite.declares(self.target, "ci")
 
     def test_a_profiles_key_that_is_not_a_table_is_refused_when_declaring(self):
         """`setdefault` returns the existing value, so the later item assignment raised a
@@ -320,14 +345,23 @@ class MalformedConfigTest(unittest.TestCase):
         in which another agent can rewrite it.
         """
         self.target.write_text('namespace = "myapp"\nprofiles = "typo"\n')
-        with self.assertRaisesRegex(CromError, "`profiles` must be a table"):
+        with self.assertRaisesRegex(CromError, "`profiles` must be a table") as caught:
             configwrite.remove_profile(self.target, "yp")
+        # `_profiles_table` raises in one place for all three of its callers, so one
+        # assertion pins the fact rather than three pinning the callers. Here rather than
+        # at the other two because this is the caller with a confusable other ending: the
+        # test below pins `profile_unknown` for a profile that is simply absent, and both
+        # raises build their own message, so a swap changes nothing else this file reads.
+        self.assertIs(caught.exception.reason, Reason.CONFIG_INVALID)
 
     def test_removing_from_a_file_with_no_profiles_is_still_not_found(self):
         """Routing through the shared helper must not turn "absent" into "malformed"."""
         self.target.write_text('namespace = "myapp"\n')
-        with self.assertRaises(NotFound):
+        with self.assertRaises(NotFound) as caught:
             configwrite.remove_profile(self.target, "ci")
+        # Both `NotFound`, both exit 3: the slug is the only field that says the
+        # file was found and the profile in it was not.
+        self.assertIs(caught.exception.reason, Reason.PROFILE_UNKNOWN)
 
 
 class WriteFailureTest(unittest.TestCase):
@@ -349,8 +383,9 @@ class WriteFailureTest(unittest.TestCase):
         with mock.patch.object(
             Path, "write_text", side_effect=OSError(28, "No space left on device")
         ):
-            with self.assertRaisesRegex(CromError, "No space left on device"):
+            with self.assertRaisesRegex(CromError, "No space left on device") as caught:
                 configwrite.ensure_profile(self.target, ProfileSpec(name="ci", seed=SeedFresh()))
+        self.assertIs(caught.exception.reason, Reason.CONFIG_UNWRITABLE)
 
     def test_a_declaration_that_already_exists_is_a_reported_no_op(self):
         """Not a failure, and not silent either: the bool is how `crom add` chooses
@@ -418,9 +453,15 @@ class WriteFailureTest(unittest.TestCase):
         `CromError` raised by something nested inside it is already the precise message,
         and rewording it as a filesystem failure would send the reader to check the wrong
         fact — so it must pass through untouched."""
-        with mock.patch.object(Path, "mkdir", side_effect=CromError("the precise reason")):
-            with self.assertRaisesRegex(CromError, "^the precise reason$"):
+        with mock.patch.object(
+            Path, "mkdir", side_effect=Reason.CONFIG_UNWRITABLE.error("the precise reason")
+        ):
+            with self.assertRaisesRegex(CromError, "^the precise reason$") as caught:
                 configwrite.write_default(self.target, namespace="myapp", seed=DEFAULT_SEED)
+        # The reason travels with the message through `_writing`'s `except CromError:
+        # raise`, which is what this test's docstring is actually about — re-tagging it
+        # would send the reader to check the file rather than the fact that failed.
+        self.assertIs(caught.exception.reason, Reason.CONFIG_UNWRITABLE)
 
 
 if __name__ == "__main__":

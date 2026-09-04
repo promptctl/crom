@@ -21,7 +21,7 @@ from pathlib import Path
 
 from . import chrome
 from .locking import exclusive
-from .model import CromError, ResolvedProfile, Seed, SeedChrome, SeedFresh, SeedPath
+from .model import CromError, Reason, ResolvedProfile, Seed, SeedChrome, SeedFresh, SeedPath
 
 # Where the user's real Chrome keeps its user-data-dir, per platform. POSIX only, as
 # crom is throughout: `chrome.scan` answers "is this profile running" by shelling out to
@@ -101,7 +101,7 @@ def _link_guard(source: Path, described: str):
                 continue
             raw = entry.readlink()
             if raw.is_absolute():
-                raise CromError(
+                raise Reason.SEED_UNSAFE.error(
                     f"seed {described} contains an absolute symlink:\n"
                     f"  {entry.relative_to(source)} -> {raw}\n"
                     f"crom copies links verbatim, so an absolute link would still point "
@@ -111,7 +111,7 @@ def _link_guard(source: Path, described: str):
             target = (entry.parent / raw).resolve()
             if target == root or root in target.parents:
                 continue
-            raise CromError(
+            raise Reason.SEED_UNSAFE.error(
                 f"seed {described} contains a symlink that points outside it:\n"
                 f"  {entry.relative_to(source)} -> {target}\n"
                 f"crom will not copy it: following the link would pull that file into "
@@ -134,7 +134,7 @@ class _Copy:
 
 def _refuse(copy: _Copy, held: Path, holder: str, lead: str) -> CromError:
     """The one thing crom says when it will not read a seed: what it saw, and the way out."""
-    return CromError(
+    return Reason.SEED_BUSY.error(
         chrome.printable(
             f"seed {copy.described} {lead}:\n"
             f"  {held}\n"
@@ -199,13 +199,13 @@ def _copy(copy: _Copy) -> None:
     except (FileNotFoundError, NotADirectoryError):
         present = False
     except OSError as e:
-        raise CromError(
+        raise Reason.SEED_UNREADABLE.error(
             chrome.printable(
                 f"seed {copy.described} cannot be read: {copy.source}: {e.strerror}"
             )
         ) from e
     if not present:
-        raise CromError(
+        raise Reason.SEED_MISSING.error(
             chrome.printable(f"seed {copy.described} does not exist: {copy.source}")
         )
     copy.dest.parent.mkdir(parents=True, exist_ok=True)

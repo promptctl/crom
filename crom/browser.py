@@ -10,7 +10,7 @@ import shutil
 import sys
 from pathlib import Path
 
-from .model import CromError
+from .model import Reason
 
 # Checked in order. macOS installs to a fixed app-bundle path; Linux distributions vary,
 # so we ask PATH. [LAW:dataflow-not-control-flow] platform differences are data in this
@@ -56,7 +56,7 @@ def find_chrome() -> Path:
         if resolved:
             return resolved
     tried = "\n  ".join(candidates)
-    raise CromError(
+    raise Reason.CHROME_UNUSABLE.error(
         f"no Chrome executable found on {sys.platform}. Tried:\n  {tried}\n"
         f"Set chrome_binary in your crom config to point at it explicitly."
     )

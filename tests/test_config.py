@@ -1,5 +1,6 @@
 """Tests for the config checkpoint: what it accepts, and what it refuses to accept."""
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,7 +8,16 @@ from unittest import mock
 
 from crom import config, flags
 from crom.paths import default_profiles_root
-from crom.model import DEFAULT_SEED, Conflict, CromError, Scope, SeedChrome, SeedFresh, SeedPath
+from crom.model import (
+    DEFAULT_SEED,
+    Conflict,
+    CromError,
+    Reason,
+    Scope,
+    SeedChrome,
+    SeedFresh,
+    SeedPath,
+)
 
 SOURCE = Path("/proj/.crom.toml")
 
@@ -87,8 +97,13 @@ class ProfileTest(unittest.TestCase):
 
     def test_a_duplicated_valueless_switch_is_not_told_to_join_values(self):
         """There is nothing to comma-join, and saying otherwise is a false claim."""
-        with self.assertRaisesRegex(CromError, r"Write the switch once: --no-pings"):
+        with self.assertRaisesRegex(CromError, r"Write the switch once: --no-pings") as caught:
             parse(MINIMAL + '[profiles.dev]\nflags = ["--no-pings", "--no-pings"]\n')
+        # One of flags.py's five raises, which all answer the same slug — pinned here and
+        # at one `drops` site rather than at all eleven call sites that reach them, since
+        # the eleventh assertion would state the same fact as the first.
+        # [LAW:polishing-by-subtraction]
+        self.assertIs(caught.exception.reason, Reason.FLAGS_INVALID)
 
     def test_a_switch_repeated_verbatim_is_told_to_write_it_once(self):
         """A copy-paste duplicate has nothing distinct to join, so suggesting
@@ -132,11 +147,16 @@ class ProfileTest(unittest.TestCase):
     def test_a_stanza_may_not_both_set_and_drop_one_switch(self):
         """Setting it here already replaces whatever was inherited, so the drop could not
         mean anything — and which of the two the author meant is only theirs to say."""
-        with self.assertRaisesRegex(CromError, r"both sets and drops --headless"):
+        with self.assertRaisesRegex(CromError, r"both sets and drops --headless") as caught:
             parse(
                 MINIMAL
                 + '[profiles.dev]\nflags = ["--headless=new"]\ndrop_flags = ["--headless"]\n'
             )
+        # The diagnosis is `Layer.__post_init__`'s, and `parse_layer` re-raises it rather
+        # than re-tagging — which it did not always do. Downgraded to CONFIG_INVALID the
+        # message stays word for word what it is now, so this is the assertion that would
+        # have caught it. [LAW:one-source-of-truth]
+        self.assertIs(caught.exception.reason, Reason.FLAGS_INVALID)
 
     def test_a_drop_entry_that_could_never_match_a_switch_is_refused(self):
         """Each of these would drop nothing and say nothing — a config stating a removal
@@ -147,8 +167,11 @@ class ProfileTest(unittest.TestCase):
             ('" --no-pings"', "whitespace"),
             ('"--${CROM_PROFILE}"', "interpolates a variable"),
         ):
-            with self.subTest(entry=entry), self.assertRaisesRegex(CromError, fault):
+            with self.subTest(entry=entry), self.assertRaisesRegex(
+                CromError, fault
+            ) as caught:
                 parse(MINIMAL + f"[profiles.dev]\ndrop_flags = [{entry}]\n")
+            self.assertIs(caught.exception.reason, Reason.FLAGS_INVALID)
 
     def test_a_drop_entry_is_diagnosed_by_the_fault_its_remedy_would_not_cure(self):
         """An entry can be both ill-shaped and value-carrying, and the value remedy is the
@@ -204,8 +227,11 @@ class ProfileTest(unittest.TestCase):
         self.assertNotIn("carries a value", str(caught.exception))
 
     def test_drop_flags_must_be_a_list_of_strings(self):
-        with self.assertRaisesRegex(CromError, r"drop_flags must be a list of switch names"):
+        with self.assertRaisesRegex(
+            CromError, r"drop_flags must be a list of switch names"
+        ) as caught:
             parse(MINIMAL + "[profiles.dev]\ndrop_flags = 3\n")
+        self.assertIs(caught.exception.reason, Reason.CONFIG_INVALID)
 
     def test_unknown_keys_are_refused_rather_than_ignored(self):
         with self.assertRaisesRegex(CromError, "unknown key"):
@@ -213,8 +239,14 @@ class ProfileTest(unittest.TestCase):
 
     def test_reserved_switches_are_refused(self):
         for flag in ("--user-data-dir=/tmp/x", "--remote-debugging-port=1234"):
-            with self.subTest(flag=flag), self.assertRaisesRegex(CromError, "crom owns it"):
+            with self.subTest(flag=flag), self.assertRaisesRegex(
+                CromError, "crom owns it"
+            ) as caught:
                 parse(MINIMAL + f'[profiles.dev]\nflags = ["{flag}"]\n')
+            # Against `drop_flags = 3` above: both are "your config is wrong" at
+            # exit 1, and only the slug says whether the file is malformed or
+            # well-formed and asking for something crom will not give up.
+            self.assertIs(caught.exception.reason, Reason.FLAGS_INVALID)
 
     def test_a_feature_switch_in_flags_is_refused_and_points_at_the_features_table(self):
         """crom composes these two switches itself, so a flag naming one would be replaced
@@ -290,8 +322,11 @@ class ChromeSeedNameTest(unittest.TestCase):
     """
 
     def test_an_absolute_path_cannot_masquerade_as_a_profile_name(self):
-        with self.assertRaisesRegex(CromError, "not a profile name"):
+        with self.assertRaisesRegex(CromError, "not a profile name") as caught:
             parse(MINIMAL + '[profiles.dev]\nseed = "chrome:/etc"\n')
+        # The slug `_parse_seed_path` gives the same threat, because it is the same
+        # threat: a well-formed value refused for what copying it would do.
+        self.assertIs(caught.exception.reason, Reason.SEED_UNSAFE)
 
     def test_a_traversal_cannot_masquerade_as_a_profile_name(self):
         # The last three are the ones that slipped an earlier version of this check:
@@ -306,8 +341,11 @@ class ChromeSeedNameTest(unittest.TestCase):
     def test_an_empty_profile_name_is_refused_rather_than_copying_everything(self):
         # `Path('/a') / ''` is `Path('/a')`, so this would seed from the user's entire
         # Chrome directory — every profile and every cookie — instead of one profile.
-        with self.assertRaisesRegex(CromError, "names no profile"):
+        with self.assertRaisesRegex(CromError, "names no profile") as caught:
             parse(MINIMAL + '[profiles.dev]\nseed = "chrome:"\n')
+        # Pinned separately from the traversal guard above: two raises, and one edit can
+        # retag either without touching the other.
+        self.assertIs(caught.exception.reason, Reason.SEED_UNSAFE)
 
     def test_an_ordinary_profile_name_with_a_space_is_still_accepted(self):
         scope = parse(MINIMAL + '[profiles.dev]\nseed = "chrome:Profile 1"\n')
@@ -342,16 +380,21 @@ class ChromeBinaryTest(unittest.TestCase):
         plain = self.root / "tools" / "notes.txt"
         plain.write_text("hi")
         plain.chmod(0o644)
-        with self.assertRaisesRegex(CromError, "not executable"):
+        with self.assertRaisesRegex(CromError, "not executable") as caught:
             self._parse(MINIMAL + 'chrome_binary = "./tools/notes.txt"\n')
+        self.assertIs(caught.exception.reason, Reason.CHROME_UNUSABLE)
 
     def test_an_empty_binary_is_refused_by_name_not_resolved(self):
         """`Path("")` is `Path(".")`, so the empty string resolves to the config's own
         directory — which exists. The `is_file()` check still refuses it, but the message
         then says a directory that is plainly there "does not exist", sending the reader
         to check the wrong fact. Same stance `state_dir` takes."""
-        with self.assertRaisesRegex(CromError, "chrome_binary is empty"):
+        with self.assertRaisesRegex(CromError, "chrome_binary is empty") as caught:
             self._parse(MINIMAL + 'chrome_binary = ""\n')
+        # One key, two slugs: nothing was written down, versus something was and
+        # it will not run. The second is worth a "install Chrome" message and the
+        # first is worth an "edit your config" one.
+        self.assertIs(caught.exception.reason, Reason.CONFIG_INVALID)
 
 
 class SeedTest(unittest.TestCase):
@@ -414,6 +457,24 @@ class DiscoveryTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def test_an_override_pointing_nowhere_is_reported_not_quietly_walked_past(self):
+        """`CROM_CONFIG` names the file to use, so a path that is not there is a fault in
+        the request rather than a reason to resume the walk. Falling back to discovery
+        would run the command against a different project's config than the caller
+        named — a fallback that changes which data is read, which is the worst kind.
+        [LAW:no-silent-failure]"""
+        with mock.patch.dict(os.environ, {"CROM_CONFIG": str(self.root / "absent.toml")}):
+            with self.assertRaisesRegex(CromError, "which does not exist") as caught:
+                config.discover(self.root)
+        self.assertIs(caught.exception.reason, Reason.CONFIG_MISSING)
+
+    def test_loading_a_file_that_is_not_there_names_it_rather_than_crashing(self):
+        with self.assertRaisesRegex(CromError, "config file not found") as caught:
+            config.load_file(self.root / "absent.toml")
+        # A `NotFound` at exit 3 like `namespace_unknown` and `profile_unknown`, and the
+        # only one of the three about the file itself rather than a name written in it.
+        self.assertIs(caught.exception.reason, Reason.CONFIG_MISSING)
+
     def test_finds_config_in_an_ancestor_directory(self):
         (self.root / ".crom.toml").write_text(MINIMAL)
         deep = self.root / "a" / "b"
@@ -456,8 +517,15 @@ class SeedPathGuardTest(unittest.TestCase):
             self._parse("~")
 
     def test_the_filesystem_root_is_refused(self):
-        with self.assertRaisesRegex(CromError, "your whole home directory or filesystem"):
+        with self.assertRaisesRegex(
+            CromError, "your whole home directory or filesystem"
+        ) as caught:
             self._parse("/")
+        # An unparseable value in a config file is `config_invalid`; every seed guard
+        # — this one and both `chrome:` refusals — is about what copying the named
+        # directory would do, and a caller told only "your config is wrong" would go
+        # looking for a typo.
+        self.assertIs(caught.exception.reason, Reason.SEED_UNSAFE)
 
     def test_an_ancestor_of_home_is_refused(self):
         ancestor = str(Path.home().resolve().parent)

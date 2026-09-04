@@ -13,6 +13,7 @@ of that already being true, so `chrome.launch` has nothing left to look up.
 
 import re
 from dataclasses import dataclass, field
+from enum import Enum, unique
 from pathlib import Path
 
 
@@ -41,7 +42,21 @@ FALLBACK_NAMESPACE = "project"
 
 
 class CromError(Exception):
-    """A failure with a message meant for the user, raised anywhere below the CLI."""
+    """A failure with a message meant for the user, raised anywhere below the CLI.
+
+    Carries a `Reason` because it cannot be built without one, which is the whole
+    enforcement: a raise that forgot to say why is a `TypeError`, not a gap a reviewer
+    has to notice. [LAW:types-are-the-program]
+
+    `super().__init__` is handed the message alone. An `Exception` built with two
+    arguments renders as the tuple — `str(e)` becomes `"('msg', <Reason...>)"` — which
+    would corrupt both the sentence click prints to stderr and the envelope's `message`,
+    the two the CLI asserts are one string rendered twice.
+    """
+
+    def __init__(self, message: str, reason: "Reason"):
+        super().__init__(message)
+        self.reason = reason
 
 
 class NotFound(CromError):
@@ -50,6 +65,126 @@ class NotFound(CromError):
 
 class Conflict(CromError):
     """Two declarations claim the same resource — usually a port."""
+
+
+@unique
+class Reason(Enum):
+    """Why a command failed, in one word a script can branch on — and the only table
+    that says which failures crom can have.
+
+    The exit code sorts every failure into four buckets, which is as fine as a published
+    numeric contract can afford to be. It cannot tell "the port is held by another
+    process" from "there is no usable Chrome" from "Chrome started and died", and those
+    are three different next moves for whoever is reading. The slug is where that
+    detail lives, so the numeric contract never has to grow to carry it.
+
+    Each member also names the exception it raises, and `error()` is the only way any of
+    them is built. So the class is *derived from* the reason rather than chosen beside
+    it: there is no way to pair a not-found reason with `Conflict` and quietly ship exit
+    4, because a raise site never names a class at all. [LAW:one-source-of-truth] one
+    fact — what went wrong — and the class, the kind and the exit code are all
+    projections of it.
+
+    Lives here rather than beside `cli._ANSWERS` because every raise site is below the
+    CLI and `model` is what they all already import; the table pointing the other way
+    would be an upward dependency. [LAW:one-way-deps]
+
+    Slugs are a promise: rename one and every script branching on it breaks silently, so
+    a wrong-but-published name stays. `@unique` makes two reasons sharing a slug a
+    definition-time error rather than an aliased member that answers to the wrong name.
+    """
+
+    def __new__(cls, slug: str, raises: type[CromError]) -> "Reason":
+        member = object.__new__(cls)
+        member._value_ = slug
+        member.raises = raises
+        return member
+
+    def error(self, message: str) -> CromError:
+        return self.raises(message, self)
+
+    # Nothing crom was asked for is there. (exit 3)
+    CONFIG_MISSING = ("config_missing", NotFound)
+    NAMESPACE_UNKNOWN = ("namespace_unknown", NotFound)
+    PROFILE_UNKNOWN = ("profile_unknown", NotFound)
+
+    # Two claims on one resource, or a claim crom reserves for itself. (exit 4)
+    NAMESPACE_CLAIMED = ("namespace_claimed", Conflict)
+    NAMESPACE_RESERVED = ("namespace_reserved", Conflict)
+    PORT_CONFLICT = ("port_conflict", Conflict)
+    PORT_EXHAUSTED = ("port_exhausted", Conflict)
+    # Not `profile_differs`: `_reject_restatement` raises this for `crom add` comparing a
+    # profile's declaration *and* for `crom init` comparing the project's own namespace
+    # and defaults, a command that names no profile at all. One slug rather than two
+    # because the next move is the same either way — edit the file or change the request
+    # — and a slug earns its place by separating next moves, not by being finer.
+    DECLARATION_DIFFERS = ("declaration_differs", Conflict)
+
+    # A config file crom cannot act on.
+    CONFIG_INVALID = ("config_invalid", CromError)
+    CONFIG_HEADER_REQUIRED = ("config_header_required", CromError)
+    CONFIG_UNWRITABLE = ("config_unwritable", CromError)
+    FLAGS_INVALID = ("flags_invalid", CromError)
+    VARIABLE_UNKNOWN = ("variable_unknown", CromError)
+
+    # A name that will not survive crom's own machinery, from wherever it was typed.
+    # Not grouped with the config file above: `parse_ref` raises this for a reference
+    # typed at the CLI — `crom up a/b/c` — which never touched one.
+    INVALID_NAME = ("invalid_name", CromError)
+
+    # The port ledger crom keeps for itself — and, during migration, the legacy registry
+    # `migrate._read_legacy` reads, which is a different file at a different path.
+    REGISTRY_INVALID = ("registry_invalid", CromError)
+    REGISTRY_UNSUPPORTED = ("registry_unsupported", CromError)
+
+    # Launching, reaching, or stopping a browser. The distinctions the exit code cannot
+    # draw and this ticket exists for: which of these you got decides whether retrying is
+    # worth anything.
+    CHROME_UNUSABLE = ("chrome_unusable", CromError)
+    CHROME_LAUNCH_FAILED = ("chrome_launch_failed", CromError)
+    CHROME_STARTUP_FAILED = ("chrome_startup_failed", CromError)
+    CHROME_STOP_FAILED = ("chrome_stop_failed", CromError)
+    CHROME_LOG_UNWRITABLE = ("chrome_log_unwritable", CromError)
+    PORT_IN_USE = ("port_in_use", CromError)
+    PORT_CHECK_FAILED = ("port_check_failed", CromError)
+    PROCESS_TABLE_UNREADABLE = ("process_table_unreadable", CromError)
+
+    # The lock `locking.exclusive` takes, which is not a browser fact: the config file,
+    # the port ledger, the legacy registry and a profile directory are all taken under
+    # it, so it sits under nearly every command rather than beneath the ones above.
+    LOCK_UNAVAILABLE = ("lock_unavailable", CromError)
+
+    # A seed directory crom will not or cannot copy.
+    SEED_MISSING = ("seed_missing", CromError)
+    SEED_UNREADABLE = ("seed_unreadable", CromError)
+    SEED_UNSAFE = ("seed_unsafe", CromError)
+    SEED_BUSY = ("seed_busy", CromError)
+
+    # The move to the namespaced layout, which runs before every command until it takes.
+    MIGRATION_BLOCKED = ("migration_blocked", CromError)
+    MIGRATION_NEEDS_QUIET = ("migration_needs_quiet", CromError)
+
+    # Pointing another tool at a profile.
+    MCP_CONFIG_INVALID = ("mcp_config_invalid", CromError)
+    MCP_KEY_TOO_LONG = ("mcp_key_too_long", CromError)
+
+    # The desktop crom is running on.
+    AUTOMATION_DENIED = ("automation_denied", CromError)
+    PLATFORM_UNSUPPORTED = ("platform_unsupported", CromError)
+    WINDOW_RAISE_FAILED = ("window_raise_failed", CromError)
+
+    # Where crom keeps things, when the home directory that anchors it cannot be found.
+    # `paths` resolves the XDG config and state directories under nearly every command,
+    # so this is no more a desktop fact than the lock above is a browser one.
+    HOME_UNKNOWN = ("home_unknown", CromError)
+
+    # Housekeeping that failed after the request was understood.
+    PROFILE_VANISHED = ("profile_vanished", CromError)
+    PROFILE_DIR_UNDELETABLE = ("profile_dir_undeletable", CromError)
+
+    # crom being wrong about its own state. Distinct from every reason above, which say
+    # the request or the machine was wrong; this one says to file a bug.
+    INTERNAL = ("internal", CromError)
 
 
 def slug_for(text: str) -> str:
@@ -80,7 +215,7 @@ def slug_for(text: str) -> str:
 
 def validate_name(kind: str, value: str) -> str:
     if not _NAME_RE.match(value):
-        raise CromError(
+        raise Reason.INVALID_NAME.error(
             f"invalid {kind} {value!r}: must match {_NAME_RE.pattern} "
             f"(lowercase letters, digits, and . _ - ; starting alphanumeric)"
         )
@@ -215,13 +350,13 @@ class Layer:
 
     def __post_init__(self) -> None:
         if (self.sets or self.drops) and not self.origin:
-            raise CromError(
+            raise Reason.INTERNAL.error(
                 "a layer that sets or drops a flag must name where it was written; "
                 "this is a crom bug, not a fault in any config"
             )
         both = sorted(self.drops & {flag.switch for flag in self.sets})
         if both:
-            raise CromError(
+            raise Reason.FLAGS_INVALID.error(
                 f"both sets and drops {', '.join(both)}.\n"
                 f"A drop removes a switch this stanza inherits, and setting it here "
                 f"already replaces whatever was inherited — so one of the two cannot mean "
@@ -299,7 +434,7 @@ class Resolution:
 
     def __post_init__(self) -> None:
         if not self.answers:
-            raise CromError(
+            raise Reason.INTERNAL.error(
                 f"nothing was resolved for {self.question!r}; this is a crom bug, "
                 f"not a fault in any config"
             )
@@ -605,7 +740,9 @@ def parse_ref(text: str, ambient: str) -> ProfileRef:
     elif len(parts) == 2:
         namespace, name = parts
     else:
-        raise CromError(f"invalid profile reference {text!r}: expected 'name' or 'namespace/name'")
+        raise Reason.INVALID_NAME.error(
+            f"invalid profile reference {text!r}: expected 'name' or 'namespace/name'"
+        )
     # No validation here: splitting is this function's job, and `ProfileRef` validates
     # its own fields. [LAW:single-enforcer] one place decides what a legal name is.
     return ProfileRef(namespace, name)

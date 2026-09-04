@@ -24,6 +24,7 @@ from .model import (
     CromError,
     ProfileRef,
     ProfileSpec,
+    Reason,
     SeedChrome,
     validate_name,
 )
@@ -93,7 +94,7 @@ def _read_legacy(source: Path) -> dict[str, dict]:
     ledger.
     """
     def refuse(problem: str) -> CromError:
-        return CromError(
+        return Reason.REGISTRY_INVALID.error(
             f"{source}: the previous crom registry {problem}.\n"
             f"Repair it, or move it aside — crom will then start fresh, and your existing "
             f"profiles will be re-created with new ports."
@@ -252,7 +253,7 @@ def _require_distinct_ports(legacy: dict, source: Path) -> None:
         if port is None:
             continue
         if port in seen:
-            raise CromError(
+            raise Reason.MIGRATION_BLOCKED.error(
                 f"{source}: '{name}' and '{seen[port]}' both claim port {port}.\n"
                 f"crom cannot give one port to two profiles. Edit that file to give them "
                 f"different ports (or remove one `port`, and crom will assign a fresh "
@@ -291,7 +292,7 @@ def _require_no_foreign_port_claim(legacy: dict, source: Path) -> None:
             None,
         )
         if clash is not None:
-            raise CromError(
+            raise Reason.MIGRATION_BLOCKED.error(
                 f"{source}: '{name}' claims port {port}, which is already reserved by "
                 f"'{clash}'.\ncrom cannot give one port to two profiles. Edit that file "
                 f"to give '{name}' a different port (or remove its `port`, and crom will "
@@ -321,7 +322,7 @@ def _require_no_destination_collision(old_dirs: dict[str, Path], destination_roo
     """
     for name, old_dir in old_dirs.items():
         if old_dir == destination_root or old_dir in destination_root.parents:
-            raise CromError(
+            raise Reason.MIGRATION_BLOCKED.error(
                 f"crom cannot migrate the profile '{name}': its directory ({old_dir}) is "
                 f"where the namespaced layout keeps every profile ({destination_root}), "
                 f"so moving it would put it inside itself.\n"
@@ -352,7 +353,7 @@ def _require_legal_names(legacy: dict) -> None:
     if not illegal:
         return
     listing = "\n  ".join(illegal)
-    raise CromError(
+    raise Reason.MIGRATION_BLOCKED.error(
         "crom cannot migrate these profiles — their names are not legal under the "
         f"namespaced layout:\n  {listing}\n"
         # The *legacy* state directory, which is where the directories being renamed
@@ -378,7 +379,7 @@ def _require_all_stopped(old_dirs: dict[str, Path]) -> None:
     if not running:
         return
     listing = "\n  ".join(f"{name} (pid {', '.join(map(str, pids))})" for name, pids in running.items())
-    raise CromError(
+    raise Reason.MIGRATION_NEEDS_QUIET.error(
         "crom needs to move its profile directories into the new namespaced layout, "
         "but these profiles are still running:\n  "
         f"{listing}\n"

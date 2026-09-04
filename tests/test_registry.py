@@ -13,7 +13,7 @@ from pathlib import Path
 from unittest import mock
 
 from crom import paths, registry
-from crom.model import Conflict, CromError, ProfileRef
+from crom.model import Conflict, CromError, ProfileRef, Reason
 
 
 class LedgerTest(unittest.TestCase):
@@ -38,8 +38,9 @@ class LedgerTest(unittest.TestCase):
         incumbent.write_text('namespace = "app"\n')
 
         registry.remember_namespace("app", incumbent)
-        with self.assertRaisesRegex(Conflict, "already claimed by"):
+        with self.assertRaisesRegex(Conflict, "already claimed by") as caught:
             registry.remember_namespace("app", self.root / "two" / ".crom.toml")
+        self.assertIs(caught.exception.reason, Reason.NAMESPACE_CLAIMED)
 
     def test_a_claim_by_a_config_that_is_gone_passes_to_the_live_project(self):
         """A recorded claimant whose file no longer exists is not a second project — it
@@ -68,8 +69,9 @@ class LedgerTest(unittest.TestCase):
     def test_base_port_is_refused_to_a_pin_from_another_profile(self):
         """`_allocate` held 9222 back from auto-assignment but not from an explicit pin,
         after which a bare `crom` quietly landed on 9223."""
-        with self.assertRaisesRegex(Conflict, "reserved for 'user/default'"):
+        with self.assertRaisesRegex(Conflict, "reserved for 'user/default'") as caught:
             registry.port_for(ProfileRef("myapp", "ci"), pinned=9222, source=None)
+        self.assertIs(caught.exception.reason, Reason.PORT_CONFLICT)
 
     def test_user_default_may_still_pin_its_own_port(self):
         port = registry.port_for(ProfileRef("user", "default"), pinned=9222, source=None)
@@ -80,8 +82,12 @@ class LedgerTest(unittest.TestCase):
     def test_the_user_namespace_cannot_be_forgotten(self):
         """`crom forget user` would release the ports personal profiles are using, and
         they would silently come back on different numbers."""
-        with self.assertRaisesRegex(Conflict, "reserved"):
+        with self.assertRaisesRegex(Conflict, "reserved") as caught:
             registry.forget_namespace("user")
+        # Against `NAMESPACE_CLAIMED` above: both are `Conflict` at exit 4 out of a
+        # namespace-ownership check, and they mean "someone else has it" versus "crom
+        # keeps this one" — a swap reads perfectly well and sends the user nowhere.
+        self.assertIs(caught.exception.reason, Reason.NAMESPACE_RESERVED)
 
     def test_an_ordinary_namespace_can_still_be_forgotten(self):
         registry.remember_namespace("app", Path("/one/.crom.toml"))
@@ -96,8 +102,9 @@ class LedgerTest(unittest.TestCase):
         path = paths.registry_file()
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("{ truncated")
-        with self.assertRaisesRegex(CromError, "not valid JSON"):
+        with self.assertRaisesRegex(CromError, "not valid JSON") as caught:
             registry.reservations()
+        self.assertIs(caught.exception.reason, Reason.REGISTRY_INVALID)
 
     def test_a_future_schema_is_a_plain_failure_not_a_conflict(self):
         """`Conflict` means two declarations claim one resource and maps to exit 4. A
@@ -109,6 +116,10 @@ class LedgerTest(unittest.TestCase):
         with self.assertRaises(CromError) as caught:
             registry.reservations()
         self.assertNotIsInstance(caught.exception, Conflict)
+        # A ledger crom is too old to read, not one written wrong: the remedy is to
+        # upgrade crom, where `REGISTRY_INVALID` would send the reader to repair a file
+        # that is perfectly well formed.
+        self.assertIs(caught.exception.reason, Reason.REGISTRY_UNSUPPORTED)
 
 
 class XdgTest(unittest.TestCase):
@@ -146,8 +157,26 @@ class XdgTest(unittest.TestCase):
         variable that would fix it — `RuntimeError` is not a `CromError`."""
         with mock.patch.dict(os.environ, {}, clear=True):
             with mock.patch.object(Path, "home", side_effect=RuntimeError("no home")):
-                with self.assertRaisesRegex(CromError, "XDG_STATE_HOME"):
+                with self.assertRaisesRegex(CromError, "XDG_STATE_HOME") as caught:
                     paths.state_home()
+        self.assertIs(caught.exception.reason, Reason.HOME_UNKNOWN)
+
+    def test_a_tilde_override_still_needs_a_home_directory(self):
+        """The one override spelling that consults the home directory anyway.
+
+        `XDG_STATE_HOME` exists so a user need not depend on `$HOME`, and an absolute
+        value genuinely does not — but a leading `~` is expanded against home, so this
+        is the one form where setting the override does not make the lookup home-free.
+        `expanduser`'s `RuntimeError` is not a `CromError`, so without the translation
+        it escapes the exit-code contract exactly as `_home`'s does. Stubbed at
+        `os.path.expanduser`, which is what `Path.expanduser` actually consults —
+        `Path.home` is a different lookup and mocking it leaves this line unreached.
+        """
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": "~/state"}, clear=True):
+            with mock.patch("os.path.expanduser", side_effect=lambda raw: raw):
+                with self.assertRaisesRegex(CromError, "XDG_STATE_HOME") as caught:
+                    paths.state_home()
+        self.assertIs(caught.exception.reason, Reason.HOME_UNKNOWN)
 
 
 
@@ -177,6 +206,19 @@ class AdoptTest(unittest.TestCase):
 
         self.assertEqual(registry.reservations(), {})
 
+    def test_a_machine_with_no_free_port_left_says_so_rather_than_assigning_one(self):
+        """The one port refusal that is about the machine rather than a declaration.
+
+        Both this and the pin refusals above are `Conflict` at exit 4 and both read as
+        "you cannot have this port", and their next moves are opposites: change the port
+        you wrote, versus free one up machine-wide. Nothing but the slug says which, and
+        until now nothing reached this line at all.
+        """
+        with mock.patch("crom.registry._port_is_free", return_value=False):
+            with self.assertRaises(Conflict) as caught:
+                registry.port_for(ProfileRef("myapp", "dev"), pinned=None, source=None)
+        self.assertIs(caught.exception.reason, Reason.PORT_EXHAUSTED)
+
     def test_the_default_profile_may_still_adopt_the_base_port(self):
         """The rule is about who holds 9222, not about the number being untouchable."""
         registry.adopt(ProfileRef("user", "default"), registry.BASE_PORT, None)
@@ -184,8 +226,9 @@ class AdoptTest(unittest.TestCase):
 
     def test_adopting_a_port_another_profile_already_holds_is_refused(self):
         registry.adopt(ProfileRef("myapp", "dev"), 9301, None)
-        with self.assertRaises(Conflict):
+        with self.assertRaises(Conflict) as caught:
             registry.adopt(ProfileRef("other", "dev"), 9301, None)
+        self.assertIs(caught.exception.reason, Reason.PORT_CONFLICT)
 
 
 
