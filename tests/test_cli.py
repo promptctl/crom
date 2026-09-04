@@ -23,7 +23,7 @@ from click.testing import CliRunner
 
 from crom import cli, config, configwrite, mcp
 from crom.config import load_ambient
-from crom.model import Conflict, ProfileRef, Reason
+from crom.model import Conflict, CromError, ProfileRef, Reason
 from crom.paths import state_home, user_config_file
 
 
@@ -73,9 +73,7 @@ class CliTest(unittest.TestCase):
         [LAW:types-are-the-program] A runner carries no state between invocations, so
         building one per call costs nothing.
         """
-        previous = Path.cwd()
-        os.chdir(cwd or self.project)
-        try:
+        with self._standing_in(cwd):
             # `catch_exceptions=False` because the default one lies about this boundary:
             # it turns an escaping exception into a tidy `exit_code == 1` with nothing in
             # `output`, which is precisely how a real process behaves *only after*
@@ -84,12 +82,42 @@ class CliTest(unittest.TestCase):
             # [FRAMING:representation] the runner is a map of the terminal; this keeps a
             # crash looking like a crash.
             result = CliRunner().invoke(cli.main, list(args), catch_exceptions=False)
-        finally:
-            os.chdir(previous)
         self.assertEqual(
             result.exit_code, expect, f"crom {' '.join(args)} -> {result.exit_code}\n{result.output}"
         )
         return result
+
+    @contextlib.contextmanager
+    def _standing_in(self, cwd: Path | None):
+        """The directory crom runs in, restored afterwards — see `invoke` for why it is
+        an input rather than a detail. Both ways in share this one, so neither can be
+        given the discipline the other has. [LAW:one-source-of-truth]"""
+        previous = Path.cwd()
+        os.chdir(cwd or self.project)
+        try:
+            yield
+        finally:
+            os.chdir(previous)
+
+    def failure(self, *args, cwd: Path | None = None) -> CromError:
+        """The `CromError` behind a failed command, for the reasons no envelope carries.
+
+        `--json` is on `up`, `down`, `restart`, `show`, `list` and `config`; `add`, `init`
+        and `rm` answer in prose only, so their slug is unobservable from outside — click's
+        standalone mode turns `CromGroup.invoke`'s answer into a `SystemExit`, and the
+        chain goes with it. Standing that mode down keeps the link the boundary already
+        builds — `raise _answer(...) from error` — which is how a test reads these reasons
+        without calling a command's callback by hand and losing everything `main` does
+        first.
+
+        The command runs identically either way: only click's handling of what it raised
+        differs, so a test may still assert on what the run left behind.
+        """
+        with self._standing_in(cwd), self.assertRaises(cli._Failure) as caught:
+            CliRunner().invoke(
+                cli.main, list(args), catch_exceptions=False, standalone_mode=False
+            )
+        return caught.exception.__cause__
 
     def crom(self, *args, cwd: Path | None = None, expect: int = 0):
         """What a script sees: stdout and stderr as one stream, which is what a terminal
@@ -1689,12 +1717,37 @@ class CliTest(unittest.TestCase):
         Path(before["profile_dir"]).mkdir(parents=True)
 
         with mock.patch("crom.cli.shutil.rmtree", side_effect=OSError(66, "Directory not empty")):
-            output = self.crom("rm", "ci", "--yes", expect=1)
+            error = self.failure("rm", "ci", "--yes")
 
-        self.assertIn("still declared", output)
+        # `rm` carries no `--json`, so this slug reaches no envelope and the rendered
+        # sentence was all the suite could see. `profile_dir_undeletable` is what makes
+        # the retry the message promises a fact a script can act on rather than prose.
+        self.assertIs(error.reason, Reason.PROFILE_DIR_UNDELETABLE)
+        self.assertIn("still declared", str(error))
         self.assertIn("[profiles.ci]", (self.project / ".crom.toml").read_text())
         # Still nameable, on its original port — which is what makes the retry real.
         self.assertEqual(json.loads(self.crom("config", "ci", "--json"))["resolved"], before)
+
+    def test_a_profile_removed_mid_declaration_is_named_rather_than_left_a_key_error(self):
+        """`add_cmd` reads the file back after `ensure_profile` wrote it, so a concurrent
+        `crom rm` — or a `git checkout` over the file — landing between the two arrives
+        here. Left to the dict lookup it was a `KeyError`, which would leave this module's
+        exit-code contract as a traceback. [LAW:no-silent-failure]
+
+        The read-back is mocked because the race cannot be scheduled: what is under test
+        is what crom says when it loses it, not how narrow the window is.
+        """
+        self.crom("init")
+        real = config.load_file
+
+        def as_if_removed(target, **kwargs):
+            return replace(real(target, **kwargs), profiles={})
+
+        with mock.patch.object(config, "load_file", side_effect=as_if_removed):
+            error = self.failure("add", "ci")
+
+        self.assertIs(error.reason, Reason.PROFILE_VANISHED)
+        self.assertIn("was removed while crom was declaring it", str(error))
 
     def test_help_sections_cover_every_command(self):
         """Every command appears in exactly one curated `crom --help` section.

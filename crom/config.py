@@ -404,11 +404,16 @@ def _parse_chrome_profile(which: str, where: str, source: Path) -> str:
     is `Path('/a')`, so `chrome:` would silently copy the user's *entire* Chrome
     directory — every profile and every cookie — when they asked for one profile.
 
+    Both refusals are `seed_unsafe`, the slug `_parse_seed_path` gives the same threat a
+    few lines above: a well-formed value refused for what copying it would do, not a
+    malformed one. `config_invalid` is where an unparseable value goes, and a caller told
+    that would go hunting for a typo instead of reading what the seed would have copied.
+
     [LAW:parse-dont-validate] The checkpoint is here, so `seed.py` holds no guard: a
     `SeedChrome` that exists names a single directory that cannot escape.
     """
     if not which:
-        raise Reason.CONFIG_INVALID.error(
+        raise Reason.SEED_UNSAFE.error(
             f"{source}: {where}.seed = 'chrome:' names no profile. Use 'chrome' for the "
             f"default profile, or 'chrome:<Profile Name>' for a specific one."
         )
@@ -420,7 +425,7 @@ def _parse_chrome_profile(which: str, where: str, source: Path) -> str:
     # the join to the filesystem root.
     parts = Path(which).parts
     if "/" in which or which.startswith("~") or len(parts) != 1 or parts[0] in (".", ".."):
-        raise Reason.CONFIG_INVALID.error(
+        raise Reason.SEED_UNSAFE.error(
             f"{source}: {where}.seed = 'chrome:{which}' is not a profile name. It must "
             f"name one directory inside your Chrome user-data-dir (e.g. 'Default', "
             f"'Profile 1') — not a path."
