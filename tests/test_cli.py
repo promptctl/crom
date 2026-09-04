@@ -1820,6 +1820,10 @@ class CliTest(unittest.TestCase):
         empty stderr to exit 120 and `Error: Broken pipe` — 120 rather than 1 because
         the wrapper never got installed, so interpreter shutdown then failed to flush
         stdout as well. Two regressions from one widened `except`.
+
+        The `--json` envelope inherits the carve-out rather than reopening it: a reader
+        that has already gone is the one failure with nowhere to put a document, so both
+        streams stay empty even when a caller asked for JSON.
         """
         self.crom("init")
         with mock.patch(
@@ -1837,6 +1841,25 @@ class CliTest(unittest.TestCase):
         ):
             result = self.invoke("list", expect=1)
         self.assertEqual(result.stderr.strip(), "Error: Cannot send")
+
+        # The same two errno values decide the envelope, and asserting both is what says
+        # the carve-out is keyed on `EPIPE` rather than on `BrokenPipeError`: one class,
+        # two answers. A reader that left gets silence on both streams; a socket crom
+        # really failed to write is an ordinary failure and gets its document.
+        with mock.patch(
+            "crom.chrome.scan", side_effect=BrokenPipeError(errno.EPIPE, "Broken pipe")
+        ):
+            gone = self.invoke("list", "--json", expect=1)
+        self.assertEqual((gone.stdout, gone.stderr), ("", ""))
+
+        with mock.patch(
+            "crom.chrome.scan", side_effect=BrokenPipeError(errno.ESHUTDOWN, "Cannot send")
+        ):
+            refused = self.invoke("list", "--json", expect=1)
+        self.assertEqual(
+            json.loads(refused.stdout)["error"],
+            {"code": 1, "kind": "os_error", "message": "Cannot send"},
+        )
 
     @contextlib.contextmanager
     def _two_profiles_pinning_one_port(self):
