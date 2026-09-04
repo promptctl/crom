@@ -47,7 +47,8 @@ FALLBACK_NAMESPACE = "project"
 # the way out. For crom's own refusals that is the raise site; the one failure with no
 # raise site, the OS's, is rendered by the boundary that receives it.
 # [LAW:effects-at-boundaries]
-Fields = dict[str, str | int | tuple[str, ...] | None]
+FieldValue = str | int | tuple[str, ...] | None
+Fields = dict[str, FieldValue]
 
 
 class CromError(Exception):
@@ -134,7 +135,7 @@ class Reason(Enum):
         member.carries = carries
         return member
 
-    def error(self, message: str, **fields: str | int | tuple[str, ...] | None) -> CromError:
+    def error(self, message: str, **fields: FieldValue) -> CromError:
         """Build this reason's failure — the only way any `CromError` comes into being.
 
         The payload is rebuilt in `carries` order rather than kept in call order, so the
