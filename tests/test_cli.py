@@ -1946,6 +1946,62 @@ class CliTest(unittest.TestCase):
 
         self.assertEqual(kinds, ["os_error", "failure"])
 
+    def test_a_reader_that_left_does_not_turn_the_envelope_into_a_traceback(self):
+        """The envelope is stdout, and stdout is what gets piped — so it can meet a
+        reader that has already gone.
+
+        Measured against the real binary before this was fixed: `crom up nosuchns/x
+        --json` with stdout on a reader-less pipe exited 120 with a stack trace, while the
+        same command without the flag exited 3 in silence. The envelope was being written
+        from the exception's `show`, which click calls from its own `except
+        ClickException` arm — and that arm's sibling `except OSError`, the one installing
+        `PacifyFlushWrapper` for `errno.EPIPE`, cannot catch what it raises. 120 rather
+        than 1 for the same reason as ever: the wrapper never got installed, so shutdown
+        then failed to flush too.
+
+        Writing it from the boundary instead puts it back inside the region click
+        protects. Patching `click.echo` reaches only that write — `click.exceptions` binds
+        its own `echo` by direct import, so the stderr prose is untouched by this mock and
+        an escape here can only have come from the envelope.
+        """
+        self.crom("init")
+        with mock.patch(
+            "crom.cli.click.echo", side_effect=BrokenPipeError(errno.EPIPE, "Broken pipe")
+        ):
+            result = self.invoke("up", "nosuchns/x", "--json", expect=1)
+
+        # Silence on both streams, which is the conventional end of a pipeline whose
+        # reader left — and exit 1, the same ending `crom list | head` already gets.
+        self.assertEqual((result.stdout, result.stderr), ("", ""))
+
+    def test_a_failure_raised_before_parsing_has_no_flag_to_honour_yet(self):
+        """Where the envelope's promise actually stops, asserted rather than left to be
+        discovered by a script author.
+
+        click runs the group callback before it parses the invoked subcommand's options,
+        and `main` does real work there — `migrate.run_if_needed()` and
+        `_bootstrap_user_config()`, either of which can refuse. A `CromError` from that
+        window is raised before `--json` has been parsed, so crom has not yet learned that
+        the caller asked, and the failure reaches them as prose only.
+
+        This is one line and not two ad-hoc gaps: the envelope answers for a command crom
+        has understood, which also excludes click's own usage errors (exit 2). Closing it
+        means moving migration and bootstrap out of the group callback so that nothing can
+        fail ahead of parsing — a change to when migration runs for every command, `crom
+        init` included, so it is its own piece of work rather than a rider on this one.
+
+        Asserted here so the limitation is known and stable. If it is ever closed, this
+        test is the one that should fail and be rewritten — not quietly deleted.
+        """
+        self.crom("init")
+        with mock.patch(
+            "crom.migrate.run_if_needed", side_effect=CromError("a legacy Chrome is still running")
+        ):
+            result = self.invoke("list", "--json", expect=1)
+
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr.strip(), "Error: a legacy Chrome is still running")
+
     def test_every_command_offering_json_answers_a_failure_in_json(self):
         """The envelope belongs to the flag, so every command carrying the flag has it.
 

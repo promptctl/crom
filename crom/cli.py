@@ -91,7 +91,7 @@ _ANSWERS = (
     _Answer(OSError, EXIT_FAILURE, "os_error"),
 )
 
-# Where a parsed `--json` is recorded, under the key `_json_option` writes and `_failure`
+# Where a parsed `--json` is recorded, under the key `_json_option` writes and `_answer`
 # reads. `Context.meta` and not the `_Session` on `ctx.obj`: meta is one dict shared by
 # click's whole context tree, so it is readable from the group without depending on the
 # group callback having already built a session.
@@ -131,46 +131,38 @@ def _json_text(payload) -> str:
 
 
 class _Failure(click.ClickException):
-    """A failed command, rendered for whichever reader asked for it.
-
-    click's own handler prints the prose to stderr, and `show` adds the same failure as
-    data on stdout under the same `--json` the success path already answers to. Both, and
-    never one instead of the other: stderr stays byte-for-byte what it was before this
-    envelope existed, so nothing reading crom's messages today has to change, while a
-    caller that asked for JSON and got zero bytes on failure now gets a document.
-
-    [LAW:one-source-of-truth] the sentence on stderr and `message` in the envelope are one
-    string rendered twice, not two wordings that can drift apart.
-    """
-
-    def __init__(self, message: str, code: int, kind: str, as_json: bool):
+    def __init__(self, message: str, exit_code: int):
         super().__init__(message)
-        self.exit_code = code
-        self.kind = kind
-        self.as_json = as_json
-
-    def show(self, file=None) -> None:
-        super().show(file)
-        # The last inch of rendering, where the flag is the whole discriminator: a caller
-        # that did not ask for JSON asked for stdout to stay empty on failure, which is
-        # what every `crom ... > out` already assumes.
-        if self.as_json:
-            envelope = {"code": self.exit_code, "kind": self.kind, "message": self.format_message()}
-            click.echo(_json_text({"error": envelope}))
+        self.exit_code = exit_code
 
 
-def _failure(error: Exception, message: str, ctx: click.Context) -> _Failure:
-    """`message`, carrying whichever code and kind `_ANSWERS` assigns `error`.
+def _answer(ctx: click.Context, error: Exception, message: str) -> _Failure:
+    """crom's whole answer to a failed command: the machine's copy on stdout when one was
+    asked for, and the exception carrying the human's copy and the exit code.
 
-    [LAW:one-source-of-truth] the wording of a failure and its classification are two
-    questions: each arm of `invoke` answers the first for its own kind of error, and
-    neither answers the second, so a code cannot be spelled anywhere but the table.
+    [LAW:one-source-of-truth] the sentence click prints to stderr and the `message` in the
+    envelope are one string rendered twice, not two wordings that can drift apart. stderr
+    is untouched either way — the flag adds the machine's copy, it never trades the
+    human's away.
+
+    The envelope is written here rather than from the exception's own `show` so that it
+    stays under the broken-pipe rule. click calls `show` from its own `except
+    ClickException` arm, whose sibling `except OSError` — the one installing
+    `PacifyFlushWrapper` for `errno.EPIPE` — cannot catch what that arm raises. Measured:
+    `crom up nosuchns/x --json` into a closed pipe returned exit 120 and a traceback,
+    where the same command without the flag exited 3 in silence. Written here it
+    propagates out of `invoke` into the region click does protect, so a reader that left
+    gets the quiet ending every other broken pipe gets. [LAW:single-enforcer] the rule
+    keeps one home rather than growing a second guard beside it.
     """
     answer = next(a for a in _ANSWERS if isinstance(error, a.error))
-    # Absent whenever nothing parsed a `--json` on this invocation — a command that has no
-    # such flag, or a failure raised in `main` before any subcommand was reached. Not
-    # asking is the honest reading of that, so the default is a value and not a branch.
-    return _Failure(message, answer.code, answer.kind, ctx.meta.get(_JSON_REQUESTED, False))
+    # Absent until click parses the subcommand's options, so a usage error or the
+    # migration `main` runs first reaches the user as prose even though the flag was on
+    # the command line. The envelope answers for a command crom has understood.
+    if ctx.meta.get(_JSON_REQUESTED, False):
+        envelope = {"code": answer.code, "kind": answer.kind, "message": message}
+        click.echo(_json_text({"error": envelope}))
+    return _Failure(message, answer.code)
 
 
 # How `crom --help` groups its commands, as data rather than as prose that has to be
@@ -215,7 +207,7 @@ class CromGroup(click.Group):
         try:
             return super().invoke(ctx)
         except CromError as error:
-            raise _failure(error, str(error), ctx) from error
+            raise _answer(ctx, error, str(error)) from error
         except OSError as error:
             # `errno` and not `BrokenPipeError`, because click's own handler keys on
             # `errno.EPIPE` for any `OSError` while `BrokenPipeError` also carries
@@ -230,7 +222,7 @@ class CromGroup(click.Group):
             # missing halves drop out as values rather than as branches.
             # [LAW:dataflow-not-control-flow]
             parts = (error.filename, error.strerror or error)
-            raise _failure(error, ": ".join(str(part) for part in parts if part), ctx) from error
+            raise _answer(ctx, error, ": ".join(str(part) for part in parts if part)) from error
 
     def format_commands(self, ctx, formatter) -> None:
         """Render the command list in sections, and never omit a command.
@@ -292,7 +284,7 @@ class _Session:
 def _emit(as_json: bool, payload, lines: list[str]) -> None:
     """Render one successful result. The last inch of UI, and the only place a *result*
     chooses its format — a failure has two readers at once, so it renders in
-    `_Failure.show`."""
+    `_answer`."""
     click.echo(_json_text(payload) if as_json else "\n".join(lines))
 
 
