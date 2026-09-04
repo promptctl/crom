@@ -1924,7 +1924,15 @@ class CliTest(unittest.TestCase):
             # `ESHUTDOWN` and not a slug of crom's own devising: the OS published this
             # name, so the envelope repeats it rather than inventing a second spelling
             # for a fact crom does not own. [LAW:one-source-of-truth]
-            {"code": 1, "kind": "os_error", "reason": "ESHUTDOWN", "message": "Cannot send"},
+            # `path` is null because this refusal names no file: the `BrokenPipeError` is
+            # about a reader that left, not about anything on disk.
+            {
+                "code": 1,
+                "kind": "os_error",
+                "reason": "ESHUTDOWN",
+                "fields": {"path": None},
+                "message": "Cannot send",
+            },
         )
 
     @contextlib.contextmanager
@@ -1952,13 +1960,18 @@ class CliTest(unittest.TestCase):
         string: it is one string rendered to two streams, and a test that accepted any
         text would pass against two wordings that had drifted apart.
         [LAW:one-source-of-truth]
+
+        `fields` is checked by name and not by value, which is the claim that belongs
+        here: whatever the failure was, the envelope carries the data crom looked up
+        under names decided by the reason. What is actually in them is pinned at the
+        raise sites, where the values come from.
         """
         self.crom("init")
         self.crom("add", "dev", "--port", "9401")
 
         refusals = (
             # 3: a namespace nothing declares.
-            (("up", "nosuchns/x"), contextlib.nullcontext(), 3, "not_found"),
+            (("up", "nosuchns/x"), contextlib.nullcontext(), 3, "not_found", ("known",)),
             # 1: the operating system refusing the process table.
             (
                 ("list",),
@@ -1968,12 +1981,13 @@ class CliTest(unittest.TestCase):
                 ),
                 1,
                 "os_error",
+                ("path",),
             ),
             # 4: two profiles pinning one port, which `list` meets while loading.
-            (("list",), self._two_profiles_pinning_one_port(), 4, "conflict"),
+            (("list",), self._two_profiles_pinning_one_port(), 4, "conflict", ("port",)),
         )
 
-        for args, refusal, code, kind in refusals:
+        for args, refusal, code, kind, fields in refusals:
             with self.subTest(command=args[0], code=code):
                 with refusal:
                     plain = self.invoke(*args, expect=code)
@@ -1985,6 +1999,7 @@ class CliTest(unittest.TestCase):
                 error = json.loads(asked.stdout)["error"]
                 self.assertEqual(error["code"], code)
                 self.assertEqual(error["kind"], kind)
+                self.assertEqual(tuple(error["fields"]), fields)
                 self.assertEqual(f"Error: {error['message']}", plain.stderr.strip())
 
     def test_the_kind_says_what_the_exit_code_cannot(self):
@@ -2040,6 +2055,80 @@ class CliTest(unittest.TestCase):
             },
         )
 
+    def test_the_namespaces_that_do_exist_reach_a_script_as_a_list(self):
+        """The case this ticket opened on: crom already knew the answer and spent it on a
+        sentence.
+
+        `unknown namespace 'x'. Known namespaces: myproj, user` is crom reading its own
+        registry on the caller's behalf and then handing back the result as English. A
+        script that wants to offer the real choices — or pick one — has to match a prose
+        prefix and split on a comma, which is a parser for crom's wording rather than for
+        crom's data, and it breaks the day the wording improves.
+
+        The list is asserted against the sentence as well as against its value, because
+        the two are one list rendered twice: the field is what the message was joined
+        from, not a second lookup that could come to disagree with it.
+        [LAW:one-source-of-truth]
+        """
+        self.crom("init")
+
+        error = json.loads(self.invoke("up", "nosuchns/x", "--json", expect=3).stdout)["error"]
+
+        self.assertEqual(error["fields"], {"known": ["myproj", "user"]})
+        self.assertTrue(
+            error["message"].endswith("Known namespaces: myproj, user"), error["message"]
+        )
+
+    def test_a_profile_nothing_declares_names_the_file_and_what_is_in_it(self):
+        """The other enumeration, and the one whose next move is a file edit.
+
+        Both facts are lookups: which config governs this directory is the result of
+        walking up from the working directory, and what it declares is the result of
+        parsing it. Neither is anywhere in the argument the caller typed.
+
+        `down` rather than `up`, because `up` declares a missing profile instead of
+        refusing it — this reason belongs to the commands that must not create what they
+        were asked to converge away from.
+        """
+        self.crom("init")
+        self.crom("add", "dev", "--port", "9401")
+
+        error = json.loads(self.invoke("down", "nope", "--json", expect=3).stdout)["error"]
+
+        self.assertEqual(
+            error["fields"],
+            # `default` as well as `dev`: `init` declares one, and the field is the file's
+            # whole list rather than the profiles this test happened to add.
+            {"source": str(self.project / ".crom.toml"), "declared": ["default", "dev"]},
+        )
+
+    def test_an_os_refusal_names_the_file_it_was_refused(self):
+        """The OS arm's own field, and the one place the boundary fills a payload itself.
+
+        This arm's message is `<path>: <reason>` joined at the boundary, so without the
+        field a caller would be splitting crom's sentence on a colon to learn which file
+        the OS would not open — and paths contain colons. The parts arrive already
+        separate; flattening them and asking the reader to undo it is the whole failure
+        this ticket exists to fix, one arm over from crom's own refusals.
+
+        Both spellings of `filename`, because the stdlib uses both: most calls hand back
+        the string they were given, and `shutil.rmtree(Path(...))` hands back the
+        `PosixPath`. Measured, not assumed. JSON has one of those types, so the boundary
+        renders — which is its job, and not one a raise site could have done here, since
+        the OS built this failure and there is no raise site.
+        """
+        self.crom("init")
+
+        for named in ("/bin/ps", Path("/bin/ps")):
+            with self.subTest(filename=type(named).__name__):
+                with mock.patch(
+                    "crom.chrome.scan",
+                    side_effect=PermissionError(13, "Permission denied", named),
+                ):
+                    result = self.invoke("list", "--json", expect=1)
+                error = json.loads(result.stdout)["error"]
+                self.assertEqual(error["fields"], {"path": "/bin/ps"})
+
     def test_a_refusal_the_os_did_not_number_answers_with_no_reason_at_all(self):
         """The one failure that reaches the envelope with nothing to put in `reason`.
 
@@ -2087,10 +2176,16 @@ class CliTest(unittest.TestCase):
         with self.assertRaises(Conflict) as caught:
             cli._reject_restatement(
                 "already configures this project, and this asks to change it:",
-                (("namespace", "chosen", "other"),),
+                # A second fact that agrees, so `settings` is asserted to name what
+                # differs rather than everything that was compared.
+                (("namespace", "chosen", "other"), ("seed", "fresh", "fresh")),
                 "Edit the file, or ask for what it already declares.",
             )
         self.assertIs(caught.exception.reason, Reason.DECLARATION_DIFFERS)
+        # Which setting contradicts the file, in the file's own vocabulary. The two values
+        # stay in the sentence: they are for a human choosing between them, and a script
+        # acting on them would be rewriting a config from the text of a refusal.
+        self.assertEqual(caught.exception.fields, {"settings": ("namespace",)})
 
     def test_every_reason_answers_with_the_class_its_own_row_names(self):
         """The whole table walked: each reason raises the exception its row declares, and
@@ -2113,14 +2208,41 @@ class CliTest(unittest.TestCase):
                 # a script matches on: a `Chrome_Unusable` slipping into the table is a
                 # vocabulary with two spellings, and slugs cannot be renamed later.
                 self.assertRegex(reason.value, r"^[a-z][a-z0-9_]*$")
+                # A field name is published on the same terms as the slug that discriminates
+                # it, so it is held to the same spelling.
+                for name in reason.carries:
+                    self.assertRegex(name, r"^[a-z][a-z0-9_]*$")
 
-                error = reason.error("a sentence")
+                error = reason.error("a sentence", **dict.fromkeys(reason.carries, "a value"))
                 self.assertIsInstance(error, reason.raises)
                 self.assertIs(error.reason, reason)
+                self.assertEqual(tuple(error.fields), reason.carries)
                 self.assertEqual(str(error), "a sentence")
 
                 answer = next(a for a in cli._ANSWERS if isinstance(error, a.error))
                 self.assertIs(answer.error, reason.raises)
+
+    def test_a_reason_decides_its_own_fields_rather_than_taking_what_it_is_given(self):
+        """The schema belongs to the reason, so a raise site supplies values and nothing
+        else — not which names, not which order.
+
+        Without this, `reason` would discriminate a payload whose shape it did not decide:
+        one `profile_unknown` site could answer with `declared` and another with
+        `profiles`, both plausible, and a script branching on the slug would be reading a
+        shape the slug does not actually promise. [LAW:types-are-the-program]
+
+        The reordering half matters for the same reason the refusal does. Two raise sites
+        naming the same fields in different orders would emit two key orders for one
+        reason, and a reader diffing crom's output across runs would see a change where
+        nothing changed.
+        """
+        for fields in ({}, {"known": ("a",), "extra": 1}, {"declared": ()}):
+            with self.subTest(given=tuple(fields)):
+                with self.assertRaises(TypeError):
+                    Reason.NAMESPACE_UNKNOWN.error("a sentence", **fields)
+
+        jumbled = Reason.PROFILE_UNKNOWN.error("a sentence", declared=(), source=None)
+        self.assertEqual(tuple(jumbled.fields), Reason.PROFILE_UNKNOWN.carries)
 
     def test_no_module_builds_a_failure_without_naming_its_reason(self):
         """The backstop for the hundred raise sites this suite never executes.
@@ -2150,6 +2272,46 @@ class CliTest(unittest.TestCase):
             and node.func.id in family
         ]
         self.assertEqual(direct, [], "build these through Reason.<REASON>.error(...)")
+
+    def test_no_module_raises_a_reason_with_fields_it_does_not_declare(self):
+        """The same backstop as above, one field over, and needed for the same reason.
+
+        `Reason.error` refuses a payload its reason did not declare — but only on the line
+        that runs, and these lines run only when something has already gone wrong. A raise
+        site that spelled `declared` as `profiles` would pass review, pass the suite, and
+        then hand the first person to reach it a `TypeError` where crom meant to hand them
+        a sentence. So the agreement is asserted over the source instead.
+
+        Statically-named sites only: `chrome.launch` binds a reason to a local — one per
+        ending its match arms can reach — and raises through it, which no reader of the
+        source can resolve to a member. That site passes no fields, and the reasons it can
+        hold declare none; the constraint keeping it safe lives in `Reason`, which is where
+        this test sends anyone who breaks it.
+        """
+        sites = [
+            (path.name, node)
+            for path in sorted(Path(cli.__file__).parent.glob("*.py"))
+            for node in ast.walk(ast.parse(path.read_text()))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "error"
+            and isinstance(node.func.value, ast.Attribute)
+            and isinstance(node.func.value.value, ast.Name)
+            and node.func.value.value.id == "Reason"
+        ]
+        # A pattern that had drifted would match nothing, find nothing wrong, and pass —
+        # an answer-shaped void wearing a green test as a costume. The floor is well under
+        # the real count so that deleting a raise site is not a test failure.
+        # [LAW:parse-dont-validate]
+        self.assertGreater(len(sites), 80)
+
+        wrong = [
+            f"{name}:{node.lineno}: {node.func.value.attr} given "
+            f"{tuple(k.arg for k in node.keywords)}"
+            for name, node in sites
+            if {k.arg for k in node.keywords} != set(Reason[node.func.value.attr].carries)
+        ]
+        self.assertEqual(wrong, [], "each raise site supplies exactly what its reason carries")
 
     def test_a_reader_that_left_does_not_turn_the_envelope_into_a_traceback(self):
         """The envelope is stdout, and stdout is what gets piped — so it can meet a
@@ -2244,6 +2406,10 @@ class CliTest(unittest.TestCase):
                         "code": 1,
                         "kind": "failure",
                         "reason": "config_invalid",
+                        # Present and empty rather than absent, because `config_invalid`
+                        # looked nothing up. A caller reads `fields` the same way for
+                        # every failure instead of testing for the key first.
+                        "fields": {},
                         "message": "no ambient config",
                     },
                 )

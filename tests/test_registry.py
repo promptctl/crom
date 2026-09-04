@@ -41,6 +41,12 @@ class LedgerTest(unittest.TestCase):
         with self.assertRaisesRegex(Conflict, "already claimed by") as caught:
             registry.remember_namespace("app", self.root / "two" / ".crom.toml")
         self.assertIs(caught.exception.reason, Reason.NAMESPACE_CLAIMED)
+        # The incumbent's path is the whole answer to "so where is it, then" — a ledger
+        # read the caller has no other way to make. The namespace travels with it because
+        # a bare `crom init` never typed one; crom derived it from the directory name.
+        self.assertEqual(
+            caught.exception.fields, {"namespace": "app", "claimed_by": str(incumbent)}
+        )
 
     def test_a_claim_by_a_config_that_is_gone_passes_to_the_live_project(self):
         """A recorded claimant whose file no longer exists is not a second project — it
@@ -72,6 +78,7 @@ class LedgerTest(unittest.TestCase):
         with self.assertRaisesRegex(Conflict, "reserved for 'user/default'") as caught:
             registry.port_for(ProfileRef("myapp", "ci"), pinned=9222, source=None)
         self.assertIs(caught.exception.reason, Reason.PORT_CONFLICT)
+        self.assertEqual(caught.exception.fields, {"port": 9222})
 
     def test_user_default_may_still_pin_its_own_port(self):
         port = registry.port_for(ProfileRef("user", "default"), pinned=9222, source=None)
@@ -229,6 +236,10 @@ class AdoptTest(unittest.TestCase):
         with self.assertRaises(Conflict) as caught:
             registry.adopt(ProfileRef("other", "dev"), 9301, None)
         self.assertIs(caught.exception.reason, Reason.PORT_CONFLICT)
+        # The same field name and the same shape as the other two sites raising this
+        # reason, which is what one declared schema per reason buys: a script reads
+        # `fields.port` without first working out which of the three it is looking at.
+        self.assertEqual(caught.exception.fields, {"port": 9301})
 
 
 

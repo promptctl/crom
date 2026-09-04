@@ -16,6 +16,7 @@ from crom.model import (
     Resolution,
     ProfileSpec,
     ResolvedProfile,
+    Scope,
     parse_ref,
 )
 
@@ -598,11 +599,39 @@ class ResolveTest(LedgerFixture):
         with self.assertRaisesRegex(CromError, "Declared there: ci, dev") as caught:
             resolve.resolve(ProfileRef("myapp", "nope"), scope)
         self.assertIs(caught.exception.reason, Reason.PROFILE_UNKNOWN)
+        # The same two facts the sentence carries, in the shapes a caller can act on: the
+        # file to open, and the names to choose from. Asserted against the sentence's own
+        # rendering above rather than beside it, because they are one list joined twice.
+        self.assertEqual(
+            caught.exception.fields,
+            {"source": str(self.root / ".crom.toml"), "declared": ("ci", "dev")},
+        )
+
+    def test_a_scope_with_no_file_behind_it_says_so_rather_than_naming_one(self):
+        """The `user` scope on a machine whose user config has not been written yet.
+
+        The sentence says "your user config", which is where a person should look and not
+        a path anything can open. `null` is what the field says instead, because a string
+        there would be a path a script could act on — and there is no file at the end of
+        it. [LAW:parse-dont-validate]
+        """
+        bare = Scope(
+            namespace="user",
+            source=None,
+            profiles_root=self.root / "profiles",
+            chrome_binary=Path("/chrome"),
+        )
+        with self.assertRaisesRegex(CromError, "your user config") as caught:
+            resolve.spec_for(ProfileRef("user", "nope"), bare)
+        self.assertEqual(caught.exception.fields, {"source": None, "declared": ()})
 
     def test_an_unknown_namespace_lists_the_known_ones(self):
         scope = self.scope(MINIMAL + "[profiles.dev]\n")
         with self.assertRaisesRegex(CromError, "unknown namespace 'ghost'") as caught:
             resolve.resolve(ProfileRef("ghost", "dev"), scope)
+        # The list the sentence renders, as data. `ghost` is deliberately absent from the
+        # fields: the caller passed it in and holding it twice is what a field is not for.
+        self.assertEqual(caught.exception.fields, {"known": ("myapp", "user")})
         # Against `PROFILE_UNKNOWN` above: both `NotFound`, both exit 3, both "crom
         # cannot find what you named" — and they send the reader to different lines of
         # a different file. The clearest confusable pair in the codebase.

@@ -452,6 +452,10 @@ def remove_profile(path: Path, name: str) -> None:
         # inside the CLI's exit-code contract. [LAW:single-enforcer]
         profiles = _profiles_table(doc, path)
         if name not in profiles:
-            raise Reason.PROFILE_UNKNOWN.error(f"{path}: profile '{name}' is not declared here")
+            raise Reason.PROFILE_UNKNOWN.error(
+                f"{path}: profile '{name}' is not declared here",
+                source=str(path),
+                declared=tuple(sorted(profiles)),
+            )
         del profiles[name]
         _save(path, doc)
