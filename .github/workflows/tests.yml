@@ -30,7 +30,18 @@ jobs:
       # second copy of that fact, free to disagree with the first.
       # [LAW:one-source-of-truth]
       - name: Install uv
-        uses: astral-sh/setup-uv@v10
+        # SHA pin, not the moving major tag code-review.yml tracks for actions/checkout
+        # — this action has no moving major to track. astral-sh stopped publishing them
+        # after `v7`, which is frozen at v7.6.0 (2026-03-16) while releases have reached
+        # v10. `@v10` does not resolve at all, and `@v7` would resolve, run green, and
+        # quietly hold this repo two majors back. A SHA is what setup-uv's own README
+        # prescribes, and Dependabot bumps the ref and the trailing version together.
+        #
+        # The trailing comment is the exception to code-review.yml's "the version lives
+        # on the uses: line and nowhere else": a SHA states which commit, never which
+        # version, so this is the only human-readable rendering of it rather than a
+        # second copy of what the line already says. [LAW:comments-carry-meaning]
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
 
       # Verbatim the two commands README's Development section documents, so a green
       # run is evidence that the documented path works. A CI-only invocation would be
