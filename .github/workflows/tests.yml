@@ -1,0 +1,58 @@
+name: Tests
+
+# Both triggers on purpose — they test different trees. `pull_request` runs against
+# the PR merged into its base, which is what merging would actually produce;
+# `push` runs the branch head as it stands, which is what a contributor has in
+# hand before any PR exists. Dropping either leaves one of those untested.
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    # The suite is pure unit — every OS interaction is mocked, so it needs no Chrome,
+    # no display, and no macOS runner. It finishes in well under a minute; this cap
+    # turns a hang into a visible failure instead of a 6-hour hold on a runner.
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        # Moving major tag, tracking whichever major is current now — the same rule
+        # code-review.yml states at length for this action.
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # No actions/setup-python: `.python-version` already declares the interpreter
+      # and uv provisions it from there. A `python-version:` input here would be a
+      # second copy of that fact, free to disagree with the first.
+      # [LAW:one-source-of-truth]
+      - name: Install uv
+        # SHA pin, not the moving major tag code-review.yml tracks for actions/checkout
+        # — this action has no moving major to track. astral-sh stopped publishing them
+        # after `v7`, which is frozen at v7.6.0 (2026-03-16) while releases have reached
+        # v10. `@v10` does not resolve at all, and `@v7` would resolve, run green, and
+        # quietly hold this repo two majors back. A SHA is what setup-uv's own README
+        # prescribes, and Dependabot bumps the ref and the trailing version together.
+        #
+        # The trailing comment is the exception to code-review.yml's "the version lives
+        # on the uses: line and nowhere else": a SHA states which commit, never which
+        # version, so this is the only human-readable rendering of it rather than a
+        # second copy of what the line already says. [LAW:comments-carry-meaning]
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+
+      # Verbatim the two commands README's Development section documents, so a green
+      # run is evidence that the documented path works. A CI-only invocation would be
+      # a second, divergable answer to "how do you run the suite".
+      # [LAW:one-source-of-truth]
+      #
+      # --locked is the one addition: same environment, but it refuses a uv.lock that
+      # no longer matches pyproject.toml rather than silently resolving versions
+      # nobody else is running. [LAW:no-silent-failure]
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Run tests
+        run: .venv/bin/python -m unittest discover -s tests
