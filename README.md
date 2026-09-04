@@ -162,6 +162,22 @@ declares any more. A row carries `ref` whole — `"myapp/beta"` — rather than 
 hand-edit invented, so a row may name something that is not a legal `namespace/name` at
 all, and `crom doctor` reports it rather than refusing it.
 
+A row also carries `standing`, where the reservation stands against the config the ledger
+names as its source, and `finding`, the sentence behind that verdict — it names the
+config crom consulted, or says the ledger records none. `declared` means crom read that
+config and it still declares the profile. `orphaned` means crom consulted it and nothing
+declares the profile any more, because the config dropped it or because the file is gone;
+that is the leak — the port stays held forever, `crom list` cannot see it, and crom's
+allocator steps over the number. `unchecked` means crom could not consult a config at all
+— the ledger records none, or the one it records would not load — so it claims nothing
+either way.
+
+Do not read `unchecked` as a quieter `orphaned`. A released port never comes back, and
+every checked-in `.mcp.json` and `CDP_URL` pointing at the number breaks with it, so crom
+will not call a reservation orphaned on evidence it could not read: an absent config
+declares nothing, which is an answer, while a config that will not parse might still
+declare the profile, which is not.
+
 `crom --version` prints the version alone on one line, so a script reads it without
 splitting a sentence. It reports the crom you have installed rather than any checkout you
 happen to be standing in, which is the number a bug report needs.
@@ -268,7 +284,7 @@ crom config [REF]             which config is in effect, and the exact Chrome co
 crom port [REF]               print the port
 crom env [REF]                print shell exports
 crom mcp [REF]                write .mcp.json
-crom doctor                   every port reservation in the ledger, declared or not
+crom doctor                   every reservation in the ledger, and which ones are orphaned
 crom forget NAMESPACE         drop a namespace deliberately, releasing its ports
 ```
 
@@ -291,18 +307,19 @@ successfully and reported as having no window, rather than as a window you canno
 
 ## How collisions are avoided
 
-Ports come from one ledger at `~/.local/state/crom/registry.json`, shared by every
-project on the machine — `crom doctor` prints every reservation in it, sorted by port,
-so a hole in the run is visible. A profile is assigned a free port the first time it
-resolves and keeps it forever, so a checked-in `.mcp.json` or an app's `CDP_URL` stays
-correct. Before handing out an *assigned* port crom binds it, which catches the unrelated
-dev server that grabbed 9222 an hour ago. A port you pin yourself skips that search, so
-its availability is checked at launch instead — `crom up` names the process holding it
-rather than timing out. Two projects that pin the same port get an error naming the
-config file on the other side, not a mysterious launch failure. Every read-modify-write
-of the ledger takes an exclusive lock, because several agents each bringing up a browser
-at once is the case crom is for — and the config files crom edits and the profile
-directories it seeds are locked the same way, for the same reason.
+Ports come from one ledger at `~/.local/state/crom/registry.json`, shared by every project
+on the machine — `crom doctor` prints every reservation in it, sorted by port, so a hole
+in the run is visible, and says which ones no config declares any more. A profile is
+assigned a free port the first time it resolves and keeps it forever, so a checked-in
+`.mcp.json` or an app's `CDP_URL` stays correct. Before handing out an *assigned* port
+crom binds it, which catches the unrelated dev server that grabbed 9222 an hour ago. A
+port you pin yourself skips that search, so its availability is checked at launch instead
+— `crom up` names the process holding it rather than timing out. Two projects that pin
+the same port get an error naming the config file on the other side, not a mysterious
+launch failure. Every read-modify-write of the ledger takes an exclusive lock, because
+several agents each bringing up a browser at once is the case crom is for — and the
+config files crom edits and the profile directories it seeds are locked the same way, for
+the same reason.
 
 Profile data is namespaced the same way: `<state_dir>/<namespace>/<name>`. Two projects
 can both have a `dev` profile and never see each other's cookies.
