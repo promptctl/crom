@@ -8,6 +8,7 @@ external system, not an implementation detail of crom.
 import ast
 import contextlib
 import errno
+import importlib.metadata
 import json
 import os
 import re
@@ -2439,6 +2440,49 @@ class CliTest(unittest.TestCase):
                     },
                 )
 
+    # --- crom's own version ----------------------------------------------------------
+
+    def test_the_version_reported_is_the_installed_distributions_own(self):
+        """crom states a version, and it is the one the build recorded.
+
+        Asserted against the metadata rather than against `"0.1.0"`, because a literal
+        here would be the second spelling of the version the reading exists to avoid:
+        it would have to be edited on every release, and until someone did, it would
+        pin crom to a version crom is not. [LAW:one-source-of-truth]
+
+        Whole lines rather than a substring, so the format is pinned too — `assertIn`
+        would pass just as happily against click's default `crom, version 0.1.0`, which
+        spells the answer differently depending on argv[0].
+        """
+        self.assertEqual(
+            self.crom("--version").splitlines(), [importlib.metadata.version("crom")]
+        )
+
+    def test_the_version_answers_where_every_other_command_fails(self):
+        """Asking crom which crom this is must not require a crom that works.
+
+        `main` migrates and bootstraps a user config before every command, so a home
+        crom cannot write to takes every one of them out — which is exactly the machine
+        someone is standing on when they need to know what they are running. `--version`
+        is answered while the command line is still being parsed, before any of that.
+
+        The failing `list` is the premise, not decoration: without it this passes on a
+        perfectly healthy home and pins nothing. [LAW:verifiable-goals]
+        """
+        blocker = self.root / "a-file-where-a-home-should-be"
+        blocker.write_text("")
+        unusable = {
+            "HOME": str(blocker / "home"),
+            "XDG_CONFIG_HOME": str(blocker / "config"),
+            "XDG_STATE_HOME": str(blocker / "state"),
+        }
+
+        with mock.patch.dict(os.environ, unusable):
+            self.crom("list", expect=1)
+
+            self.assertEqual(
+                self.crom("--version").splitlines(), [importlib.metadata.version("crom")]
+            )
 
 
 if __name__ == "__main__":
