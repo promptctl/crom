@@ -23,7 +23,7 @@ from click.testing import CliRunner
 
 from crom import cli, config, configwrite, mcp
 from crom.config import load_ambient
-from crom.model import ProfileRef, Reason
+from crom.model import Conflict, ProfileRef, Reason
 from crom.paths import state_home, user_config_file
 
 
@@ -2017,6 +2017,27 @@ class CliTest(unittest.TestCase):
         # sentence; the halves the boundary drops must not take the message with them.
         # [LAW:no-silent-failure]
         self.assertIn("gave up partway", error["message"])
+
+    def test_a_restated_declaration_answers_one_slug_for_both_of_its_callers(self):
+        """`crom add` comparing a profile's declaration and `crom init` comparing the
+        project's own namespace both raise from `_reject_restatement`, and neither
+        command carries `--json` — so this is the only seam where the reason can be read
+        at all, which is why the assertion is here rather than on an envelope.
+
+        One slug and not two. A slug earns its place by separating next moves, and both
+        callers say the same thing to whoever receives it: the file declares something
+        else, so edit it or change the request. A second name no script would branch on
+        differently would be a mode, not a distinction. [LAW:no-mode-explosion] The name
+        is `declaration_differs` rather than `profile_differs` because `crom init` names
+        no profile, and a slug that says otherwise sends a reader to the wrong stanza.
+        """
+        with self.assertRaises(Conflict) as caught:
+            cli._reject_restatement(
+                "already configures this project, and this asks to change it:",
+                (("namespace", "chosen", "other"),),
+                "Edit the file, or ask for what it already declares.",
+            )
+        self.assertIs(caught.exception.reason, Reason.DECLARATION_DIFFERS)
 
     def test_every_reason_answers_with_the_class_its_own_row_names(self):
         """The whole table walked: each reason raises the exception its row declares, and

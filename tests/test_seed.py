@@ -178,9 +178,12 @@ class MaterializeTest(unittest.TestCase):
         # without ever proving that escaping is caught.
         (source / "Default" / "Preferences").symlink_to(Path("..") / ".." / "secret.txt")
 
-        with self.assertRaisesRegex(CromError, "points outside it"):
+        with self.assertRaisesRegex(CromError, "points outside it") as caught:
             seed.materialize(profile(self.dest, SeedPath(source)))
 
+        # `_link_guard`'s other raise: the absolute-link arm is pinned above, and these
+        # are two separate raises that a separate edit can retag one of.
+        self.assertIs(caught.exception.reason, Reason.SEED_UNSAFE)
         self.assertFalse(self.dest.exists())
         self.assertEqual(secret.read_text(), "private key")  # untouched
 

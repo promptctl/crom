@@ -1,5 +1,6 @@
 """Tests for the config checkpoint: what it accepts, and what it refuses to accept."""
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -449,6 +450,24 @@ class DiscoveryTest(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def test_an_override_pointing_nowhere_is_reported_not_quietly_walked_past(self):
+        """`CROM_CONFIG` names the file to use, so a path that is not there is a fault in
+        the request rather than a reason to resume the walk. Falling back to discovery
+        would run the command against a different project's config than the caller
+        named — a fallback that changes which data is read, which is the worst kind.
+        [LAW:no-silent-failure]"""
+        with mock.patch.dict(os.environ, {"CROM_CONFIG": str(self.root / "absent.toml")}):
+            with self.assertRaisesRegex(CromError, "which does not exist") as caught:
+                config.discover(self.root)
+        self.assertIs(caught.exception.reason, Reason.CONFIG_MISSING)
+
+    def test_loading_a_file_that_is_not_there_names_it_rather_than_crashing(self):
+        with self.assertRaisesRegex(CromError, "config file not found") as caught:
+            config.load_file(self.root / "absent.toml")
+        # A `NotFound` at exit 3 like `namespace_unknown` and `profile_unknown`, and the
+        # only one of the three about the file itself rather than a name written in it.
+        self.assertIs(caught.exception.reason, Reason.CONFIG_MISSING)
 
     def test_finds_config_in_an_ancestor_directory(self):
         (self.root / ".crom.toml").write_text(MINIMAL)
