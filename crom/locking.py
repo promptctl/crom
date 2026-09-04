@@ -49,7 +49,9 @@ def exclusive(path: Path) -> Iterator[None]:
             # XDG_STATE_HOME can refuse it, and ENOLCK is reachable under resource
             # exhaustion — and this primitive sits under nearly every command, so a raw
             # OSError from here escapes as a traceback exactly as one from `open` did.
-            raise Reason.LOCK_UNAVAILABLE.error(f"could not take the lock at {lock_path}: {e}") from e
+            raise Reason.LOCK_UNAVAILABLE.error(
+                f"could not take the lock at {lock_path}: {e}"
+            ) from e
         try:
             yield
         finally:

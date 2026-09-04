@@ -161,12 +161,18 @@ def write(profile: ResolvedProfile, path: Path) -> Legacy:
         try:
             config = json.loads(path.read_text())
         except json.JSONDecodeError as e:
-            raise Reason.MCP_CONFIG_INVALID.error(f"{path} exists but is not valid JSON: {e}") from e
+            raise Reason.MCP_CONFIG_INVALID.error(
+                f"{path} exists but is not valid JSON: {e}"
+            ) from e
         if not isinstance(config, dict):
-            raise Reason.MCP_CONFIG_INVALID.error(f"{path} must contain a JSON object, got {type(config).__name__}")
+            raise Reason.MCP_CONFIG_INVALID.error(
+                f"{path} must contain a JSON object, got {type(config).__name__}"
+            )
         servers = config.setdefault("mcpServers", {})
         if not isinstance(servers, dict):
-            raise Reason.MCP_CONFIG_INVALID.error(f'{path}: "mcpServers" must be an object, got {type(servers).__name__}')
+            raise Reason.MCP_CONFIG_INVALID.error(
+                f'{path}: "mcpServers" must be an object, got {type(servers).__name__}'
+            )
     else:
         config = {}
         servers = {}

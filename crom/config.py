@@ -24,8 +24,8 @@ from . import configwrite, flags, registry, report
 from .browser import find_chrome
 from .locking import exclusive
 from .model import (
-    DEFAULTS_STANZA,
     DEFAULT_SEED,
+    DEFAULTS_STANZA,
     FALLBACK_NAMESPACE,
     MAX_PORT,
     MIN_PORT,

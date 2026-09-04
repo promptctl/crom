@@ -5,6 +5,7 @@ part apps integrate against. `chrome.scan` is stubbed because the process table 
 external system, not an implementation detail of crom.
 """
 
+import ast
 import contextlib
 import errno
 import json
@@ -199,7 +200,9 @@ class CliTest(unittest.TestCase):
         command — including `crom init`, which `_Session` exists to keep working on a
         machine that has no Chrome yet.
         """
-        with mock.patch("crom.config.find_chrome", side_effect=Reason.CHROME_UNUSABLE.error("no Chrome here")):
+        with mock.patch(
+            "crom.config.find_chrome", side_effect=Reason.CHROME_UNUSABLE.error("no Chrome here")
+        ):
             self.crom("init", "myapp")
 
         self.assertIn('namespace = "myapp"', (self.project / ".crom.toml").read_text())
@@ -1530,7 +1533,10 @@ class CliTest(unittest.TestCase):
             mock.patch("crom.cli.seed.materialize_under_lock"),
             mock.patch("crom.cli.chrome.kill", return_value=(999,)),
             mock.patch("crom.cli.chrome.find_pids", return_value=()),
-            mock.patch("crom.cli.chrome.launch", side_effect=Reason.CHROME_STARTUP_FAILED.error("Chrome exited 1")),
+            mock.patch(
+                "crom.cli.chrome.launch",
+                side_effect=Reason.CHROME_STARTUP_FAILED.error("Chrome exited 1"),
+            ),
         ):
             result = self.invoke("restart", "ci", expect=1)
 
@@ -1583,7 +1589,10 @@ class CliTest(unittest.TestCase):
             mock.patch("crom.cli.seed.materialize_under_lock"),
             mock.patch("crom.cli.chrome.find_pids", return_value=()),
             mock.patch("crom.cli.chrome.launch", return_value=(1234,)),
-            mock.patch("crom.cli.window.raise_profile", side_effect=Reason.AUTOMATION_DENIED.error("no Automation access")),
+            mock.patch(
+                "crom.cli.window.raise_profile",
+                side_effect=Reason.AUTOMATION_DENIED.error("no Automation access"),
+            ),
         ):
             result = self.invoke("show", "ci", expect=1)
 
@@ -1949,6 +1958,93 @@ class CliTest(unittest.TestCase):
 
         self.assertEqual(kinds, ["os_error", "failure"])
 
+    def test_the_reason_says_what_the_kind_cannot(self):
+        """Three failures, one exit code, one kind — and three different next moves.
+
+        This is the case the epic opened on. Exit 1 and `kind: failure` cover a port held
+        by a stranger, a Chrome that will not run, and a Chrome that started and died,
+        and a script that wants to retry, or to tell its user to install a browser, or to
+        go read a log, cannot get to any of those from either field. The reason is what
+        separates them — which is also what stops it from being `kind` spelled finer:
+        derive one from the other and this test collapses to a single key.
+        """
+        self.crom("init")
+
+        seen = {}
+        for reason in (Reason.PORT_IN_USE, Reason.CHROME_UNUSABLE, Reason.CHROME_STARTUP_FAILED):
+            with mock.patch("crom.chrome.scan", side_effect=reason.error("refused")):
+                result = self.invoke("list", "--json", expect=1)
+            error = json.loads(result.stdout)["error"]
+            seen[error["reason"]] = (error["code"], error["kind"])
+
+        self.assertEqual(
+            seen,
+            {
+                "port_in_use": (1, "failure"),
+                "chrome_unusable": (1, "failure"),
+                "chrome_startup_failed": (1, "failure"),
+            },
+        )
+
+    def test_every_reason_answers_with_the_class_its_own_row_names(self):
+        """The whole table walked: each reason raises the exception its row declares, and
+        the boundary answers for that exception under that same row.
+
+        This is what a raise site never naming a class buys. Pair a reason with a class
+        at each of a hundred raise sites and the two can disagree — silently, since both
+        halves are plausible on their own, and what a script sees is the wrong exit code.
+        Here the class is derived, so there is one place for the pairing to be wrong and
+        this walks all of it. [LAW:one-source-of-truth]
+
+        The message is asserted too, because `Exception` renders a two-argument
+        construction as its tuple: hand the reason to `super().__init__` and every
+        sentence in crom becomes `"('...', <Reason...>)"` — on stderr and in the
+        envelope's `message` both.
+        """
+        for reason in Reason:
+            with self.subTest(reason=reason.value):
+                # Lowercase and underscores, checked because the slug is a published name
+                # a script matches on: a `Chrome_Unusable` slipping into the table is a
+                # vocabulary with two spellings, and slugs cannot be renamed later.
+                self.assertRegex(reason.value, r"^[a-z][a-z0-9_]*$")
+
+                error = reason.error("a sentence")
+                self.assertIsInstance(error, reason.raises)
+                self.assertIs(error.reason, reason)
+                self.assertEqual(str(error), "a sentence")
+
+                answer = next(a for a in cli._ANSWERS if isinstance(error, a.error))
+                self.assertIs(answer.error, reason.raises)
+
+    def test_no_module_builds_a_failure_without_naming_its_reason(self):
+        """The backstop for the hundred raise sites this suite never executes.
+
+        `CromError` cannot be constructed without a reason, so a raise that forgot one is
+        a `TypeError`. But Python only says so on the line that runs, and these lines run
+        only when something has already gone wrong — a new `raise CromError(...)` in a
+        rarely-taken branch would ship, and the first person to reach it would get a
+        crash where crom meant to hand them a sentence. So the invariant is asserted over
+        the source rather than over one execution.
+
+        What it looks for is a call on the bare name: `CromError(...)`, `NotFound(...)`,
+        `Conflict(...)`. The one legitimate construction — `self.raises(message, self)`,
+        inside `Reason.error` — is a call on an attribute and so is not one, which is why
+        this needs no list of blessed exceptions to stay accurate.
+
+        Same shape as `test_help_sections_cover_every_command`: a completeness check on a
+        contract, not an assertion about how any one function is written.
+        """
+        family = {"CromError", "NotFound", "Conflict"}
+        direct = [
+            f"{path.name}:{node.lineno}: {node.func.id}(...)"
+            for path in sorted(Path(cli.__file__).parent.glob("*.py"))
+            for node in ast.walk(ast.parse(path.read_text()))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in family
+        ]
+        self.assertEqual(direct, [], "build these through Reason.<REASON>.error(...)")
+
     def test_a_reader_that_left_does_not_turn_the_envelope_into_a_traceback(self):
         """The envelope is stdout, and stdout is what gets piped — so it can meet a
         reader that has already gone.
@@ -1998,7 +2094,8 @@ class CliTest(unittest.TestCase):
         """
         self.crom("init")
         with mock.patch(
-            "crom.migrate.run_if_needed", side_effect=Reason.MIGRATION_NEEDS_QUIET.error("a legacy Chrome is still running")
+            "crom.migrate.run_if_needed",
+            side_effect=Reason.MIGRATION_NEEDS_QUIET.error("a legacy Chrome is still running"),
         ):
             result = self.invoke("list", "--json", expect=1)
 
@@ -2031,7 +2128,8 @@ class CliTest(unittest.TestCase):
         for name in offering:
             with self.subTest(command=name):
                 with mock.patch(
-                    "crom.cli.load_ambient", side_effect=Reason.CONFIG_INVALID.error("no ambient config")
+                    "crom.cli.load_ambient",
+                    side_effect=Reason.CONFIG_INVALID.error("no ambient config"),
                 ):
                     result = self.invoke(name, "--json", expect=1)
                 self.assertEqual(

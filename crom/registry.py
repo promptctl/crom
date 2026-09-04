@@ -73,7 +73,9 @@ def _read(path: Path) -> dict:
             f"a freshly assigned port."
         ) from e
     if not isinstance(data, dict):
-        raise Reason.REGISTRY_INVALID.error(f"{path}: the port ledger is a JSON {type(data).__name__}, not an object")
+        raise Reason.REGISTRY_INVALID.error(
+            f"{path}: the port ledger is a JSON {type(data).__name__}, not an object"
+        )
     if data.get("version") != SCHEMA_VERSION:
         raise Reason.REGISTRY_UNSUPPORTED.error(
             f"{path}: unsupported registry version {data.get('version')!r} "

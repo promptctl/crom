@@ -44,8 +44,8 @@ from . import (
 )
 from .config import discover, load_ambient, load_user_scope, parse_layer, parse_port, parse_seed
 from .model import (
-    DEFAULTS_STANZA,
     DEFAULT_SEED,
+    DEFAULTS_STANZA,
     USER_NAMESPACE,
     Conflict,
     CromError,
@@ -56,8 +56,8 @@ from .model import (
     ProfileRef,
     ProfileSpec,
     Reason,
-    Resolution,
     ResolvedProfile,
+    Resolution,
     Scope,
     parse_ref,
     profile_stanza,
@@ -1081,7 +1081,9 @@ def init_cmd(namespace: str | None, seed_text: str | None):
     # [LAW:single-enforcer]
     claimed_namespace = namespace or (None if existing else chosen_namespace)
     if claimed_namespace == USER_NAMESPACE:
-        raise Reason.NAMESPACE_RESERVED.error(f'"{USER_NAMESPACE}" is reserved; pass a different namespace')
+        raise Reason.NAMESPACE_RESERVED.error(
+            f'"{USER_NAMESPACE}" is reserved; pass a different namespace'
+        )
 
     # Parsed here, before the file exists, through the same checkpoint that reads the
     # value back on the next command — so `crom init --seed chorme` fails naming the
