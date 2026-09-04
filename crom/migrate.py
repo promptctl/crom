@@ -126,6 +126,14 @@ def _read_legacy(source: Path) -> dict[str, dict]:
     return profiles
 
 
+# What `_move_staged` appends to name its half-finished move. Named rather than spelled
+# inline because `doctor._leaks` must recognise these and refuse to call one a reclaimable
+# leak: it lands in the same profile root a seed stages into, and unlike a seed's copy it
+# can be the only surviving copy of the profile. One spelling, so the two cannot drift.
+# [LAW:one-source-of-truth]
+STAGING_SUFFIX = ".partial"
+
+
 def run(log) -> None:
     source = legacy_registry_file()
     legacy = _read_legacy(source)
@@ -213,7 +221,7 @@ def _move_staged(old_dir: Path, destination: Path) -> None:
     [LAW:no-ambient-temporal-coupling] the progress of the last attempt is state on
     disk, read here, rather than inferred from which of two paths happens to exist.
     """
-    staging = destination.parent / f".{destination.name}.partial"
+    staging = destination.parent / f".{destination.name}{STAGING_SUFFIX}"
 
     if destination.exists():
         # Committed on an earlier attempt. `os.replace` is the only thing that creates
