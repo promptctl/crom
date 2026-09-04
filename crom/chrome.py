@@ -679,9 +679,8 @@ def _stderr_sink(profile_dir: Path) -> Iterator[_StderrSink]:
     try:
         handle = path.open("wb")
     except OSError as e:
-        # `CromGroup.invoke` handles `CromError` alone, so a raw OSError would leave
-        # `launch` as a traceback and bypass the exit-code contract. Translated here for
-        # the same reason `Popen` and `ps` are. [LAW:no-silent-failure]
+        # Named here for the same reason `Popen` and `ps` are: the CLI boundary answers
+        # for a raw `OSError`, but with the path alone — never with what it was for.
         raise CromError(f"could not open {path} to capture Chrome's output: {e}") from e
 
     with handle:

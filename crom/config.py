@@ -685,8 +685,8 @@ def _reads_as_toml(source: Path) -> str | None:
     """Why `source` cannot be tokenized as TOML, or None when it can.
 
     `UnicodeDecodeError` sits beside the decode error rather than escaping: it is a
-    `ValueError`, so a config saved as UTF-16 used to leave `CromGroup.invoke` — which
-    catches only `CromError` — as a traceback. Both mean the same thing to every caller,
+    `ValueError`, which the CLI boundary does not answer for, so a config saved as UTF-16
+    used to leave `crom` as a traceback. Both mean the same thing to every caller,
     which is that there are no bytes here crom can read. [LAW:parse-dont-validate]
     """
     try:
