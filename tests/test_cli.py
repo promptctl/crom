@@ -907,6 +907,26 @@ class CliTest(unittest.TestCase):
         self.assertIn("myproj/default", output)
         self.assertIn("[profiles.default]", (self.project / ".crom.toml").read_text())
 
+    def test_a_bare_crom_launches_the_default_profile_like_any_other_command(self):
+        """`crom` with no arguments is `crom up`, and it is one now rather than nearly one.
+
+        The group used to carry `invoke_without_command` and reach `up`'s callback
+        through `ctx.invoke`, which goes around `Command.invoke` — so everything
+        `CromCommand` does to ready a command would have needed spelling a second time to
+        cover the bare invocation. `CromGroup.parse_args` supplies the name instead,
+        making it an ordinary invocation; this says it still means what the README says
+        it means. [LAW:one-source-of-truth]
+        """
+        self.crom("init")
+
+        with mock.patch("crom.chrome.launch", return_value=(4321,)):
+            with mock.patch("crom.seed.materialize_under_lock"):
+                bare = self.crom()
+                named = self.crom("up")
+
+        self.assertEqual(bare, named)
+        self.assertIn("myproj/default", bare)
+
     def test_removing_an_undeclared_profile_does_not_declare_it_first(self):
         """`rm` converges a profile toward not existing, so creating one on the way would
         be crom bringing into being the thing it was asked to take away."""
@@ -2399,34 +2419,60 @@ class CliTest(unittest.TestCase):
         # reader left — and exit 1, the same ending `crom list | head` already gets.
         self.assertEqual((result.stdout, result.stderr), ("", ""))
 
-    def test_a_failure_raised_before_parsing_has_no_flag_to_honour_yet(self):
-        """Where the envelope's promise actually stops, asserted rather than left to be
-        discovered by a script author.
+    def test_a_failure_while_readying_crom_still_answers_the_flag_on_the_command_line(self):
+        """Nothing crom does happens ahead of the parse, so nothing it does can miss the
+        flag.
 
-        click runs the group callback before it parses the invoked subcommand's options,
-        and `main` does real work there — `migrate.run_if_needed()` and
-        `_bootstrap_user_config()`, either of which can refuse. A `CromError` from that
-        window is raised before `--json` has been parsed, so crom has not yet learned that
-        the caller asked, and the failure reaches them as prose only.
+        Migration and the user-config bootstrap can both refuse, and they used to run
+        from the group callback — which click calls *before* `make_context` parses the
+        invoked subcommand's options, so `--json` had not been recorded yet and the
+        refusal reached a machine as prose over an empty stdout. `CromCommand.invoke`
+        runs them past the parse instead, which is the whole of what turns this into a
+        document.
 
-        This is one line and not two ad-hoc gaps: the envelope answers for a command crom
-        has understood, which also excludes click's own usage errors (exit 2). Closing it
-        means moving migration and bootstrap out of the group callback so that nothing can
-        fail ahead of parsing — a change to when migration runs for every command, `crom
-        init` included, so it is its own piece of work rather than a rider on this one.
-
-        Asserted here so the limitation is known and stable. If it is ever closed, this
-        test is the one that should fail and be rewritten — not quietly deleted.
+        Both halves, because the claim is about the window and not about migration: a
+        command is readied by two calls, and either one refusing has the same answer.
+        Which reason fills each is not under test — the envelope's other keys are covered
+        by the tests that raise from inside a command — so each half carries the reason
+        its own failure would really carry, and the assertion is the same either way.
         """
         self.crom("init")
-        with mock.patch(
-            "crom.migrate.run_if_needed",
-            side_effect=Reason.MIGRATION_NEEDS_QUIET.error("a legacy Chrome is still running"),
-        ):
-            result = self.invoke("list", "--json", expect=1)
+        readying = (
+            ("crom.migrate.run_if_needed", Reason.MIGRATION_NEEDS_QUIET, "a legacy Chrome is still running"),
+            ("crom.cli._bootstrap_user_config", Reason.CONFIG_UNWRITABLE, "could not write the user config"),
+        )
+        for target, reason, sentence in readying:
+            with self.subTest(target=target):
+                with mock.patch(target, side_effect=reason.error(sentence)):
+                    result = self.invoke("list", "--json", expect=1)
+
+                self.assertEqual(
+                    json.loads(result.stdout)["error"],
+                    {
+                        "code": 1,
+                        "kind": "failure",
+                        "reason": reason.value,
+                        "fields": {},
+                        "message": sentence,
+                    },
+                )
+                self.assertEqual(result.stderr.strip(), f"Error: {sentence}")
+
+    def test_bad_usage_is_the_one_failure_left_without_an_envelope(self):
+        """The carve-out the README publishes, and now the only one.
+
+        A malformed command line fails *during* the parse, so the `--json` sitting on it
+        was never understood either — there is no flag to honour rather than a flag
+        arriving too late. That is what keeps this outside the envelope permanently,
+        where the readying failures above were only outside by accident of ordering, and
+        it is why closing that accident does not promise envelopes for typos.
+        """
+        self.crom("init")
+
+        result = self.invoke("list", "--nosuchflag", "--json", expect=2)
 
         self.assertEqual(result.stdout, "")
-        self.assertEqual(result.stderr.strip(), "Error: a legacy Chrome is still running")
+        self.assertIn("No such option", result.stderr)
 
     def test_every_command_offering_json_answers_a_failure_in_json(self):
         """The envelope belongs to the flag, so every command carrying the flag has it.
