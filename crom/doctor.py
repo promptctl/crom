@@ -214,10 +214,20 @@ def survey() -> Survey:
     repair is the only way to release an orphan today, so this command meets one. That
     namespace has no root to look under and reports as one crom could not check, which is
     an answer; a `Path` could not have held the case at all.
+
+    The same hand repair can leave a key that names no namespace, which `model.namespace_of`
+    answers with `None` rather than a segment that would send the scan out of the profile
+    root. Those keys leave the scan set and stay in `rows` — `consulted` covers every
+    source in the ledger either way — so the reservation is still judged and still
+    reported, and only a scan of a directory nothing named is what goes missing.
     """
     ledger = registry.reservations()
     namespaces: dict[str, str | None] = {
-        **{namespace_of(ref): held.source for ref, held in ledger.items()},
+        **{
+            namespace: held.source
+            for ref, held in ledger.items()
+            if (namespace := namespace_of(ref)) is not None
+        },
         **{name: str(config) for name, config in registry.namespaces().items()},
         USER_NAMESPACE: str(user_config_file()),
     }
@@ -411,11 +421,11 @@ def _leaks(namespace: str, root: Path) -> tuple[Staged | Unscanned, ...]:
     `seed._staged` is not the only writer here: `migrate._move_staged` stages a legacy
     profile as `.<name>.partial` in this very root, and on a same-filesystem move it
     renames `old_dir` away *before* that exists — so an interruption in that window leaves
-    the `.partial` holding the only copy of the profile. This command's own sentence calls
-    what it lists "left behind by an interrupted seed", beside a size `measure` calls what
-    deleting it would reclaim. Both are false for a migration's staging directory, and a
-    reader who acted on them would lose their cookies and logins. Migration owns the
-    suffix and this reads it from there. [LAW:one-source-of-truth]
+    the `.partial` holding the only copy of the profile. This command lists what it finds
+    as a seed's residue, beside a size `measure` calls what deleting it would reclaim. Both
+    are false for a migration's staging directory, and a reader who acted on them would
+    lose their cookies and logins. Migration owns the suffix and this reads it from
+    there. [LAW:one-source-of-truth]
 
     No test takes a name apart, which is what makes them total: `.<name>.<rand>` cannot be
     split back into its halves, because `_NAME_RE` lets a profile name contain dots of its

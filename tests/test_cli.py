@@ -1825,10 +1825,9 @@ class CliTest(unittest.TestCase):
         stages a legacy profile as `.<name>.partial` under `default_profiles_root() /
         user`, and on a same-filesystem move it renames `old_dir` away *before* that path
         exists — so an interruption in that window leaves the `.partial` holding the only
-        copy of the profile. Reported here it would appear under this command's own
-        sentence, "left behind by an interrupted seed", beside a byte count `measure`
-        calls what deleting it would reclaim. A reader who believed either would lose
-        their cookies and logins.
+        copy of the profile. Reported here it would appear as a seed's residue, beside a
+        byte count `measure` calls what deleting it would reclaim. A reader who believed
+        either would lose their cookies and logins.
 
         Both directories are planted, and the seed's is asserted present as well as the
         migration's absent: an exclusion that swallowed the real leak too would pass a
@@ -1916,6 +1915,92 @@ class CliTest(unittest.TestCase):
         self.assertEqual(1, len(leaked), found)
         self.assertEqual("myapp", leaked[0]["namespace"])
         self.assertEqual(4096, leaked[0]["bytes"])
+
+    def test_doctor_will_not_scan_a_root_the_ledger_key_never_named(self):
+        """A hand-edited key that names no namespace, and the directories it aimed at.
+
+        `model.namespace_of` takes the leading segment of a ledger key, and `_staging`
+        joins it to a profile root. Two segments a hand repair can produce are not names
+        at all but path syntax: `/alpha` splits to `""`, and `root / ""` is `root` — the
+        *shared* profiles directory every namespace sits under — while `../alpha` splits
+        to `".."` and walks out of the root entirely. Either one pointed the scan at a
+        directory the key never named, and whatever was found there was published as a
+        leak beside a size saying deleting it is free.
+
+        So the decoys are planted rather than assumed absent: a clean report is what the
+        bug already produced on an empty root, and only a directory sitting in the
+        collapsed root can tell a scan that skipped it from a scan that never ran.
+        [LAW:verifiable-goals] the real leak under `myapp` is asserted found in the same
+        breath, because a `namespace_of` that answered `None` to everything would pass a
+        test that only checked the decoys were spared.
+
+        Both keys stay in the reservations half. Dropping a key from the scan is not
+        dropping it from the report — `crom doctor` is the command a person runs because
+        the ledger is a mess, and a stranded port it declined to mention is a port
+        nothing will ever reclaim. [LAW:no-silent-failure]
+        """
+        config_file = self.project / ".crom.toml"
+        config_file.write_text('namespace = "myapp"\n\n[profiles.alpha]\n')
+        self.crom("list")
+        root = state_home() / "profiles"
+        (root / "myapp").mkdir(parents=True, exist_ok=True)
+        leak = root / "myapp" / ".alpha.9f3c1a"
+        decoys = (root / ".decoy.shared", root.parent / ".decoy.above")
+        for directory in (leak, *decoys):
+            directory.mkdir()
+            (directory / "Cookies").write_bytes(b"x" * 4096)
+        ledger = json.loads(registry_file().read_text())
+        for key, port in (("/alpha", 9446), ("../alpha", 9447)):
+            ledger["ports"][key] = {"port": port, "pinned": False, "source": str(config_file)}
+        registry_file().write_text(json.dumps(ledger))
+
+        found = self._staging()
+
+        self.assertEqual([str(leak)], [item["path"] for item in found if "path" in item])
+        for decoy in decoys:
+            self.assertTrue(decoy.is_dir(), decoy)
+
+        standings = self._standings()
+
+        self.assertEqual("orphaned", standings["/alpha"])
+        self.assertEqual("orphaned", standings["../alpha"])
+
+    def test_doctor_counts_the_namespaces_it_could_not_check_not_the_reasons(self):
+        """One namespace, two true reasons, and the sentence that has to add them up.
+
+        A config that is gone gets both answers — its default root is scanned, and the
+        caveat beside it says that root is where the profiles are only if that config
+        never set a `state_dir`. When the scan *also* fails, both halves speak: `_leaks`
+        returns its own `Unscanned` for the root it could not read, and the `_Gone` arm
+        appends the caveat on top. Two entries, and they say different things, so neither
+        may be dropped or fused into the other. [LAW:no-silent-failure]
+
+        What was wrong is the sentence counting them: `len(unscanned)` counts entries
+        under a line that says `namespace(s)`, so one namespace reported as two. The
+        entries are the territory and the sentence is a map of it, and the map is what
+        had to change. Asserting both — two errors, one namespace, and the line saying
+        one — is what keeps a later fix from making the count true by deleting a reason.
+
+        A regular file where the root belongs rather than `chmod 0`, which does not stop
+        a suite running as root: `NotADirectoryError` is an `OSError` that is not
+        `FileNotFoundError`, which is the arm this needs.
+        """
+        config_file = self.project / ".crom.toml"
+        config_file.write_text('namespace = "myapp"\n\n[profiles.dev]\n')
+        self.crom("list")
+        config_file.unlink()
+        root = state_home() / "profiles"
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "myapp").write_text("not a directory")
+
+        found = self._staging()
+
+        self.assertEqual({"myapp"}, {item["namespace"] for item in found})
+        errors = [item["error"] for item in found]
+        self.assertEqual(2, len(errors), found)
+        self.assertIn(f"{root / 'myapp'} could not be read", errors[0])
+        self.assertIn(f"{config_file} is gone", errors[1])
+        self.assertIn("1 namespace(s) crom could not check", self.crom("doctor"))
 
     # --- removal --------------------------------------------------------------------
 

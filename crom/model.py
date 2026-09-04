@@ -804,8 +804,8 @@ class FailedProfile:
 ProfileEntry = ResolvedProfile | FailedProfile
 
 
-def namespace_of(ref: str) -> str:
-    """The namespace a ledger key names, for a reader that must survive a bad key.
+def namespace_of(ref: str) -> str | None:
+    """The namespace a ledger key names, or `None` where the key names none.
 
     `ProfileRef.__str__` owns the `namespace/name` format and this is its inverse, here
     rather than spelled again at the one call site. [LAW:one-source-of-truth]
@@ -814,12 +814,23 @@ def namespace_of(ref: str) -> str:
     with a second `/` or a component that fails `validate_name`, and a hand-edited ledger
     is the only way to release an orphaned reservation today — so `crom doctor`, the
     command a person runs *because* the ledger is a mess, cannot afford a reader that dies
-    on one. A namespace this returns is a name to look for on disk, never a name to act
-    on: the worst a nonsense key yields is a directory that does not exist, which its
-    caller already answers with "nothing there". [LAW:no-silent-failure] guessing is safe
-    here only because the guess is checked against the filesystem before it means anything.
+    on one. Total is not the same as answering, though: a leading segment is returned only
+    when `_NAME_RE` accepts it, the same expression `validate_name` raises on, so a legal
+    name is defined once. [LAW:parse-dont-validate] the return type is the proof — what
+    comes back is a name crom itself would have written, which is what lets the caller
+    join it to a profile root and get a child of that root.
+
+    Returning the raw segment could not offer that. `_NAME_RE` requires a leading
+    alphanumeric, and both states it rejects here are path-shaped: `/dev` splits to `""`
+    and `root / ""` is `root`, the shared profiles directory itself, while `../dev` splits
+    to `".."` and walks out of the root entirely. Either one aims a scan at a directory
+    the key never named, and whatever it finds there gets reported as a leak under a size
+    that says deleting it is free. [LAW:no-silent-failure] the key is still judged and
+    still reported — as a reservation, against the config the ledger names — and it is
+    only the scan of a directory nothing pointed at that goes away.
     """
-    return ref.split("/", 1)[0]
+    namespace = ref.split("/", 1)[0]
+    return namespace if _NAME_RE.fullmatch(namespace) else None
 
 
 def parse_ref(text: str, ambient: str) -> ProfileRef:

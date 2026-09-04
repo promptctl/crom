@@ -1597,8 +1597,10 @@ def doctor_cmd(as_json: bool):
     Then every staging directory under a profile root. Seeding builds a profile beside its
     final path and moves it in only once it is whole, so a `crom up` killed mid-copy
     leaves the half-built copy behind — dot-prefixed, so `ls` hides it, and the retry
-    succeeds, so nothing looks wrong. Each is reported with its size, and so is every
-    namespace crom could not look under.
+    succeeds, so nothing looks wrong. A seed running right now leaves the same evidence
+    and is listed the same way, so a directory here may still be filling rather than
+    abandoned; crom does not tell the two apart. Each is reported with its size, and so
+    is every namespace crom could not look under.
     """
     found = doctor.survey()
     _emit(
@@ -1621,11 +1623,12 @@ def doctor_cmd(as_json: bool):
                 f"{row.standing.finding}"
                 for row in found.rows
             ),
-            f"{len(found.staged)} staging directory(s) left behind by an interrupted seed",
+            f"{len(found.staged)} staging directory(s) from a seed interrupted or still running",
             # The size leads: it is what decides whether this is worth acting on, and the
             # paths are long enough to push it off the end of a line if it followed.
             *(f"  {_human_size(item.bytes):>8}  {item.path}" for item in found.staged),
-            f"{len(found.unscanned)} namespace(s) crom could not check for them",
+            f"{len({item.namespace for item in found.unscanned})} namespace(s) crom "
+            f"could not check for them",
             *(f"  {item.namespace + '/':30s}{item.error}" for item in found.unscanned),
         ],
     )

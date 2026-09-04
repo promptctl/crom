@@ -191,8 +191,8 @@ An element is either a directory crom found — `namespace`, `path` and `bytes` 
 namespace it could not look under, `namespace` and `error`. That is the same split
 `crom list` gives, and it is read the same way: check for `error` first. `bytes` counts
 the regular files under the directory, which is what deleting it would reclaim; a symlink
-counts as the link rather than as its target, since deleting the directory leaves the
-target where it is.
+adds nothing, since deleting the directory leaves its target where it is and the link
+itself frees no space.
 
 A namespace carries an `error` entry for one of two reasons: crom does not know where that
 namespace keeps its profile directories, or it knows and cannot get in. The address comes
@@ -204,7 +204,15 @@ reports the namespace as one it could not fully check, since that config may hav
 `state_dir` crom can no longer read. Both come back every time, so a script must still
 check a gone namespace for an `error` entry. The other reason names a directory rather
 than a config: the profile root is exactly where crom expected, and the permissions on it
-— or the filesystem under it — refused the read.
+— or the filesystem under it — refused the read. The two reasons can land on the same
+namespace at once — a config that is gone whose default profile root also refuses the read
+— and then the array carries two `error` elements under that one `namespace`, one saying
+the root could not be read and one saying the config is gone, so the default root crom
+fell back to may not be where the profiles live. Both are true and neither replaces the
+other, so read the array as a list: a script that keys a dictionary by `namespace`
+overwrites the first finding with the second and never sees it went missing. The
+plain-text summary line counts distinct namespaces, so its number can be smaller than the
+number of `error` rows printed beneath it.
 
 A seed running right now has a staging directory too, and `crom doctor` reports that one
 as well. The evidence on disk is identical, and crom does not try to tell them apart; the
