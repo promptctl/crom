@@ -305,6 +305,32 @@ class MalformedLedgerTest(unittest.TestCase):
         with self.assertRaisesRegex(CromError, "outside the legal range"):
             registry.reservations()
 
+    def test_a_non_boolean_pinned_is_reported_rather_than_believed(self):
+        """`"false"` and not `123`, because a quoted boolean is the edit someone actually
+        makes and it is the one that reverses the answer: it is truthy, so `crom doctor`
+        reported the reservation as pinned on the evidence of a file saying it is not.
+
+        Refused rather than coerced. `bool("false")` is `True`, so normalizing would
+        answer `true` for that same file — the wrong value in the right type, where a
+        caller can no longer tell a mangled ledger from a pinned port.
+        [LAW:parse-dont-validate]
+        """
+        self._write_ledger(
+            {"ports": {"user/default": {"port": 9222, "pinned": "false"}}, "namespaces": {}}
+        )
+        with self.assertRaisesRegex(CromError, "not true or false"):
+            registry.reservations()
+
+    def test_a_non_string_source_is_reported_rather_than_used(self):
+        """The same claim one field over. `Reservation.source` is `str | None` and
+        `crom doctor` publishes it, so an unchecked value makes the annotation a map of
+        the ledger that the ledger does not have to honour."""
+        self._write_ledger(
+            {"ports": {"user/default": {"port": 9222, "source": 123}}, "namespaces": {}}
+        )
+        with self.assertRaisesRegex(CromError, "not a string path or null"):
+            registry.reservations()
+
     def test_the_optional_keys_are_genuinely_optional(self):
         """`pinned` and `source` are read with defaults, so requiring them would reject
         ledgers that work — the check has to be the strongest claim that is *true*."""

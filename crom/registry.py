@@ -142,10 +142,30 @@ def _read(path: Path) -> dict:
                 f"{path}: the port ledger's `ports.{name}.port` is {port}, "
                 f"outside the legal range {MIN_PORT}..{MAX_PORT}"
             )
+        # Optional to *supply*, but not free-form once supplied — the paragraph above is
+        # about which keys must be present, this about what a present one may hold.
+        # `Reservation` declares a type for each, and unchecked those are claims nothing
+        # proves.
+        #
+        # `"pinned": "false"` is the edit that costs most: truthy, so `crom doctor` reports
+        # a reservation as pinned on the evidence of a file saying it is not. Refused and
+        # not coerced — `bool("false")` is `True`, so normalizing answers `true` for that
+        # same file, and a caller loses the difference between a mangled ledger and a
+        # pinned port. [LAW:no-silent-failure]
+        pinned = entry.get("pinned", False)
+        if not isinstance(pinned, bool):
+            raise Reason.REGISTRY_INVALID.error(
+                f"{path}: the port ledger's `ports.{name}.pinned` is {pinned!r}, "
+                f"not true or false"
+            )
+        source = entry.get("source")
+        if source is not None and not isinstance(source, str):
+            raise Reason.REGISTRY_INVALID.error(
+                f"{path}: the port ledger's `ports.{name}.source` is {source!r}, "
+                f"not a string path or null"
+            )
     for name, entry in data["namespaces"].items():
         # `namespaces()` does `Path(entry["config"])`, and `Path(123)` is a `TypeError`.
-        # Presence was checked above for both keys but the type only for `ports.port` —
-        # the same claim owed to both halves of that loop.
         if not isinstance(entry["config"], str):
             raise Reason.REGISTRY_INVALID.error(
                 f"{path}: the port ledger's `namespaces.{name}.config` is "
