@@ -345,8 +345,14 @@ class MalformedConfigTest(unittest.TestCase):
         in which another agent can rewrite it.
         """
         self.target.write_text('namespace = "myapp"\nprofiles = "typo"\n')
-        with self.assertRaisesRegex(CromError, "`profiles` must be a table"):
+        with self.assertRaisesRegex(CromError, "`profiles` must be a table") as caught:
             configwrite.remove_profile(self.target, "yp")
+        # `_profiles_table` raises in one place for all three of its callers, so one
+        # assertion pins the fact rather than three pinning the callers. Here rather than
+        # at the other two because this is the caller with a confusable other ending: the
+        # test below pins `profile_unknown` for a profile that is simply absent, and both
+        # raises build their own message, so a swap changes nothing else this file reads.
+        self.assertIs(caught.exception.reason, Reason.CONFIG_INVALID)
 
     def test_removing_from_a_file_with_no_profiles_is_still_not_found(self):
         """Routing through the shared helper must not turn "absent" into "malformed"."""

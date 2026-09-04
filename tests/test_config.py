@@ -322,8 +322,11 @@ class ChromeSeedNameTest(unittest.TestCase):
     """
 
     def test_an_absolute_path_cannot_masquerade_as_a_profile_name(self):
-        with self.assertRaisesRegex(CromError, "not a profile name"):
+        with self.assertRaisesRegex(CromError, "not a profile name") as caught:
             parse(MINIMAL + '[profiles.dev]\nseed = "chrome:/etc"\n')
+        # The slug `_parse_seed_path` gives the same threat, because it is the same
+        # threat: a well-formed value refused for what copying it would do.
+        self.assertIs(caught.exception.reason, Reason.SEED_UNSAFE)
 
     def test_a_traversal_cannot_masquerade_as_a_profile_name(self):
         # The last three are the ones that slipped an earlier version of this check:
@@ -338,8 +341,11 @@ class ChromeSeedNameTest(unittest.TestCase):
     def test_an_empty_profile_name_is_refused_rather_than_copying_everything(self):
         # `Path('/a') / ''` is `Path('/a')`, so this would seed from the user's entire
         # Chrome directory — every profile and every cookie — instead of one profile.
-        with self.assertRaisesRegex(CromError, "names no profile"):
+        with self.assertRaisesRegex(CromError, "names no profile") as caught:
             parse(MINIMAL + '[profiles.dev]\nseed = "chrome:"\n')
+        # Pinned separately from the traversal guard above: two raises, and one edit can
+        # retag either without touching the other.
+        self.assertIs(caught.exception.reason, Reason.SEED_UNSAFE)
 
     def test_an_ordinary_profile_name_with_a_space_is_still_accepted(self):
         scope = parse(MINIMAL + '[profiles.dev]\nseed = "chrome:Profile 1"\n')
@@ -515,9 +521,10 @@ class SeedPathGuardTest(unittest.TestCase):
             CromError, "your whole home directory or filesystem"
         ) as caught:
             self._parse("/")
-        # Every other bad value in a config file is `config_invalid`; this one is
-        # about what copying the named directory would do, and a caller told only
-        # "your config is wrong" would go looking for a typo.
+        # An unparseable value in a config file is `config_invalid`; every seed guard
+        # — this one and both `chrome:` refusals — is about what copying the named
+        # directory would do, and a caller told only "your config is wrong" would go
+        # looking for a typo.
         self.assertIs(caught.exception.reason, Reason.SEED_UNSAFE)
 
     def test_an_ancestor_of_home_is_refused(self):
