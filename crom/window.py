@@ -119,9 +119,13 @@ def _raise_one(profile: ResolvedProfile, pid: int) -> int:
     if result.returncode != 0:
         said = result.stderr.strip()
         remedy = next((text for code, text in _REMEDIES if code in said), "")
-        raise CromError(
-            "\n".join(filter(None, (f"could not raise '{profile.ref}' (pid {pid}): {said}", remedy)))
-        )
+        # The status is carried even when osascript said nothing: killed by a signal it
+        # exits non-zero with empty stderr, and the sentence would otherwise stop at the
+        # colon, naming a failure while withholding every fact about it.
+        # [LAW:no-silent-failure]
+        detail = " ".join(filter(None, (f"exit {result.returncode}.", said)))
+        problem = f"could not raise '{profile.ref}' (pid {pid}): {detail}"
+        raise CromError("\n".join(filter(None, (problem, remedy))))
 
     # osascript answered, so the number it printed is the only evidence of what was
     # raised. Parsed rather than trusted: a build that prints something else here would

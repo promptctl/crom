@@ -175,6 +175,21 @@ class RefusalTest(unittest.TestCase):
 
         self.assertIn("something new. (-42)", str(caught.exception))
 
+    def test_an_osascript_killed_before_it_could_complain_still_names_its_status(self):
+        """The one ending that could degrade to no information at all.
+
+        A signal ends osascript before it writes anything, so there is no error number for
+        a remedy to match and nothing to quote — which used to leave a sentence that named
+        a failure and then stopped at the colon. [LAW:no-silent-failure]
+        """
+        with answered(returncode=-9, stdout="", stderr=""):
+            with self.assertRaises(CromError) as caught:
+                window.raise_profile(self.profile, (4242,))
+
+        message = str(caught.exception)
+        self.assertIn("4242", message)
+        self.assertIn("exit -9", message)
+
     def test_a_machine_without_osascript_is_told_the_command_is_macos_only(self):
         """`crom show` is the one command with no portable spelling. On a machine without
         `osascript` it must say so, not fail with a bare FileNotFoundError traceback that
