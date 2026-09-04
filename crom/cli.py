@@ -51,6 +51,7 @@ from .model import (
     CromError,
     Emitted,
     FailedProfile,
+    Fields,
     Layer,
     NotFound,
     ProfileRef,
@@ -71,13 +72,22 @@ EXIT_NOT_FOUND = 3
 EXIT_CONFLICT = 4
 
 
-def _crom_reason(error: Exception) -> str | None:
-    """crom's own refusals arrive carrying their reason, because `CromError` cannot be
-    built without one."""
-    return error.reason.value
+class _Detail(NamedTuple):
+    """Everything a failure can say past its code and kind: the reason slug, and the
+    values crom looked up on the way to refusing."""
+
+    reason: str | None
+    fields: Fields
 
 
-def _errno_reason(error: Exception) -> str | None:
+def _crom_detail(error: Exception) -> _Detail:
+    """crom's own refusals arrive carrying both, and for the same reason: a `CromError`
+    cannot be built without a reason, and `Reason.error` fills the fields from what that
+    reason declares it carries. Neither is assembled here."""
+    return _Detail(error.reason.value, error.fields)
+
+
+def _errno_detail(error: Exception) -> _Detail:
     """An OS refusal arrives carrying a slug already, and the OS owns how it is spelled.
     `ENOENT` is a name every language's errno table can already look up, so crom
     inventing a parallel spelling beside it would be a second source of truth for a fact
@@ -88,19 +98,32 @@ def _errno_reason(error: Exception) -> str | None:
     one answer that cannot be mistaken for a slug, where a stand-in like `"unknown"`
     would be an answer-shaped void: a caller could branch on it as though crom had
     identified something. [LAW:parse-dont-validate]
+
+    The path comes from the same place for the same reason. This arm's message is
+    `<path>: <reason>` joined below, so without the field a caller would be splitting
+    crom's sentence on a colon to learn which file the OS refused — and paths contain
+    colons. `filename` is what the OS was asked about rather than what the caller typed,
+    which is exactly what a field is for; `None` where it named none.
+
+    Stringified here because `open(Path(...))` hands back the `Path` object it was given,
+    and the envelope is JSON. That is this boundary's own job — rendering — and not one a
+    raise site could have done, since there is no raise site: the OS built this one.
     """
-    return errno.errorcode.get(error.errno)
+    return _Detail(
+        errno.errorcode.get(error.errno),
+        {"path": None if error.filename is None else str(error.filename)},
+    )
 
 
 class _Answer(NamedTuple):
     """What crom answers for one class of error: the code a script branches on, the kind
-    that says what happened when the code cannot, and where to find the reason that says
+    that says what happened when the code cannot, and where to read the detail that says
     it finer than either."""
 
     error: type[Exception]
     code: int
     kind: str
-    reason: Callable[[Exception], str | None]
+    detail: Callable[[Exception], _Detail]
 
 
 # Every exception this CLI answers for, and the only place a code or a kind is assigned.
@@ -118,11 +141,16 @@ class _Answer(NamedTuple):
 # enumerated one in `model.Reason`, or the errno names the OS already publishes. That is
 # what keeps `kind` from being `reason` blurred: it names which of the two you are
 # holding.
+#
+# One column and not two, though it answers with two values. The reason and the fields are
+# drawn from the same vocabulary — crom's raise site filled both, or the OS did — so a row
+# choosing them separately could pair crom's slug with the OS's fields. Returned together,
+# that mispairing has nowhere to live. [LAW:one-source-of-truth]
 _ANSWERS = (
-    _Answer(NotFound, EXIT_NOT_FOUND, "not_found", _crom_reason),
-    _Answer(Conflict, EXIT_CONFLICT, "conflict", _crom_reason),
-    _Answer(CromError, EXIT_FAILURE, "failure", _crom_reason),
-    _Answer(OSError, EXIT_FAILURE, "os_error", _errno_reason),
+    _Answer(NotFound, EXIT_NOT_FOUND, "not_found", _crom_detail),
+    _Answer(Conflict, EXIT_CONFLICT, "conflict", _crom_detail),
+    _Answer(CromError, EXIT_FAILURE, "failure", _crom_detail),
+    _Answer(OSError, EXIT_FAILURE, "os_error", _errno_detail),
 )
 
 # Where a parsed `--json` is recorded, under the key `_json_option` writes and `_answer`
@@ -194,10 +222,15 @@ def _answer(ctx: click.Context, error: Exception, message: str) -> _Failure:
     # migration `main` runs first reaches the user as prose even though the flag was on
     # the command line. The envelope answers for a command crom has understood.
     if ctx.meta.get(_JSON_REQUESTED, False):
+        detail = answer.detail(error)
         envelope = {
             "code": answer.code,
             "kind": answer.kind,
-            "reason": answer.reason(error),
+            "reason": detail.reason,
+            # Always present, `{}` where the reason declares no fields, so a caller reads
+            # one shape rather than testing for the key first.
+            # [LAW:dataflow-not-control-flow]
+            "fields": detail.fields,
             "message": message,
         }
         click.echo(_json_text({"error": envelope}))
@@ -749,13 +782,23 @@ def _reject_restatement(
     absent `seed` means "inherit `[defaults]`", not "seed is nothing" — so statedness is
     read off the type rather than tracked alongside it. [LAW:types-are-the-program]
     """
-    differing = [
-        f"  {label}: declared {declared or '(unset)'}, you asked for {asked}"
+    # The contradictions are found once and then rendered twice — a line each for the
+    # reader, their labels alone for the script. Filtering a second time to name them would
+    # be a second copy of the rule deciding what "differs" means. [LAW:one-source-of-truth]
+    differing = tuple(
+        (label, declared, asked)
         for label, declared, asked in facts
         if asked is not None and declared != asked
-    ]
+    )
     if differing:
-        raise Reason.DECLARATION_DIFFERS.error("\n".join((subject, *differing, remedy)))
+        lines = (
+            f"  {label}: declared {declared or '(unset)'}, you asked for {asked}"
+            for label, declared, asked in differing
+        )
+        raise Reason.DECLARATION_DIFFERS.error(
+            "\n".join((subject, *lines, remedy)),
+            settings=tuple(label for label, _, _ in differing),
+        )
 
 
 @main.command("add")
@@ -1149,7 +1192,7 @@ def init_cmd(namespace: str | None, seed_text: str | None):
         (
             ("namespace", declared_namespace, namespace),
             (
-                f"{DEFAULTS_STANZA}.seed",
+                "seed",
                 str(declared_seed),
                 None if stated_seed is None else configwrite.render_seed(stated_seed, base),
             ),
