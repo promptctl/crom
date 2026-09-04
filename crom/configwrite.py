@@ -19,8 +19,8 @@ from . import flags
 from .locking import exclusive
 from .model import (
     CromError,
-    NotFound,
     ProfileSpec,
+    Reason,
     Seed,
     SeedChrome,
     SeedFresh,
@@ -126,7 +126,7 @@ def _load(path: Path) -> tomlkit.TOMLDocument:
     try:
         return tomlkit.parse(path.read_text())
     except (tomlkit.exceptions.ParseError, OSError) as e:
-        raise CromError(f"{path}: cannot be read as TOML ({e}).\nRepair the file.") from e
+        raise Reason.CONFIG_INVALID.error(f"{path}: cannot be read as TOML ({e}).\nRepair the file.") from e
 
 
 def _profiles_table(doc: tomlkit.TOMLDocument, path: Path, *, create: bool = False):
@@ -149,7 +149,7 @@ def _profiles_table(doc: tomlkit.TOMLDocument, path: Path, *, create: bool = Fal
     else:
         profiles = doc.get("profiles", {})
     if not isinstance(profiles, dict):
-        raise CromError(
+        raise Reason.CONFIG_INVALID.error(
             f"{path}: `profiles` must be a table, not {type(profiles).__name__}.\n"
             f"Repair the file."
         )
@@ -178,7 +178,7 @@ def _writing(path: Path) -> Iterator[None]:
     except CromError:
         raise
     except OSError as e:
-        raise CromError(f"{path}: {e.strerror or e}") from e
+        raise Reason.CONFIG_UNWRITABLE.error(f"{path}: {e.strerror or e}") from e
 
 
 def _save(path: Path, doc: tomlkit.TOMLDocument) -> None:
@@ -359,7 +359,7 @@ def _declare(path: Path, spec: ProfileSpec, header: str) -> bool:
     with exclusive(path):
         if not path.exists():
             if not header:
-                raise CromError(
+                raise Reason.CONFIG_HEADER_REQUIRED.error(
                     f"{path} does not exist, and crom will not create a config without a "
                     f"header declaring its namespace — the file would be written and then "
                     f"rejected by crom's own parser on the next command."
@@ -445,6 +445,6 @@ def remove_profile(path: Path, name: str) -> None:
         # inside the CLI's exit-code contract. [LAW:single-enforcer]
         profiles = _profiles_table(doc, path)
         if name not in profiles:
-            raise NotFound(f"{path}: profile '{name}' is not declared here")
+            raise Reason.PROFILE_UNKNOWN.error(f"{path}: profile '{name}' is not declared here")
         del profiles[name]
         _save(path, doc)

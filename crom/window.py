@@ -19,7 +19,7 @@ done nothing. [LAW:no-silent-failure]
 
 import subprocess
 
-from .model import CromError, ResolvedProfile
+from .model import Reason, ResolvedProfile
 
 # How long crom waits for `osascript` to answer. A raise costs milliseconds once macOS has
 # granted Automation access, so this bound is not sized for the work — it is sized for the
@@ -97,7 +97,7 @@ def _raise_one(profile: ResolvedProfile, pid: int) -> int:
             timeout=RAISE_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired as e:
-        raise CromError(
+        raise Reason.AUTOMATION_DENIED.error(
             f"`osascript` did not answer within {RAISE_TIMEOUT_SECONDS:.0f}s while raising "
             f"'{profile.ref}' (pid {pid}).\nThe usual cause is macOS's Automation consent "
             f"dialog waiting on an answer — grant access in System Settings › Privacy & "
@@ -110,7 +110,7 @@ def _raise_one(profile: ResolvedProfile, pid: int) -> int:
         # catches the same breadth around its own `Popen` for that reason.
         # One message carrying the error rather than an arm per cause: the sentence below
         # is true of every way the command can fail to run. [LAW:dataflow-not-control-flow]
-        raise CromError(
+        raise Reason.PLATFORM_UNSUPPORTED.error(
             f"could not run `osascript` to raise a window: {e}\n"
             "Raising one browser out of several identical ones needs macOS's own window "
             "server, so `crom show` works on macOS alone."
@@ -125,7 +125,7 @@ def _raise_one(profile: ResolvedProfile, pid: int) -> int:
         # [LAW:no-silent-failure]
         detail = " ".join(filter(None, (f"exit {result.returncode}.", said)))
         problem = f"could not raise '{profile.ref}' (pid {pid}): {detail}"
-        raise CromError("\n".join(filter(None, (problem, remedy))))
+        raise Reason.WINDOW_RAISE_FAILED.error("\n".join(filter(None, (problem, remedy))))
 
     # osascript answered, so the number it printed is the only evidence of what was
     # raised. Parsed rather than trusted: a build that prints something else here would
@@ -135,7 +135,7 @@ def _raise_one(profile: ResolvedProfile, pid: int) -> int:
     try:
         return int(counted)
     except ValueError as e:
-        raise CromError(
+        raise Reason.WINDOW_RAISE_FAILED.error(
             f"raised '{profile.ref}' (pid {pid}), but osascript reported its window count "
             f"as {counted!r}, which is not a number."
         ) from e

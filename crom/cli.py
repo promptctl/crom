@@ -11,6 +11,10 @@ exit codes are a contract a script can branch on:
     0  success            3  no such profile / namespace / config
     1  failure            4  port or declaration conflict
     2  usage error (click's own)
+
+Four codes is as fine as a numeric contract can afford to be, so every failure also
+carries a reason slug — one word naming what actually went wrong, enumerated in
+`model.Reason`.
 """
 
 import errno
@@ -18,6 +22,7 @@ import json
 import os
 import shlex
 import shutil
+from collections.abc import Callable
 from pathlib import Path
 from stat import S_ISREG
 from typing import NamedTuple
@@ -39,8 +44,8 @@ from . import (
 )
 from .config import discover, load_ambient, load_user_scope, parse_layer, parse_port, parse_seed
 from .model import (
-    DEFAULT_SEED,
     DEFAULTS_STANZA,
+    DEFAULT_SEED,
     USER_NAMESPACE,
     Conflict,
     CromError,
@@ -50,8 +55,9 @@ from .model import (
     NotFound,
     ProfileRef,
     ProfileSpec,
-    ResolvedProfile,
+    Reason,
     Resolution,
+    ResolvedProfile,
     Scope,
     parse_ref,
     profile_stanza,
@@ -65,13 +71,36 @@ EXIT_NOT_FOUND = 3
 EXIT_CONFLICT = 4
 
 
+def _crom_reason(error: Exception) -> str | None:
+    """crom's own refusals arrive carrying their reason, because `CromError` cannot be
+    built without one."""
+    return error.reason.value
+
+
+def _errno_reason(error: Exception) -> str | None:
+    """An OS refusal arrives carrying a slug already, and the OS owns how it is spelled.
+    `ENOENT` is a name every language's errno table can already look up, so crom
+    inventing a parallel spelling beside it would be a second source of truth for a fact
+    it does not own. [LAW:one-source-of-truth]
+
+    `None` where there is no errno — `shutil.Error` is an `OSError` carrying none — since
+    at that point crom knows nothing finer than `kind` has already said. `null` is the
+    one answer that cannot be mistaken for a slug, where a stand-in like `"unknown"`
+    would be an answer-shaped void: a caller could branch on it as though crom had
+    identified something. [LAW:parse-dont-validate]
+    """
+    return errno.errorcode.get(error.errno)
+
+
 class _Answer(NamedTuple):
-    """What crom answers for one class of error: the code a script branches on, and the
-    kind that says what happened when the code cannot."""
+    """What crom answers for one class of error: the code a script branches on, the kind
+    that says what happened when the code cannot, and where to find the reason that says
+    it finer than either."""
 
     error: type[Exception]
     code: int
     kind: str
+    reason: Callable[[Exception], str | None]
 
 
 # Every exception this CLI answers for, and the only place a code or a kind is assigned.
@@ -82,13 +111,18 @@ class _Answer(NamedTuple):
 # both exit 1, and `kind` is the only field that separates them — which matters, because
 # one means the user's request was wrong and the other means the machine got in the way.
 # Exit codes are a published four-value vocabulary that cannot grow without breaking the
-# contract; kinds can, which is where a finer slug belongs once four classes stop
-# being enough to say what went wrong.
+# contract, and `kind` sorts the same failures four ways again. Neither can tell a port
+# held by a stranger from a Chrome that will not run from a Chrome that died on the way
+# up, and those are three different next moves. `reason` is where that lives — a column
+# here because a class still decides which vocabulary a reason is drawn from: crom's own
+# enumerated one in `model.Reason`, or the errno names the OS already publishes. That is
+# what keeps `kind` from being `reason` blurred: it names which of the two you are
+# holding.
 _ANSWERS = (
-    _Answer(NotFound, EXIT_NOT_FOUND, "not_found"),
-    _Answer(Conflict, EXIT_CONFLICT, "conflict"),
-    _Answer(CromError, EXIT_FAILURE, "failure"),
-    _Answer(OSError, EXIT_FAILURE, "os_error"),
+    _Answer(NotFound, EXIT_NOT_FOUND, "not_found", _crom_reason),
+    _Answer(Conflict, EXIT_CONFLICT, "conflict", _crom_reason),
+    _Answer(CromError, EXIT_FAILURE, "failure", _crom_reason),
+    _Answer(OSError, EXIT_FAILURE, "os_error", _errno_reason),
 )
 
 # Where a parsed `--json` is recorded, under the key `_json_option` writes and `_answer`
@@ -160,7 +194,12 @@ def _answer(ctx: click.Context, error: Exception, message: str) -> _Failure:
     # migration `main` runs first reaches the user as prose even though the flag was on
     # the command line. The envelope answers for a command crom has understood.
     if ctx.meta.get(_JSON_REQUESTED, False):
-        envelope = {"code": answer.code, "kind": answer.kind, "message": message}
+        envelope = {
+            "code": answer.code,
+            "kind": answer.kind,
+            "reason": answer.reason(error),
+            "message": message,
+        }
         click.echo(_json_text({"error": envelope}))
     return _Failure(message, answer.code)
 
@@ -716,7 +755,7 @@ def _reject_restatement(
         if asked is not None and declared != asked
     ]
     if differing:
-        raise Conflict("\n".join((subject, *differing, remedy)))
+        raise Reason.PROFILE_DIFFERS.error("\n".join((subject, *differing, remedy)))
 
 
 @main.command("add")
@@ -814,7 +853,7 @@ def add_cmd(session: _Session, name: str, seed_text: str | None, flag_texts: tup
         # takes a concurrent `crom rm` — or a `git checkout` over the file — landing in
         # between. Said as a `CromError` rather than left to a `KeyError`, which would
         # leave this module's exit-code contract as a traceback. [LAW:no-silent-failure]
-        raise CromError(
+        raise Reason.PROFILE_VANISHED.error(
             f"{target}: profile '{name}' was removed while crom was declaring it"
         )
 
@@ -1042,7 +1081,7 @@ def init_cmd(namespace: str | None, seed_text: str | None):
     # [LAW:single-enforcer]
     claimed_namespace = namespace or (None if existing else chosen_namespace)
     if claimed_namespace == USER_NAMESPACE:
-        raise Conflict(f'"{USER_NAMESPACE}" is reserved; pass a different namespace')
+        raise Reason.NAMESPACE_RESERVED.error(f'"{USER_NAMESPACE}" is reserved; pass a different namespace')
 
     # Parsed here, before the file exists, through the same checkpoint that reads the
     # value back on the next command — so `crom init --seed chorme` fails naming the
@@ -1091,7 +1130,7 @@ def init_cmd(namespace: str | None, seed_text: str | None):
     # diagnosis stays `config.parse`'s; this is only the checkpoint for the value the
     # three lines below are about to state as fact.
     if not isinstance(declared_namespace, str):
-        raise CromError(
+        raise Reason.CONFIG_INVALID.error(
             f"{target} exists but declares no usable `namespace` "
             f"({declared_namespace!r}), so it does not configure this project.\n"
             f'Add namespace = "{chosen_namespace}" to it, or delete it and run '
@@ -1446,7 +1485,7 @@ def _delete_profile_data(profile: ResolvedProfile) -> None:
     try:
         shutil.rmtree(profile.profile_dir)
     except OSError as e:
-        raise CromError(
+        raise Reason.PROFILE_DIR_UNDELETABLE.error(
             f"could not delete {profile.profile_dir}: {e}\n"
             f"'{profile.ref}' is still declared — run `crom rm {profile.ref}` again."
         ) from e

@@ -21,7 +21,7 @@ from click.testing import CliRunner
 
 from crom import cli, config, configwrite, mcp
 from crom.config import load_ambient
-from crom.model import CromError, ProfileRef
+from crom.model import ProfileRef, Reason
 from crom.paths import state_home, user_config_file
 
 
@@ -199,7 +199,7 @@ class CliTest(unittest.TestCase):
         command — including `crom init`, which `_Session` exists to keep working on a
         machine that has no Chrome yet.
         """
-        with mock.patch("crom.config.find_chrome", side_effect=CromError("no Chrome here")):
+        with mock.patch("crom.config.find_chrome", side_effect=Reason.CHROME_UNUSABLE.error("no Chrome here")):
             self.crom("init", "myapp")
 
         self.assertIn('namespace = "myapp"', (self.project / ".crom.toml").read_text())
@@ -1530,7 +1530,7 @@ class CliTest(unittest.TestCase):
             mock.patch("crom.cli.seed.materialize_under_lock"),
             mock.patch("crom.cli.chrome.kill", return_value=(999,)),
             mock.patch("crom.cli.chrome.find_pids", return_value=()),
-            mock.patch("crom.cli.chrome.launch", side_effect=CromError("Chrome exited 1")),
+            mock.patch("crom.cli.chrome.launch", side_effect=Reason.CHROME_STARTUP_FAILED.error("Chrome exited 1")),
         ):
             result = self.invoke("restart", "ci", expect=1)
 
@@ -1583,7 +1583,7 @@ class CliTest(unittest.TestCase):
             mock.patch("crom.cli.seed.materialize_under_lock"),
             mock.patch("crom.cli.chrome.find_pids", return_value=()),
             mock.patch("crom.cli.chrome.launch", return_value=(1234,)),
-            mock.patch("crom.cli.window.raise_profile", side_effect=CromError("no Automation access")),
+            mock.patch("crom.cli.window.raise_profile", side_effect=Reason.AUTOMATION_DENIED.error("no Automation access")),
         ):
             result = self.invoke("show", "ci", expect=1)
 
@@ -1858,7 +1858,10 @@ class CliTest(unittest.TestCase):
             refused = self.invoke("list", "--json", expect=1)
         self.assertEqual(
             json.loads(refused.stdout)["error"],
-            {"code": 1, "kind": "os_error", "message": "Cannot send"},
+            # `ESHUTDOWN` and not a slug of crom's own devising: the OS published this
+            # name, so the envelope repeats it rather than inventing a second spelling
+            # for a fact crom does not own. [LAW:one-source-of-truth]
+            {"code": 1, "kind": "os_error", "reason": "ESHUTDOWN", "message": "Cannot send"},
         )
 
     @contextlib.contextmanager
@@ -1938,7 +1941,7 @@ class CliTest(unittest.TestCase):
         kinds = []
         for error in (
             PermissionError(13, "Permission denied", "/bin/ps"),
-            CromError("ps is not on PATH"),
+            Reason.PROCESS_TABLE_UNREADABLE.error("ps is not on PATH"),
         ):
             with mock.patch("crom.chrome.scan", side_effect=error):
                 result = self.invoke("list", "--json", expect=1)
@@ -1995,7 +1998,7 @@ class CliTest(unittest.TestCase):
         """
         self.crom("init")
         with mock.patch(
-            "crom.migrate.run_if_needed", side_effect=CromError("a legacy Chrome is still running")
+            "crom.migrate.run_if_needed", side_effect=Reason.MIGRATION_NEEDS_QUIET.error("a legacy Chrome is still running")
         ):
             result = self.invoke("list", "--json", expect=1)
 
@@ -2028,12 +2031,17 @@ class CliTest(unittest.TestCase):
         for name in offering:
             with self.subTest(command=name):
                 with mock.patch(
-                    "crom.cli.load_ambient", side_effect=CromError("no ambient config")
+                    "crom.cli.load_ambient", side_effect=Reason.CONFIG_INVALID.error("no ambient config")
                 ):
                     result = self.invoke(name, "--json", expect=1)
                 self.assertEqual(
                     json.loads(result.stdout)["error"],
-                    {"code": 1, "kind": "failure", "message": "no ambient config"},
+                    {
+                        "code": 1,
+                        "kind": "failure",
+                        "reason": "config_invalid",
+                        "message": "no ambient config",
+                    },
                 )
 
 

@@ -20,10 +20,10 @@ from .model import (
     FailedProfile,
     Flag,
     Layer,
-    NotFound,
     ProfileEntry,
     ProfileRef,
     ProfileSpec,
+    Reason,
     ResolvedProfile,
     Scope,
     Seed,
@@ -43,7 +43,7 @@ def _expand(text: str, variables: dict[str, str], where: str) -> str:
         key = match.group(1)
         if key not in variables:
             known = ", ".join(f"${{{k}}}" for k in sorted(variables))
-            raise CromError(f"{where}: unknown variable ${{{key}}} (known: {known})")
+            raise Reason.VARIABLE_UNKNOWN.error(f"{where}: unknown variable ${{{key}}} (known: {known})")
         return variables[key]
 
     return _VAR_RE.sub(replace, text)
@@ -79,7 +79,7 @@ def _reject_unknown_variables(texts: tuple[str, ...], known: dict[str, str], whe
         for match in _VAR_RE.finditer(text):
             if match.group(1) not in known:
                 names = ", ".join(f"${{{k}}}" for k in sorted(known))
-                raise CromError(f"{where}: unknown variable ${{{match.group(1)}}} (known: {names})")
+                raise Reason.VARIABLE_UNKNOWN.error(f"{where}: unknown variable ${{{match.group(1)}}} (known: {names})")
 
 
 def build_argv(
@@ -138,7 +138,7 @@ def scope_for(namespace: str, ambient: Scope, log=report.to_stderr) -> Scope:
             )
 
     options = ", ".join(sorted({USER_NAMESPACE, ambient.namespace, *registry.namespaces()}))
-    raise NotFound(f"unknown namespace '{namespace}'. Known namespaces: {options}")
+    raise Reason.NAMESPACE_UNKNOWN.error(f"unknown namespace '{namespace}'. Known namespaces: {options}")
 
 
 def _remembered(namespace: str) -> Scope | str | None:
@@ -186,7 +186,7 @@ def spec_for(ref: ProfileRef, scope: Scope) -> ProfileSpec:
     if spec is None:
         declared = ", ".join(sorted(scope.profiles)) or "(none)"
         where = scope.source or "your user config"
-        raise NotFound(
+        raise Reason.PROFILE_UNKNOWN.error(
             f"profile '{ref}' is not declared in {where}.\nDeclared there: {declared}"
         )
     return spec
