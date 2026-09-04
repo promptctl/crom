@@ -113,8 +113,8 @@ class MigrateTest(unittest.TestCase):
 
     def test_an_attempt_that_dies_partway_is_resumed_by_the_next_one(self):
         # The legacy registry is only retired after the whole loop, so a failed attempt
-        # is retried on the user's next command — and migration runs before anything
-        # else in `main`. A step that could not survive being run twice would therefore
+        # is retried on the user's next command — and migration runs before any
+        # command does. A step that could not survive being run twice would therefore
         # raise on every command from then on, with no command left to recover with.
         real_move = migrate.shutil.move
 

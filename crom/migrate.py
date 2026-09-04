@@ -155,8 +155,8 @@ def run(log) -> None:
         # the whole loop, so an attempt that dies partway is retried on the user's next
         # command — and every step here has to survive being run twice. It is the one
         # step that would not: re-declaring a name it already wrote would raise, and
-        # because migration runs before anything else in `main`, that exception would
-        # come back on *every* command and leave crom unusable with no way out.
+        # because migration runs before any command does, that exception would come
+        # back on *every* command and leave crom unusable with no way out.
         configwrite.ensure_profile(
             user_config_file(),
             ProfileSpec(name=name, seed=SeedChrome()),
