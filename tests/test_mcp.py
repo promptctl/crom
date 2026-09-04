@@ -195,6 +195,40 @@ class WriteTest(unittest.TestCase):
             mcp.write(profile(ProfileRef("a" * 40, "dev"), 9222), self.path)
         self.assertEqual(self.path.read_text(), original)
 
+    def test_reports_that_there_was_no_legacy_entry(self):
+        self.assertIs(mcp.write(self.dev, self.path), mcp.Legacy.ABSENT)
+
+    def test_reports_the_legacy_entry_it_renamed(self):
+        self.path.write_text(json.dumps({"mcpServers": {mcp.LEGACY_KEY: mcp.server_entry(9222)}}))
+        self.assertIs(mcp.write(self.dev, self.path), mcp.Legacy.REPLACED)
+
+    def test_reports_a_legacy_entry_left_on_another_port(self):
+        self.path.write_text(json.dumps({"mcpServers": {mcp.LEGACY_KEY: mcp.server_entry(9500)}}))
+        self.assertIs(mcp.write(self.dev, self.path), mcp.Legacy.KEPT)
+
+    def test_reports_a_legacy_entry_left_because_crom_did_not_write_it(self):
+        # The second shape that reaches KEPT. It is one value with the case above and not
+        # two, because separating them means parsing a body crom did not write — the
+        # guess `write` refuses to make, and so the phrasing must not claim either.
+        theirs = {"command": "npx", "args": ["--browserUrl", "http://127.0.0.1:9222"]}
+        self.path.write_text(json.dumps({"mcpServers": {mcp.LEGACY_KEY: theirs}}))
+        self.assertIs(mcp.write(self.dev, self.path), mcp.Legacy.KEPT)
+
+    def test_a_null_legacy_entry_is_not_reported_as_absent(self):
+        # `{"chrome-devtools-mcp": null}` is legal JSON, and `servers.get(LEGACY_KEY)`
+        # reads it as no legacy entry at all — reporting ABSENT, the one outcome that
+        # says nothing, about a file that still declares two servers after the write.
+        self.path.write_text(json.dumps({"mcpServers": {mcp.LEGACY_KEY: None}}))
+        self.assertIs(mcp.write(self.dev, self.path), mcp.Legacy.KEPT)
+        self.assertIsNone(self.servers()[mcp.LEGACY_KEY])
+
+    def test_the_rename_is_reported_once_and_not_on_every_write(self):
+        # Convergence, not a standing complaint: the second write has no legacy entry to
+        # rename, and reporting one would be crom claiming work it did not do.
+        self.path.write_text(json.dumps({"mcpServers": {mcp.LEGACY_KEY: mcp.server_entry(9222)}}))
+        mcp.write(self.dev, self.path)
+        self.assertIs(mcp.write(self.dev, self.path), mcp.Legacy.ABSENT)
+
     def test_rejects_invalid_json(self):
         self.path.write_text("not json")
         with self.assertRaises(CromError):

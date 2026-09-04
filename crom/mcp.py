@@ -1,6 +1,7 @@
 """Generates the .mcp.json entry that points chrome-devtools-mcp at a given profile."""
 
 import json
+from enum import Enum, auto
 from pathlib import Path
 
 from .model import CromError, ProfileRef, ResolvedProfile
@@ -34,6 +35,38 @@ _ESCAPES = {"_": "_u", ".": "_d"}
 # names no profile, so an entry still sitting under it says which browser it points at
 # and nothing about whose browser that is — `write` explains what is done with that.
 LEGACY_KEY = "chrome-devtools-mcp"
+
+
+class Legacy(Enum):
+    """What `write` found under `LEGACY_KEY`, and therefore what it did with it.
+
+    Three values rather than the `str | None` this would collapse to, because "renamed
+    it" and "there was none" do not exhaust the outcomes: an entry `write` cannot show
+    is crom's own stays where it is, and the file goes on declaring two chrome-devtools
+    servers. A bare `None` folds that onto "nothing to report" and the one outcome the
+    user cannot see for themselves is the one that goes out silently.
+    [LAW:no-silent-failure] [LAW:types-are-the-program]
+    """
+
+    ABSENT = auto()
+    REPLACED = auto()
+    KEPT = auto()
+
+    @classmethod
+    def of(cls, servers: dict, entry: dict) -> "Legacy":
+        """Which one the servers already in the file are, measured against `entry`.
+
+        The one place the question is asked, so the file `write` leaves and the sentence
+        its caller prints about that file come from a single answer rather than from two
+        tests that can drift into disagreeing. [LAW:one-source-of-truth]
+
+        Membership and not `servers.get(LEGACY_KEY)`, because `{"chrome-devtools-mcp":
+        null}` is legal JSON: a `.get` reads that file as having no legacy entry at all
+        and answers ABSENT — the one value that says nothing. [LAW:no-silent-failure]
+        """
+        if LEGACY_KEY not in servers:
+            return cls.ABSENT
+        return cls.REPLACED if servers[LEGACY_KEY] == entry else cls.KEPT
 
 
 def entry_key(ref: ProfileRef) -> str:
@@ -87,7 +120,7 @@ def server_entry(port: int) -> dict:
     }
 
 
-def write(profile: ResolvedProfile, path: Path) -> None:
+def write(profile: ResolvedProfile, path: Path) -> Legacy:
     """Merge `profile`'s chrome-devtools-mcp server entry into `path`.
 
     Takes the whole profile rather than a ref and a port because those are one fact:
@@ -116,6 +149,13 @@ def write(profile: ResolvedProfile, path: Path) -> None:
     confidently and sometimes wrongly), and it is renamed when that profile is next
     wired. The key is derived before the drop, so a ref `entry_key` refuses leaves the
     legacy entry wired rather than dropping it for a replacement that never arrives.
+
+    Hands back what became of that entry instead of saying so itself, because a sentence
+    for a user is the CLI's job and this is the only place the fact exists — once the
+    file is written, `path` no longer records that anything was renamed.
+    [LAW:effects-at-boundaries] A caller reconstructing it by reading `path` first would
+    be a second source for an event decided here, and a weaker one: it cannot tell an
+    entry that was renamed from one deliberately left alone. [LAW:one-source-of-truth]
     """
     if path.exists():
         try:
@@ -133,9 +173,12 @@ def write(profile: ResolvedProfile, path: Path) -> None:
 
     key = entry_key(profile.ref)
     entry = server_entry(profile.port)
+    legacy = Legacy.of(servers, entry)
     # [LAW:dataflow-not-control-flow] the filter runs on every write; whether a legacy
-    # entry is there to drop is a fact about the data, not a branch in the mechanics.
-    servers = {n: e for n, e in servers.items() if (n, e) != (LEGACY_KEY, entry)}
+    # entry is there to drop is a fact about the data, not a branch in the mechanics. It
+    # reads the answer above rather than asking again.
+    servers = {n: e for n, e in servers.items() if (n, legacy) != (LEGACY_KEY, Legacy.REPLACED)}
     servers[key] = entry
     config["mcpServers"] = servers
     path.write_text(json.dumps(config, indent=2) + "\n")
+    return legacy

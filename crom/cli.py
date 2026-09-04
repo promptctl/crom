@@ -29,6 +29,7 @@ from . import (
     mcp,
     migrate,
     registry,
+    report,
     resolve as resolver,
     seed,
     window,
@@ -44,6 +45,7 @@ from .model import (
     FailedProfile,
     Layer,
     NotFound,
+    ProfileRef,
     ProfileSpec,
     ResolvedProfile,
     Resolution,
@@ -1241,6 +1243,35 @@ def env_cmd(session: _Session, ref: str):
         click.echo(f"export {key}={shlex.quote(value)}")
 
 
+def _legacy_notes(legacy: mcp.Legacy, ref: ProfileRef, key: str, path: str) -> tuple[str, ...]:
+    """What to say about an entry the file already held under crom's old constant key.
+
+    A table over the three outcomes rather than a chain of `if`s, and total rather than
+    a `.get(..., ())`, so an outcome added to `mcp.Legacy` later fails here loudly
+    instead of quietly printing nothing about itself. [LAW:dataflow-not-control-flow]
+    [LAW:no-silent-failure]
+
+    The kept clause claims only that the entry is not what crom writes for this profile,
+    which is the whole of what crom knows about it. Both shapes that reach KEPT are in
+    it — an entry naming another browser and one whose body a human edited — and telling
+    those apart, or naming the port in either, would need a parser for an entry crom may
+    not have written, which is exactly the guess `mcp.write` refuses to make. It says
+    nothing about which, because what the user can act on is the same either way: this
+    file now declares two chrome-devtools servers, and crom will not merge them.
+    """
+    return {
+        mcp.Legacy.ABSENT: (),
+        mcp.Legacy.REPLACED: (
+            f"Renamed {path}'s '{mcp.LEGACY_KEY}' entry to '{key}' — "
+            f"same wiring, now named for {ref}.",
+        ),
+        mcp.Legacy.KEPT: (
+            f"Left {path}'s existing '{mcp.LEGACY_KEY}' entry alone — it is not the entry "
+            f"crom writes for {ref}, so the file now declares two chrome-devtools servers.",
+        ),
+    }[legacy]
+
+
 @main.command("mcp")
 @click.argument("ref", required=False, default="default")
 @click.option("--path", "path", default=".mcp.json", help="File to write.")
@@ -1248,8 +1279,18 @@ def env_cmd(session: _Session, ref: str):
 def mcp_cmd(session: _Session, ref: str, path: str):
     """Wire chrome-devtools-mcp at a profile by writing .mcp.json here."""
     profile = session.working(ref)
-    mcp.write(profile, Path(path))
-    click.echo(f"Wrote {path} wired to {profile.ref} ({profile.cdp_url})")
+    legacy = mcp.write(profile, Path(path))
+    # Recomputed from the ref rather than carried back from `write`, which is a
+    # derivation and not a copy: `entry_key` is pure, so the two callers cannot disagree
+    # about the key for one ref the way two stored spellings of it could.
+    # [LAW:one-source-of-truth]
+    key = mcp.entry_key(profile.ref)
+    # Before the answer, and on the other stream: renaming an entry is convergence — work
+    # crom did on the user's behalf that they did not ask for — and `report` is where that
+    # goes, while the line below is the answer a script parses. [CLI binding]
+    for note in _legacy_notes(legacy, profile.ref, key, path):
+        report.to_stderr(note)
+    click.echo(f"Wrote {path}: '{key}' wired to {profile.ref} ({profile.cdp_url})")
 
 
 @main.command("forget")
