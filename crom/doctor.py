@@ -26,9 +26,9 @@ from pathlib import Path
 from stat import S_ISREG
 from typing import ClassVar
 
-from . import registry
+from . import migrate, registry
 from .config import load_file
-from .model import USER_NAMESPACE, CromError, ProfileRef
+from .model import USER_NAMESPACE, CromError, ProfileRef, namespace_of
 from .paths import default_profiles_root, registry_file, user_config_file
 from .registry import Reservation
 
@@ -196,22 +196,39 @@ def survey() -> Survey:
     happened rather than a verdict — the two halves divide the outcomes differently, and
     only they know how. [LAW:decomposition]
 
-    Which namespaces have a profile root at all comes from the same ledger the
-    reservations do, because that index is what makes a namespace a global address. The
-    `user` namespace is added last and cannot be displaced: its config is a fixed path, so
-    a project that claimed the name could otherwise send this looking somewhere else.
+    Which namespaces have a profile root is read from the ledger *and* from the mapping
+    index, because the index alone is lossy in exactly the case this command is for.
+    `registry.forget_mapping` drops a namespace from it whenever `resolve.scope_for` meets
+    a config it can no longer load, and deliberately keeps the ports — so a project whose
+    config was deleted and then referred to from elsewhere kept reporting `orphaned`
+    reservations while its profile root went unscanned and unmentioned. Silence, where the
+    whole point of the second half is that a root crom did not check says so.
+    [LAW:no-silent-failure]
+
+    Reading both registers costs one dict merge and no new precedence: the index still
+    wins for a namespace in both, since it is what makes a namespace a global address, and
+    `user` is still added last and cannot be displaced — its config is a fixed path, so a
+    project that claimed the name could otherwise send this looking somewhere else.
+    A namespace is carried against the source `_consult` takes rather than against a
+    `Path`, because the ledger may record no config for a reservation at all — a hand
+    repair is the only way to release an orphan today, so this command meets one. That
+    namespace has no root to look under and reports as one crom could not check, which is
+    an answer; a `Path` could not have held the case at all.
     """
     ledger = registry.reservations()
-    namespaces = {**registry.namespaces(), USER_NAMESPACE: user_config_file()}
+    namespaces: dict[str, str | None] = {
+        **{namespace_of(ref): held.source for ref, held in ledger.items()},
+        **{name: str(config) for name, config in registry.namespaces().items()},
+        USER_NAMESPACE: str(user_config_file()),
+    }
     consulted = {
         source: _consult(source)
-        for source in {held.source for held in ledger.values()}
-        | {str(config) for config in namespaces.values()}
+        for source in {held.source for held in ledger.values()} | set(namespaces.values())
     }
     found = tuple(
         item
-        for namespace, config in sorted(namespaces.items())
-        for item in _staging(namespace, consulted[str(config)])
+        for namespace, source in sorted(namespaces.items())
+        for item in _staging(namespace, consulted[source])
     )
     return Survey(
         registry=registry_file(),
@@ -383,32 +400,54 @@ def _staging(
 def _leaks(namespace: str, root: Path) -> tuple[Staged | Unscanned, ...]:
     """Every staging directory sitting in one profile root, each with its size.
 
-    Two tests, and each is exact rather than approximate. The leading dot is decisive
+    Three tests, and each is exact rather than approximate. The leading dot is decisive
     because `model.validate_name` requires a profile name to start alphanumeric, so no
-    directory crom ever commits here can begin with one, and `seed._staged` is the only
-    writer that puts one here. `is_dir` is decisive because the *other* dot-prefixed
-    resident is `locking.exclusive`'s `.<name>.lock`, a regular file that every command
-    touching the profile leaves behind — reported as a leak it would fire on every
-    machine, every run. [LAW:types-are-the-program]
+    directory crom ever commits here can begin with one. `is_dir` is decisive because one
+    other dot-prefixed resident is `locking.exclusive`'s `.<name>.lock`, a regular file
+    that every command touching the profile leaves behind — reported as a leak it would
+    fire on every machine, every run. [LAW:types-are-the-program]
 
-    Neither test takes the name apart, which is what makes them total: `.<name>.<rand>`
-    cannot be split back into its halves, because `_NAME_RE` lets a profile name contain
-    dots of its own.
+    The third test is the one that keeps this command from costing someone their data.
+    `seed._staged` is not the only writer here: `migrate._move_staged` stages a legacy
+    profile as `.<name>.partial` in this very root, and on a same-filesystem move it
+    renames `old_dir` away *before* that exists — so an interruption in that window leaves
+    the `.partial` holding the only copy of the profile. This command's own sentence calls
+    what it lists "left behind by an interrupted seed", beside a size `measure` calls what
+    deleting it would reclaim. Both are false for a migration's staging directory, and a
+    reader who acted on them would lose their cookies and logins. Migration owns the
+    suffix and this reads it from there. [LAW:one-source-of-truth]
+
+    No test takes a name apart, which is what makes them total: `.<name>.<rand>` cannot be
+    split back into its halves, because `_NAME_RE` lets a profile name contain dots of its
+    own. `endswith` on a constant asks nothing of the name's structure.
+
+    The whole read sits under one handler, classification included. `is_dir` stats, and on
+    3.12 — the floor `requires-python` promises — `Path.is_dir` re-raises anything outside
+    `pathlib._ignore_error`, so a root that is readable but not searchable lists fine and
+    then raises EACCES on the first entry. Outside the `try` that escaped as a traceback
+    from the command whose docstring promises it never raises for a directory it cannot
+    read. `Path.is_dir` swallows every `OSError` from 3.13 on, so the bug was invisible on
+    a new interpreter and live on the supported one. [LAW:single-enforcer]
 
     A root that was never created holds nothing, and that is an answer. A root crom cannot
-    list is not one.
+    read is not one.
     """
     try:
-        entries = sorted(root.iterdir())
+        staged = tuple(
+            entry
+            for entry in sorted(root.iterdir())
+            if entry.name.startswith(".")
+            and not entry.name.endswith(migrate.STAGING_SUFFIX)
+            and entry.is_dir()
+        )
     except FileNotFoundError:
         return ()
     except OSError as e:
         return (Unscanned(namespace, f"{root} could not be read: {e.strerror}"),)
-    return tuple(
-        Staged(namespace, entry, measure(entry))
-        for entry in entries
-        if entry.name.startswith(".") and entry.is_dir()
-    )
+    # `measure` stays outside the handler: it already skips an entry it cannot stat and
+    # documents its number as a floor, so a permission tightened under it costs a byte
+    # count rather than the row that says the directory is there.
+    return tuple(Staged(namespace, entry, measure(entry)) for entry in staged)
 
 
 def measure(directory: Path) -> int:

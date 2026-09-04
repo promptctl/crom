@@ -23,9 +23,9 @@ from unittest import mock
 
 from click.testing import CliRunner
 
-from crom import cli, config, configwrite, doctor, mcp
+from crom import cli, config, configwrite, doctor, mcp, migrate
 from crom.config import load_ambient
-from crom.model import Conflict, CromError, ProfileRef, Reason
+from crom.model import USER_NAMESPACE, Conflict, CromError, ProfileRef, Reason
 from crom.paths import registry_file, state_home, user_config_file
 
 # README.md is the only place a reader learns the failure envelope's vocabulary, so it
@@ -167,8 +167,6 @@ class CliTest(unittest.TestCase):
         developer's real `~/.config/crom/profiles.json` and migrate their profiles
         mid-run. If this fails, stop and fix the harness before trusting any result.
         """
-        from crom import migrate
-
         self.assertTrue(str(Path.home()).startswith(str(self.root)))
         self.assertTrue(str(migrate.legacy_registry_file()).startswith(str(self.root)))
         self.assertFalse(migrate.needed())
@@ -1819,6 +1817,105 @@ class CliTest(unittest.TestCase):
         self.assertIn(f"{config_file} could not be checked", errors["myapp"])
         self.assertNotIn("user", errors)
         self.assertIn("1 namespace(s) crom could not check", self.crom("doctor"))
+
+    def test_doctor_will_not_call_a_migration_staging_directory_a_seed_leak(self):
+        """The one dot-prefixed directory here that must never be offered up for deletion.
+
+        `seed._staged` is not the only writer in a profile root. `migrate._move_staged`
+        stages a legacy profile as `.<name>.partial` under `default_profiles_root() /
+        user`, and on a same-filesystem move it renames `old_dir` away *before* that path
+        exists — so an interruption in that window leaves the `.partial` holding the only
+        copy of the profile. Reported here it would appear under this command's own
+        sentence, "left behind by an interrupted seed", beside a byte count `measure`
+        calls what deleting it would reclaim. A reader who believed either would lose
+        their cookies and logins.
+
+        Both directories are planted, and the seed's is asserted present as well as the
+        migration's absent: an exclusion that swallowed the real leak too would pass a
+        test that only looked for the `.partial`. [LAW:verifiable-goals]
+        """
+        self.crom("list")
+        root = state_home() / "profiles" / USER_NAMESPACE
+        root.mkdir(parents=True, exist_ok=True)
+        migrating = root / f".default{migrate.STAGING_SUFFIX}"
+        leaked = root / ".default.qz93kd01"
+        for directory in (migrating, leaked):
+            directory.mkdir()
+            (directory / "Cookies").write_bytes(b"x" * 2048)
+
+        found = [Path(item["path"]) for item in self._staging() if "path" in item]
+
+        self.assertEqual([leaked], found)
+
+    @unittest.skipIf(os.geteuid() == 0, "root traverses any directory, so nothing is denied")
+    def test_doctor_will_not_read_a_profile_root_it_cannot_search_as_empty(self):
+        """Listing a root and classifying what came back are one read, and can fail apart.
+
+        A root with read but no execute permission lists fine and then denies the `stat`
+        behind `is_dir` on every entry it just named. On 3.12 — the floor
+        `requires-python` promises — `Path.is_dir` re-raises anything outside
+        `pathlib._ignore_error`, and EACCES is outside it, so with the filter sitting
+        after the `try` this escaped as a traceback out of the command whose docstring
+        promises it never raises for a directory it cannot read.
+
+        The version split is why this is a test and not a note: `Path.is_dir` swallows
+        every `OSError` from 3.13 on, so the bug is invisible to a contributor on a new
+        interpreter and live on the one the project supports. Nothing but running it on
+        3.12 would have said so.
+
+        Skipped rather than adapted under root, which traverses regardless. That is not
+        the `chmod 0` failure the sibling `NotADirectoryError` test refuses — a skip
+        declines to make a claim, where that one would have passed while asserting
+        nothing.
+        """
+        self.crom("list")
+        root = state_home() / "profiles" / USER_NAMESPACE
+        (root / ".default.qz93kd01").mkdir(parents=True)
+        # Restored here rather than through `addCleanup`, which runs after `tearDown` has
+        # already removed the sandbox — and an unsearchable directory is one `tearDown`
+        # cannot remove either.
+        root.chmod(0o600)
+        try:
+            found = self._staging()
+        finally:
+            root.chmod(0o700)
+
+        self.assertEqual([], [item for item in found if "path" in item])
+        self.assertIn(f"{root} could not be read", found[0]["error"])
+
+    def test_doctor_still_scans_a_namespace_whose_mapping_crom_forgot(self):
+        """The index that drives this half is lossy, and loses exactly the case it is for.
+
+        `registry.forget_mapping` drops a namespace the moment `resolve.scope_for` meets a
+        config it can no longer load, and deliberately keeps the ports — a config file
+        that is missing right now is not proof the project is gone. So a project whose
+        config was deleted and then referred to from elsewhere went on reporting
+        `orphaned` reservations while its profile root was never looked at and never
+        mentioned: silence, from the half of the command whose whole point is that a root
+        crom did not check says so. [LAW:no-silent-failure]
+
+        Driving the scan from the ledger as well as the index is what closes it, and the
+        ledger is the register that cannot lose the namespace — releasing a reservation is
+        a separate, deliberate act. The forget is triggered through a real cross-project
+        reference rather than by calling `forget_mapping` directly, so this fails if that
+        call site moves. [LAW:behavior-not-structure]
+        """
+        self._interrupted_seed(
+            f'namespace = "myapp"\n\n[profiles.dev]\nseed = "{self.root / "seed"}"\n'
+        )
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        (self.project / ".crom.toml").unlink()
+
+        self.crom("config", "myapp/dev", cwd=elsewhere, expect=3)
+        self.assertEqual({}, json.loads((state_home() / "registry.json").read_text())["namespaces"])
+
+        found = self._staging()
+
+        leaked = [item for item in found if "path" in item]
+        self.assertEqual(1, len(leaked), found)
+        self.assertEqual("myapp", leaked[0]["namespace"])
+        self.assertEqual(4096, leaked[0]["bytes"])
 
     # --- removal --------------------------------------------------------------------
 

@@ -804,6 +804,24 @@ class FailedProfile:
 ProfileEntry = ResolvedProfile | FailedProfile
 
 
+def namespace_of(ref: str) -> str:
+    """The namespace a ledger key names, for a reader that must survive a bad key.
+
+    `ProfileRef.__str__` owns the `namespace/name` format and this is its inverse, here
+    rather than spelled again at the one call site. [LAW:one-source-of-truth]
+
+    Total where `parse_ref` is partial, and deliberately so. `parse_ref` raises on a key
+    with a second `/` or a component that fails `validate_name`, and a hand-edited ledger
+    is the only way to release an orphaned reservation today — so `crom doctor`, the
+    command a person runs *because* the ledger is a mess, cannot afford a reader that dies
+    on one. A namespace this returns is a name to look for on disk, never a name to act
+    on: the worst a nonsense key yields is a directory that does not exist, which its
+    caller already answers with "nothing there". [LAW:no-silent-failure] guessing is safe
+    here only because the guess is checked against the filesystem before it means anything.
+    """
+    return ref.split("/", 1)[0]
+
+
 def parse_ref(text: str, ambient: str) -> ProfileRef:
     """Parse a user-typed reference; a bare name resolves in the ambient namespace.
 
