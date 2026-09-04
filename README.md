@@ -154,6 +154,14 @@ is deliberate: one broken declaration is reported rather than sinking the whole 
 since `crom list` is what you run *because* something is wrong. Check for `error` before
 reading `port` and friends.
 
+`crom doctor --json` is neither shape. It answers with an object: `registry`, the path of
+crom's port ledger, and `reservations`, the rows in it. The path is in the answer because
+editing that file by hand is the only way to release a single reservation no config
+declares any more. A row carries `ref` whole — `"myapp/beta"` — rather than split into
+`namespace` and `profile` the way the record does. Nothing rejects a ledger key a
+hand-edit invented, so a row may name something that is not a legal `namespace/name` at
+all, and `crom doctor` reports it rather than refusing it.
+
 `crom --version` prints the version alone on one line, so a script reads it without
 splitting a sentence. It reports the crom you have installed rather than any checkout you
 happen to be standing in, which is the number a bug report needs.
@@ -228,14 +236,14 @@ unfamiliar reason still lands somewhere sensible.
 
 Not every failure gets an envelope, and the rule is that one appears exactly when a
 command that takes `--json` was given it and parsed it. `up`, `down`, `restart`, `show`,
-`list` and `config` take the flag; `add`, `rm`, `init`, `port`, `env`, `mcp` and `forget`
-answer in prose only. Bad usage — exit `2`, an unknown flag or a missing argument — is
-parsing itself failing, so the `--json` on that line was never understood either: there
-is no flag to honour, and the answer stays prose. `crom --version` is not a command and
-answers in prose for the same reason. A broken pipe is deliberately outside all of it:
-when `crom list | head` loses its reader mid-write, crom ends silently with exit `1` and
-nothing on either stream, because a reader that has already left is the one failure with
-nowhere to put a document.
+`list`, `config` and `doctor` take the flag; `add`, `rm`, `init`, `port`, `env`, `mcp` and
+`forget` answer in prose only. Bad usage — exit `2`, an unknown flag or a missing
+argument — is parsing itself failing, so the `--json` on that line was never understood
+either: there is no flag to honour, and the answer stays prose. `crom --version` is not a
+command and answers in prose for the same reason. A broken pipe is deliberately outside
+all of it: when `crom list | head` loses its reader mid-write, crom ends silently with
+exit `1` and nothing on either stream, because a reader that has already left is the one
+failure with nowhere to put a document.
 
 One gap worth knowing, because it looks like an envelope and is not. The `error` string a
 `crom list --json` element carries for a declaration it could not resolve is a sentence
@@ -260,6 +268,7 @@ crom config [REF]             which config is in effect, and the exact Chrome co
 crom port [REF]               print the port
 crom env [REF]                print shell exports
 crom mcp [REF]                write .mcp.json
+crom doctor                   every port reservation in the ledger, declared or not
 crom forget NAMESPACE         drop a namespace deliberately, releasing its ports
 ```
 
@@ -283,16 +292,17 @@ successfully and reported as having no window, rather than as a window you canno
 ## How collisions are avoided
 
 Ports come from one ledger at `~/.local/state/crom/registry.json`, shared by every
-project on the machine. A profile is assigned a free port the first time it resolves and
-keeps it forever, so a checked-in `.mcp.json` or an app's `CDP_URL` stays correct. Before
-handing out an *assigned* port crom binds it, which catches the unrelated dev server that
-grabbed 9222 an hour ago. A port you pin yourself skips that search, so its availability
-is checked at launch instead — `crom up` names the process holding it rather than timing
-out. Two projects that pin the same port get an error naming the config file on the other
-side, not a mysterious launch failure. Every read-modify-write of the ledger takes an
-exclusive lock, because several agents each bringing up a browser at once is the case
-crom is for — and the config files crom edits and the profile directories it seeds are
-locked the same way, for the same reason.
+project on the machine — `crom doctor` prints every reservation in it, sorted by port,
+so a hole in the run is visible. A profile is assigned a free port the first time it
+resolves and keeps it forever, so a checked-in `.mcp.json` or an app's `CDP_URL` stays
+correct. Before handing out an *assigned* port crom binds it, which catches the unrelated
+dev server that grabbed 9222 an hour ago. A port you pin yourself skips that search, so
+its availability is checked at launch instead — `crom up` names the process holding it
+rather than timing out. Two projects that pin the same port get an error naming the
+config file on the other side, not a mysterious launch failure. Every read-modify-write
+of the ledger takes an exclusive lock, because several agents each bringing up a browser
+at once is the case crom is for — and the config files crom edits and the profile
+directories it seeds are locked the same way, for the same reason.
 
 Profile data is namespaced the same way: `<state_dir>/<namespace>/<name>`. Two projects
 can both have a `dev` profile and never see each other's cookies.

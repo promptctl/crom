@@ -37,6 +37,23 @@ class Reservation:
     pinned: bool
     source: str | None
 
+    def describe(self, *, ref: str) -> dict:
+        """One ledger row as a machine reads it, under the key the ledger filed it as.
+
+        `ref` arrives as an argument because it is the row's key and not a field of the
+        row, the same way `ResolvedProfile.describe` takes the liveness it does not own.
+
+        It stays whole, where a profile record splits the identical string into
+        `namespace` and `profile`. Both writers into `ports` key on `str(ProfileRef)`,
+        but nothing rejects a key that reached the table another way — `_read` checks
+        every entry and no name — and hand-editing this file is the only way to release
+        one orphaned reservation today. Splitting here would be a second reader of a
+        format `ProfileRef.__str__` owns, and it would answer for strings that format
+        never produced. [LAW:types-are-the-program] the row claims what a ledger key is
+        and no more.
+        """
+        return {"ref": ref, "port": self.port, "pinned": self.pinned, "source": self.source}
+
 
 def _empty() -> dict:
     return {"version": SCHEMA_VERSION, "ports": {}, "namespaces": {}}
