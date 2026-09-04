@@ -18,9 +18,9 @@ from unittest import mock
 
 from click.testing import CliRunner
 
-from crom import cli, config, configwrite
+from crom import cli, config, configwrite, mcp
 from crom.config import load_ambient
-from crom.model import CromError
+from crom.model import CromError, ProfileRef
 from crom.paths import state_home, user_config_file
 
 
@@ -1124,7 +1124,8 @@ class CliTest(unittest.TestCase):
         port = self.crom("port").strip()
         self.crom("mcp")
         entry = json.loads((self.project / ".mcp.json").read_text())
-        self.assertIn(f"http://127.0.0.1:{port}", entry["mcpServers"]["chrome-devtools-mcp"]["args"])
+        entry_key = mcp.entry_key(ProfileRef("myproj", "default"))
+        self.assertIn(f"http://127.0.0.1:{port}", entry["mcpServers"][entry_key]["args"])
 
     # --- collision avoidance, the whole point ---------------------------------------
 
