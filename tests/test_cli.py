@@ -1838,6 +1838,125 @@ class CliTest(unittest.TestCase):
             result = self.invoke("list", expect=1)
         self.assertEqual(result.stderr.strip(), "Error: Cannot send")
 
+    @contextlib.contextmanager
+    def _two_profiles_pinning_one_port(self):
+        """A config `list` refuses to load, restored afterwards so one case cannot
+        decide what the next one sees."""
+        path = self.project / ".crom.toml"
+        original = path.read_text()
+        path.write_text(original + "\n[profiles.ci]\nport = 9401\n")
+        try:
+            yield
+        finally:
+            path.write_text(original)
+
+    def test_a_json_caller_gets_the_failure_as_data(self):
+        """A caller that asked for JSON gets a document on stdout for every exit code.
+
+        Each refusal is run twice — once plain, once with `--json` — because the promise
+        is that the flag *adds* the machine's copy rather than trading the human's away.
+        Comparing the two runs is what makes that checkable: stderr has to come back
+        byte-identical, so no script reading crom's messages today is disturbed, and plain
+        stdout has to stay empty, because `crom list > out` already assumes it.
+
+        The message is asserted to be the stderr sentence itself, not merely a non-empty
+        string: it is one string rendered to two streams, and a test that accepted any
+        text would pass against two wordings that had drifted apart.
+        [LAW:one-source-of-truth]
+        """
+        self.crom("init")
+        self.crom("add", "dev", "--port", "9401")
+
+        refusals = (
+            # 3: a namespace nothing declares.
+            (("up", "nosuchns/x"), contextlib.nullcontext(), 3, "not_found"),
+            # 1: the operating system refusing the process table.
+            (
+                ("list",),
+                mock.patch(
+                    "crom.chrome.scan",
+                    side_effect=PermissionError(13, "Permission denied", "/bin/ps"),
+                ),
+                1,
+                "os_error",
+            ),
+            # 4: two profiles pinning one port, which `list` meets while loading.
+            (("list",), self._two_profiles_pinning_one_port(), 4, "conflict"),
+        )
+
+        for args, refusal, code, kind in refusals:
+            with self.subTest(command=args[0], code=code):
+                with refusal:
+                    plain = self.invoke(*args, expect=code)
+                    asked = self.invoke(*args, "--json", expect=code)
+
+                self.assertEqual(plain.stdout, "")
+                self.assertEqual(asked.stderr, plain.stderr)
+
+                error = json.loads(asked.stdout)["error"]
+                self.assertEqual(error["code"], code)
+                self.assertEqual(error["kind"], kind)
+                self.assertEqual(f"Error: {error['message']}", plain.stderr.strip())
+
+    def test_the_kind_says_what_the_exit_code_cannot(self):
+        """Both of these are exit 1, and they are not the same failure.
+
+        crom refusing and the OS refusing share a code, because the published vocabulary
+        has four values and cannot grow without breaking the contract a script branches
+        on. So `kind` is the field that separates them — one means the request was wrong,
+        the other means the machine got in the way, and only the second is worth a retry.
+
+        This is also what stops `kind` from being `code` spelled a second time: derive one
+        from the other and this test fails, because there is no function from 1 to both
+        answers. [LAW:one-source-of-truth]
+        """
+        self.crom("init")
+
+        kinds = []
+        for error in (
+            PermissionError(13, "Permission denied", "/bin/ps"),
+            CromError("ps is not on PATH"),
+        ):
+            with mock.patch("crom.chrome.scan", side_effect=error):
+                result = self.invoke("list", "--json", expect=1)
+            kinds.append(json.loads(result.stdout)["error"]["kind"])
+
+        self.assertEqual(kinds, ["os_error", "failure"])
+
+    def test_every_command_offering_json_answers_a_failure_in_json(self):
+        """The envelope belongs to the flag, so every command carrying the flag has it.
+
+        The commands are discovered from click rather than listed here, which is the
+        whole claim: `--json` is one declaration whose callback records that it was
+        passed, so a command added tomorrow is covered without anyone remembering to
+        cover it. Naming them instead would test six instances of a rule and leave the
+        rule itself unasserted. [LAW:single-enforcer]
+
+        `load_ambient` is the seam because all six cross it to learn what is declared —
+        one refusal, six commands, and no command contains a line about envelopes.
+        """
+        self.crom("init")
+        offering = [
+            name
+            for name in cli.main.list_commands(None)
+            if any("--json" in option.opts for option in cli.main.get_command(None, name).params)
+        ]
+        # A discovery that found nothing would loop zero times and assert nothing — an
+        # answer-shaped void wearing a passing test as a costume. New commands may join
+        # freely; the loop is what covers them. [LAW:parse-dont-validate]
+        self.assertGreaterEqual(set(offering), {"up", "down", "restart", "show", "list", "config"})
+
+        for name in offering:
+            with self.subTest(command=name):
+                with mock.patch(
+                    "crom.cli.load_ambient", side_effect=CromError("no ambient config")
+                ):
+                    result = self.invoke(name, "--json", expect=1)
+                self.assertEqual(
+                    json.loads(result.stdout)["error"],
+                    {"code": 1, "kind": "failure", "message": "no ambient config"},
+                )
+
 
 
 if __name__ == "__main__":

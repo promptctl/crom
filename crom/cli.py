@@ -20,6 +20,7 @@ import shlex
 import shutil
 from pathlib import Path
 from stat import S_ISREG
+from typing import NamedTuple
 
 import click
 
@@ -63,31 +64,111 @@ EXIT_FAILURE = 1
 EXIT_NOT_FOUND = 3
 EXIT_CONFLICT = 4
 
-# Which exception means which exit code — every exception this CLI answers for, and the
-# only place a code is assigned. [LAW:dataflow-not-control-flow] the mapping is a table
-# consulted once, not a chain of except clauses repeated per command.
-_EXIT_CODES = (
-    (NotFound, EXIT_NOT_FOUND),
-    (Conflict, EXIT_CONFLICT),
-    (CromError, EXIT_FAILURE),
-    (OSError, EXIT_FAILURE),
+class _Answer(NamedTuple):
+    """What crom answers for one class of error: the code a script branches on, and the
+    kind that says what happened when the code cannot."""
+
+    error: type[Exception]
+    code: int
+    kind: str
+
+
+# Every exception this CLI answers for, and the only place a code or a kind is assigned.
+# [LAW:dataflow-not-control-flow] the mapping is a table consulted once, not a chain of
+# except clauses repeated per command.
+#
+# `kind` is not `code` spelled twice. crom refusing and the operating system refusing are
+# both exit 1, and `kind` is the only field that separates them — which matters, because
+# one means the user's request was wrong and the other means the machine got in the way.
+# Exit codes are a published four-value vocabulary that cannot grow without breaking the
+# contract; kinds can, which is where `.3`'s finer slugs will land.
+_ANSWERS = (
+    _Answer(NotFound, EXIT_NOT_FOUND, "not_found"),
+    _Answer(Conflict, EXIT_CONFLICT, "conflict"),
+    _Answer(CromError, EXIT_FAILURE, "failure"),
+    _Answer(OSError, EXIT_FAILURE, "os_error"),
 )
+
+# Where a parsed `--json` is recorded, under the key `_json_option` writes and `_failure`
+# reads. `Context.meta` and not the `_Session` on `ctx.obj`: meta is one dict shared by
+# click's whole context tree, so it is readable from the group without depending on the
+# group callback having already built a session.
+_JSON_REQUESTED = "crom.json_requested"
+
+
+def _json_option(command):
+    """The `--json` flag: one declaration, which is also how the boundary comes to know.
+
+    `CromGroup.invoke` sees an empty `ctx.params`, because the flag belongs to the
+    subcommand and click hands a parent no handle on its child's context. So the value
+    has to be left somewhere the boundary can find it, and click runs this callback while
+    parsing — meaning the option and the recording are a single declaration.
+    [LAW:single-enforcer] the alternative was every `--json` command assigning the flag
+    onto its session on the way past: N places to enforce one rule, which is a rule the
+    next command gets written without. Here there is nothing to remember, because there
+    is nothing to do.
+
+    One declaration also means one help string. Five of the six commands carrying this
+    flag declared it with none, so `crom up --help` documented `--json` and
+    `crom list --help` left a reader to guess. [LAW:one-source-of-truth]
+    """
+
+    def remember(ctx: click.Context, param: click.Parameter, value: bool) -> bool:
+        ctx.meta[_JSON_REQUESTED] = value
+        return value
+
+    return click.option(
+        "--json", "as_json", is_flag=True, callback=remember, help="Emit the result as JSON."
+    )(command)
+
+
+def _json_text(payload) -> str:
+    """How crom spells JSON, for the one reader who cannot tell a result from a failure
+    until it has parsed one: both are the same document format, indented the same way."""
+    return json.dumps(payload, indent=2)
 
 
 class _Failure(click.ClickException):
-    def __init__(self, message: str, exit_code: int):
-        super().__init__(message)
-        self.exit_code = exit_code
+    """A failed command, rendered for whichever reader asked for it.
 
+    click's own handler prints the prose to stderr, and `show` adds the same failure as
+    data on stdout under the same `--json` the success path already answers to. Both, and
+    never one instead of the other: stderr stays byte-for-byte what it was before this
+    envelope existed, so nothing reading crom's messages today has to change, while a
+    caller that asked for JSON and got zero bytes on failure now gets a document.
 
-def _failure(error: Exception, message: str) -> _Failure:
-    """`message`, carrying whichever exit code `_EXIT_CODES` assigns `error`.
-
-    [LAW:one-source-of-truth] the wording of a failure and its code are two questions:
-    each arm below answers the first for its own kind of error, and none of them answers
-    the second, so a code cannot be spelled anywhere but the table.
+    [LAW:one-source-of-truth] the sentence on stderr and `message` in the envelope are one
+    string rendered twice, not two wordings that can drift apart.
     """
-    return _Failure(message, next(c for kind, c in _EXIT_CODES if isinstance(error, kind)))
+
+    def __init__(self, message: str, code: int, kind: str, as_json: bool):
+        super().__init__(message)
+        self.exit_code = code
+        self.kind = kind
+        self.as_json = as_json
+
+    def show(self, file=None) -> None:
+        super().show(file)
+        # The last inch of rendering, where the flag is the whole discriminator: a caller
+        # that did not ask for JSON asked for stdout to stay empty on failure, which is
+        # what every `crom ... > out` already assumes.
+        if self.as_json:
+            envelope = {"code": self.exit_code, "kind": self.kind, "message": self.format_message()}
+            click.echo(_json_text({"error": envelope}))
+
+
+def _failure(error: Exception, message: str, ctx: click.Context) -> _Failure:
+    """`message`, carrying whichever code and kind `_ANSWERS` assigns `error`.
+
+    [LAW:one-source-of-truth] the wording of a failure and its classification are two
+    questions: each arm of `invoke` answers the first for its own kind of error, and
+    neither answers the second, so a code cannot be spelled anywhere but the table.
+    """
+    answer = next(a for a in _ANSWERS if isinstance(error, a.error))
+    # Absent whenever nothing parsed a `--json` on this invocation — a command that has no
+    # such flag, or a failure raised in `main` before any subcommand was reached. Not
+    # asking is the honest reading of that, so the default is a value and not a branch.
+    return _Failure(message, answer.code, answer.kind, ctx.meta.get(_JSON_REQUESTED, False))
 
 
 # How `crom --help` groups its commands, as data rather than as prose that has to be
@@ -132,7 +213,7 @@ class CromGroup(click.Group):
         try:
             return super().invoke(ctx)
         except CromError as error:
-            raise _failure(error, str(error)) from error
+            raise _failure(error, str(error), ctx) from error
         except OSError as error:
             # `errno` and not `BrokenPipeError`, because click's own handler keys on
             # `errno.EPIPE` for any `OSError` while `BrokenPipeError` also carries
@@ -147,7 +228,7 @@ class CromGroup(click.Group):
             # missing halves drop out as values rather than as branches.
             # [LAW:dataflow-not-control-flow]
             parts = (error.filename, error.strerror or error)
-            raise _failure(error, ": ".join(str(part) for part in parts if part)) from error
+            raise _failure(error, ": ".join(str(part) for part in parts if part), ctx) from error
 
     def format_commands(self, ctx, formatter) -> None:
         """Render the command list in sections, and never omit a command.
@@ -207,8 +288,10 @@ class _Session:
 
 
 def _emit(as_json: bool, payload, lines: list[str]) -> None:
-    """Render one result. The last inch of UI, and the only place output format matters."""
-    click.echo(json.dumps(payload, indent=2) if as_json else "\n".join(lines))
+    """Render one successful result. The last inch of UI, and the only place a *result*
+    chooses its format — a failure has two readers at once, so it renders in
+    `_Failure.show`."""
+    click.echo(_json_text(payload) if as_json else "\n".join(lines))
 
 
 def _status(profile: ResolvedProfile, live: dict[str, tuple[int, ...]]) -> tuple[bool, tuple[int, ...]]:
@@ -335,7 +418,7 @@ def _start_under_lock(profile: ResolvedProfile) -> tuple[bool, tuple[int, ...]]:
 
 @main.command("up")
 @click.argument("ref", required=False, default="default")
-@click.option("--json", "as_json", is_flag=True, help="Emit the profile record as JSON.")
+@_json_option
 @click.pass_obj
 def up_cmd(session: _Session, ref: str, as_json: bool):
     """Launch a profile, or report the running one. Idempotent."""
@@ -360,7 +443,7 @@ def up_cmd(session: _Session, ref: str, as_json: bool):
 
 @main.command("down")
 @click.argument("ref", required=False, default="default")
-@click.option("--json", "as_json", is_flag=True)
+@_json_option
 @click.pass_obj
 def down_cmd(session: _Session, ref: str, as_json: bool):
     """Stop a running profile."""
@@ -385,7 +468,7 @@ def down_cmd(session: _Session, ref: str, as_json: bool):
 
 @main.command("restart")
 @click.argument("ref", required=False, default="default")
-@click.option("--json", "as_json", is_flag=True)
+@_json_option
 @click.pass_obj
 def restart_cmd(session: _Session, ref: str, as_json: bool):
     """Stop a profile and start it again on its current config."""
@@ -441,7 +524,7 @@ def restart_cmd(session: _Session, ref: str, as_json: bool):
 
 @main.command("show")
 @click.argument("ref", required=False, default="default")
-@click.option("--json", "as_json", is_flag=True)
+@_json_option
 @click.pass_obj
 def show_cmd(session: _Session, ref: str, as_json: bool):
     """Bring a profile's window to the front, launching it if it is not running."""
@@ -487,7 +570,7 @@ def show_cmd(session: _Session, ref: str, as_json: bool):
 
 @main.command("list")
 @click.option("--all", "everything", is_flag=True, help="Include every namespace crom knows.")
-@click.option("--json", "as_json", is_flag=True)
+@_json_option
 @click.pass_obj
 def list_cmd(session: _Session, everything: bool, as_json: bool):
     """List the profiles addressable from here."""
@@ -1052,7 +1135,7 @@ def init_cmd(namespace: str | None, seed_text: str | None):
 
 @main.command("config")
 @click.argument("ref", required=False)
-@click.option("--json", "as_json", is_flag=True)
+@_json_option
 @click.pass_obj
 def config_cmd(session: _Session, ref: str | None, as_json: bool):
     """Show the config in effect, and how a profile resolves flag by flag.
