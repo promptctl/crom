@@ -139,6 +139,13 @@ in a config and in your shell, and `CROM_REF` is the joined `namespace/name`.
 }
 ```
 
+Two commands add a key to that record. `crom restart --json` adds `stopped`, the pids it
+killed, which is empty when the profile was not running — that is the one distinction the
+command exists to report, and the record alone cannot carry it because the record
+describes the profile rather than the act. `crom show --json` adds `started`, whether it
+had to launch the browser first, and `windows`, how many came forward — zero for a
+headless profile, which is raised successfully and simply has no window to show for it.
+
 `crom list --json` gives an array, but not every element has that shape. A profile that
 could not be resolved appears as `{"namespace", "profile", "ref", "error"}`, and with
 `--all` a namespace whose config file is gone appears as `{"namespace", "error"}`. That
@@ -155,6 +162,8 @@ or namespace, `4` a port or declaration conflict.
 crom                          launch the default profile
 crom up [REF]                 launch, or report the running browser
 crom down [REF]               stop it
+crom restart [REF]            stop it and start it again on its current config
+crom show [REF]               bring its window to the front, launching it if needed
 crom list [--all]             profiles addressable from here; --all covers every namespace
 crom add NAME [--seed SEED]   declare a profile in the config governing this directory
 crom rm REF                   stop it if running, undeclare it, release its port, delete its data
@@ -171,6 +180,18 @@ crom forget NAMESPACE         drop a namespace deliberately, releasing its ports
 `default`, with two exceptions: `crom config` without a REF reports the ambient scope
 alone (which config is in effect, and what it declares) rather than resolving a profile,
 and `crom rm` requires a REF — it will not guess which profile you meant to delete.
+
+`crom restart` holds one profile lock across both halves, so a concurrent `crom up` or
+`crom rm` lands wholly before it or wholly after rather than in the gap between the stop
+and the start. Typing `crom down && crom up` leaves that gap open.
+
+`crom show` is the one macOS-only command. Every crom-managed Chrome is the same
+application bundle, so `activate` cannot pick between them — it raises whichever instance
+the window server prefers. crom targets the exact process instead, which is unambiguous
+however many are running, and that needs AppleScript. macOS gates it behind Automation
+access granted to the program that ran crom, not to crom itself; when that is withheld,
+crom names the System Settings pane that grants it. A profile running headless is raised
+successfully and reported as having no window, rather than as a window you cannot find.
 
 ## How collisions are avoided
 
@@ -223,7 +244,8 @@ profile back.
 
 A profile you refer to but never declared gets declared, exactly as `crom add <name>`
 with no options would declare it — a bare stanza, so `[defaults]` still governs its seed.
-That covers `crom up`, `crom port`, `crom env`, `crom mcp`, and `crom config <ref>`, and
+That covers `crom up`, `crom restart`, `crom show`, `crom port`, `crom env`, `crom mcp`,
+and `crom config <ref>`, and
 the case it fires in most is a bare `crom up` in a project whose `.crom.toml` declares no
 profiles at all, which used to exit 3 for want of the `default` all of those commands
 default to. The cost is that a mistyped ref no longer errors: it writes a declaration into
