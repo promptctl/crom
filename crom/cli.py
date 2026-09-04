@@ -1594,6 +1594,12 @@ def doctor_cmd(as_json: bool):
     it any more — or `unchecked`, which is crom refusing to guess about a config it could
     not read.
 
+    Each also carries who holds its port right now, which is a separate question with a
+    separate answer: `idle` if nothing does, `own` if this profile's own browser does,
+    `foreign` if something else does, or `unprobed` if crom could not tell. `foreign` is
+    the one to act on — only `crom up` checks that a port is still crom's, so `crom port`,
+    `crom env` and `crom mcp` will hand out a number a stranger is already answering on.
+
     Then every staging directory under a profile root. Seeding builds a profile beside its
     final path and moves it in only once it is whole, so a `crom up` killed mid-copy
     leaves the half-built copy behind — dot-prefixed, so `ls` hides it, and the retry
@@ -1616,11 +1622,14 @@ def doctor_cmd(as_json: bool):
             *(
                 f"  {row.held.port:<6}{row.ref:30s}"
                 f"{'pinned' if row.held.pinned else '':8s}{row.standing.slug:11s}"
-                # The finding stands where the bare source path stood, and never loses
-                # it: every finding opens with the config crom consulted, or says that
-                # the ledger records none. [LAW:polishing-by-subtraction] the column that
-                # had to spell its own fallback no longer decides anything.
-                f"{row.standing.finding}"
+                f"{row.liveness.slug:10s}"
+                # Both findings, joined, on every row. The standing's names the config
+                # crom consulted or says the ledger records none; the liveness's is the
+                # only place a reader learns *why* crom could not tell who holds a port,
+                # which no slug can carry. Joining them keeps the line the same shape for
+                # every row rather than growing a second line for the rows that have
+                # something to add. [LAW:dataflow-not-control-flow]
+                f"{row.standing.finding} — {row.liveness.finding}"
                 for row in found.rows
             ),
             f"{len(found.staged)} staging directory(s) from a seed interrupted or still running",

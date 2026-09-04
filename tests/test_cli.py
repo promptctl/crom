@@ -83,8 +83,16 @@ class CliTest(unittest.TestCase):
         self.env.start()
         self.scan = mock.patch("crom.chrome.scan", return_value={})
         self.scan.start()
+        # The port table is an external system for the same reason the process table is,
+        # and `crom doctor` now asks it about every reservation. Unstubbed, a developer
+        # running this suite with their own Chrome on 9222 would see rows this file never
+        # wrote. A test that is *about* a held port names the port it holds, inline, the
+        # way the tests about a running browser name the directory.
+        self.ports = mock.patch("crom.chrome.port_is_free", return_value=True)
+        self.ports.start()
 
     def tearDown(self):
+        self.ports.stop()
         self.scan.stop()
         self.env.stop()
         self.tmp.cleanup()
@@ -1419,6 +1427,12 @@ class CliTest(unittest.TestCase):
                 "source": str(self.project / ".crom.toml"),
                 "standing": "declared",
                 "finding": f"{self.project / '.crom.toml'} declares it",
+                # The second verdict, published beside the first rather than folded into
+                # it: this row is declared *and* nothing is on its port, and a reader who
+                # only ever sees one of those cannot tell it from a row whose port a
+                # stranger holds.
+                "liveness": "idle",
+                "liveness_finding": "nothing holds port 9333",
             },
             answer["reservations"],
         )
@@ -1456,14 +1470,24 @@ class CliTest(unittest.TestCase):
                 # ledger can hold.
                 "standing": "unchecked",
                 "finding": "the ledger records no config for it",
+                # `unchecked` about its config and answered about its port, on one row.
+                # Nothing holds 9444, and that is settled without ever naming a profile
+                # directory — which is the only reason a key this shape can be answered
+                # about at all.
+                "liveness": "idle",
+                "liveness_finding": "nothing holds port 9444",
             },
             rows,
         )
 
+    def _rows(self) -> dict[str, dict]:
+        """Every reservation row, keyed by the ledger key it was filed under."""
+        rows = json.loads(self.crom("doctor", "--json"))["reservations"]
+        return {row["ref"]: row for row in rows}
+
     def _standings(self) -> dict[str, str]:
         """Every reservation's standing, keyed by the ledger key it was filed under."""
-        rows = json.loads(self.crom("doctor", "--json"))["reservations"]
-        return {row["ref"]: row["standing"] for row in rows}
+        return {ref: row["standing"] for ref, row in self._rows().items()}
 
     def test_doctor_separates_a_reservation_nothing_declares_from_one_that_lives(self):
         """The epic's own reproduction, and the whole of this ticket.
@@ -1580,6 +1604,213 @@ class CliTest(unittest.TestCase):
 
         self.assertEqual("orphaned", standings["a/b/c"])
         self.assertEqual("orphaned", standings["MyApp/UPPER"])
+
+    # --- who holds the port a reservation names -------------------------------------
+
+    def _two_profiles(self) -> None:
+        """Two reservations on ports this file chose, so a held port is one it named."""
+        (self.project / ".crom.toml").write_text(
+            'namespace = "myapp"\n\n[profiles.alpha]\nport = 9401\n'
+            "[profiles.beta]\nport = 9402\n"
+        )
+        self.crom("list")  # resolving both stanzas is what reserves both ports
+
+    def test_doctor_reports_a_reservation_whose_port_a_stranger_holds(self):
+        """The finding this ticket exists for, and why it cannot be a fourth standing.
+
+        crom promises a port that never moves, but `crom port`, `crom env` and `crom mcp`
+        hand the number out with no liveness check — only `crom up` verifies, through
+        `chrome._require_port_available`. So a tool wired by `crom mcp` connects to
+        whatever is answering there, and nothing reported that until now.
+
+        The row is `declared` in the same breath: the config is perfect, and the machine
+        is not. A doctor that answered this on the standing axis would have to call a
+        reservation both `declared` and something else at once, which one enum cannot say.
+        [LAW:types-are-the-program]
+
+        `beta` is what makes this a detection rather than a label — a doctor that called
+        every reservation `foreign` passes the `alpha` assertion on its own.
+        [LAW:verifiable-goals]
+        """
+        self._two_profiles()
+
+        with mock.patch("crom.chrome.port_is_free", lambda port: port != 9401):
+            rows = self._rows()
+
+        self.assertEqual("foreign", rows["myapp/alpha"]["liveness"])
+        self.assertEqual("declared", rows["myapp/alpha"]["standing"])
+        self.assertEqual("idle", rows["myapp/beta"]["liveness"])
+
+    def test_doctor_does_not_call_a_profiles_own_browser_a_stranger(self):
+        """The false alarm the detection is worth nothing without.
+
+        A running profile holds its port — that is what running *is* — so a doctor that
+        read a held port as a stranger would fire on every profile anyone had up, every
+        run, and the one row that matters would be lost in them.
+
+        The directory is what settles it, because the directory is the identity
+        `chrome.scan` groups by: crom knows what it would have launched this profile with,
+        and asks the process table whether anything is there.
+        """
+        self._two_profiles()
+        directory = str(state_home() / "profiles" / "myapp" / "alpha")
+
+        with (
+            mock.patch("crom.chrome.port_is_free", lambda port: port != 9401),
+            mock.patch("crom.chrome.scan", return_value={directory: (4242,)}),
+        ):
+            rows = self._rows()
+
+        self.assertEqual("own", rows["myapp/alpha"]["liveness"])
+
+    def test_doctor_finds_the_browser_of_a_profile_its_config_no_longer_declares(self):
+        """The two axes crossing, on the row where getting it wrong costs the most.
+
+        Drop a profile from the config while its browser is up and the reservation is
+        orphaned and running at once. Deriving the profile directory from what the config
+        *declares* would find nothing for a key it no longer names, and report the user's
+        own browser as a stranger — on the one row a reader is already being told to act
+        on. So the directory is composed from the ledger key instead, through
+        `model.ref_of`, and the two verdicts are decided independently.
+        """
+        self._two_profiles()
+        (self.project / ".crom.toml").write_text(
+            'namespace = "myapp"\n\n[profiles.beta]\nport = 9402\n'
+        )
+        directory = str(state_home() / "profiles" / "myapp" / "alpha")
+
+        with (
+            mock.patch("crom.chrome.port_is_free", lambda port: port != 9401),
+            mock.patch("crom.chrome.scan", return_value={directory: (4242,)}),
+        ):
+            rows = self._rows()
+
+        self.assertEqual("orphaned", rows["myapp/alpha"]["standing"])
+        self.assertEqual("own", rows["myapp/alpha"]["liveness"])
+
+    def test_doctor_will_not_name_a_holder_for_a_key_that_is_not_a_reference(self):
+        """A hand-edited key on a held port, and the false `foreign` it must not print.
+
+        Hand-editing the ledger is the only way to release an orphan today, so keys
+        `ProfileRef` refuses really do reach here. Crom cannot name the directory such a
+        key's browser would run in, so it cannot ask whether that browser is up — and a
+        `foreign` reached by finding no browser on a directory that was never named is not
+        a weaker finding, it is a wrong one. [LAW:no-silent-failure]
+        """
+        self._two_profiles()
+        ledger = json.loads(registry_file().read_text())
+        # Sourced to the config crom *can* read, so what goes unanswered is the key alone:
+        # against a config it could not read the row would be unprobed for that reason
+        # instead, and this would pass without `ref_of` ever being asked.
+        ledger["ports"]["a/b/c"] = {
+            "port": 9403,
+            "pinned": False,
+            "source": str(self.project / ".crom.toml"),
+        }
+        registry_file().write_text(json.dumps(ledger))
+
+        with mock.patch("crom.chrome.port_is_free", lambda port: port != 9403):
+            rows = self._rows()
+
+        self.assertEqual("unprobed", rows["a/b/c"]["liveness"])
+        self.assertIn("a/b/c", rows["a/b/c"]["liveness_finding"])
+
+    def test_doctor_answers_for_a_free_port_even_when_the_key_names_no_profile(self):
+        """A port nothing holds is answered, whoever the reservation turns out to be.
+
+        The same unresolvable key as above, with nothing on its port. Refusing to answer
+        here would make `unprobed` mean two different things — "a stranger might be there"
+        and "nothing is there" — on the rows most likely to have been stranded by a hand
+        repair, which are exactly the ports a release is going to reclaim.
+        """
+        self._two_profiles()
+        ledger = json.loads(registry_file().read_text())
+        # Sourced to the config crom *can* read, so what goes unanswered is the key alone:
+        # against a config it could not read the row would be unprobed for that reason
+        # instead, and this would pass without `ref_of` ever being asked.
+        ledger["ports"]["a/b/c"] = {
+            "port": 9403,
+            "pinned": False,
+            "source": str(self.project / ".crom.toml"),
+        }
+        registry_file().write_text(json.dumps(ledger))
+
+        self.assertEqual("idle", self._rows()["a/b/c"]["liveness"])
+
+    def test_doctor_will_not_name_a_holder_for_a_reservation_whose_config_is_gone(self):
+        """Where this half parts company with the staging half, deliberately.
+
+        `test_doctor_still_finds_the_leak_of_a_project_whose_config_is_gone` has the scan
+        fall back to crom's default profile root and caveat it, because a staging
+        directory found there really is there whatever `state_dir` that config used to
+        set. This asks the opposite kind of question: it reports what it did *not* find,
+        and no browser on a directory the profile may never have used is a false
+        `foreign` rather than an incomplete answer. Same module, opposite treatment, and
+        the difference is which way the evidence runs.
+        """
+        self._two_profiles()
+        ledger = json.loads(registry_file().read_text())
+        gone = self.root / "deleted.toml"
+        ledger["ports"]["ghost/one"] = {"port": 9403, "pinned": False, "source": str(gone)}
+        registry_file().write_text(json.dumps(ledger))
+
+        with mock.patch("crom.chrome.port_is_free", lambda port: port != 9403):
+            rows = self._rows()
+
+        self.assertEqual("orphaned", rows["ghost/one"]["standing"])
+        self.assertEqual("unprobed", rows["ghost/one"]["liveness"])
+        self.assertIn(str(gone), rows["ghost/one"]["liveness_finding"])
+
+    def test_doctor_reports_a_process_table_it_cannot_read_rather_than_crashing(self):
+        """A doctor answers on the machine whose state is the problem, so it never raises.
+
+        `chrome.scan` raises when `ps` is missing or exits nonzero, and this half calls it
+        for every row at once. Unhandled that would end the command on precisely the
+        machine it was run to diagnose, and the reservations it had already judged would
+        go with it.
+        """
+        self._two_profiles()
+
+        with (
+            mock.patch("crom.chrome.port_is_free", lambda port: port != 9401),
+            mock.patch(
+                "crom.chrome.scan",
+                side_effect=Reason.PROCESS_TABLE_UNREADABLE.error(
+                    "could not read the process table: `ps` was not found on PATH.\n"
+                    "crom answers 'is this profile running' by reading `ps`."
+                ),
+            ),
+        ):
+            rows = self._rows()
+
+        self.assertEqual("unprobed", rows["myapp/alpha"]["liveness"])
+        # The first line only, the way a config that would not load is reported: the
+        # second is advice for a different command, and a row is a row.
+        self.assertEqual(
+            "could not read the process table: `ps` was not found on PATH.",
+            rows["myapp/alpha"]["liveness_finding"],
+        )
+
+    def test_doctor_reports_a_port_it_could_not_probe_rather_than_calling_it_free(self):
+        """A probe socket that cannot be made says nothing about the port.
+
+        `chrome.port_is_free` raises rather than answering when the socket itself cannot
+        be created — fd exhaustion, which is a fact about the process asking and not about
+        the port. Reading that as `idle` would be an answer shaped like a fact, on the
+        field a release is going to trust before it reclaims a number.
+        """
+        self._two_profiles()
+
+        with mock.patch(
+            "crom.chrome.port_is_free",
+            side_effect=Reason.PORT_CHECK_FAILED.error(
+                "could not check whether port 9401 is free: [Errno 24] Too many open files"
+            ),
+        ):
+            rows = self._rows()
+
+        self.assertEqual("unprobed", rows["myapp/alpha"]["liveness"])
+        self.assertIn("Too many open files", rows["myapp/alpha"]["liveness_finding"])
 
     # --- what an interrupted seed left behind ---------------------------------------
 

@@ -179,6 +179,47 @@ will not call a reservation orphaned on evidence it could not read: an absent co
 declares nothing, which is an answer, while a config that will not parse might still
 declare the profile, which is not.
 
+A row carries two more keys: `liveness`, who holds the reservation's port right now, and
+`liveness_finding`, the sentence behind that verdict. `idle` means nothing holds the port.
+`own` means the port is held and the profile's own browser is running against its profile
+directory. `foreign` means the port is held and no browser crom launched for this profile
+is running — that is the one to act on. `unprobed` means crom could not tell. The second
+sentence key is prefixed where the first is not because `finding` was already published as
+the standing's sentence, and a key means one thing forever, so a row that now carries two
+verdicts can only have one unnamed sentence.
+
+`liveness` is a separate key rather than a fourth value of `standing` because the two
+answer independent questions. `standing` is about declarations: whether the config the
+ledger names still declares this profile. `liveness` is about the machine: who is on the
+port. A reservation a config still declares can have a stranger on its port, and one
+nothing declares can be sitting idle. Folded into one key, "declared but stolen" could not
+be said at all — and that is the only combination a reader has to act on. It is worth
+acting on because crom promises a port that never moves, but `crom port`, `crom env` and
+`crom mcp` hand the number out with no liveness check, and only `crom up` verifies. So a
+tool wired up by `crom mcp` connects to whatever is answering on that port, and a stranger
+there is a stranger it drives.
+
+`own` is an inference rather than proof: crom knows something holds the port, knows its
+own browser for that profile is running, and pairs the two. `unprobed` is never a quieter
+`idle`, for the same reason `unchecked` is never a quieter `orphaned` — a reader acts on
+`idle` by treating the number as available. crom answers `unprobed` when it could not name
+the profile directory a browser holding that port would be running against, or could not
+ask at all: a ledger key that is not a legal `namespace/name`, a config it could not read,
+a config that is gone — which may have set a `state_dir` crom can no longer name — a
+process table it could not read, or a port probe it could not run. A port nothing holds is
+answered `idle` whatever else crom could not work out, because settling that needs no
+profile directory at all, so a hand-edited ledger key with nothing on its port still gets
+a real answer. `liveness_finding` is where the reason lives, and for `unprobed` it is the
+only place it appears, since no slug can carry it.
+
+The two halves of the answer treat a gone config differently, on purpose. For a namespace
+whose config file is gone, the `staging` half falls back to crom's default profile root
+and reports a caveat beside what it finds, while `liveness` declines to answer at all. The
+staging half reports what it found — a directory sitting in the default root really is
+there. Liveness would be reporting what it did not find, and "no browser on a directory
+the profile may never have used" is not an incomplete answer but a false one — and the
+verdict it would print is `foreign`, the loudest thing the command says.
+
 `staging` is the other leak crom looks for, and it costs disk rather than ports. Seeding
 builds the copy beside the profile's final path and moves it into place only once the copy
 is whole, so a `crom up` killed mid-copy — SIGKILL, a machine losing power — leaves the
@@ -325,8 +366,9 @@ crom config [REF]             which config is in effect, and the exact Chrome co
 crom port [REF]               print the port
 crom env [REF]                print shell exports
 crom mcp [REF]                write .mcp.json
-crom doctor                   every reservation in the ledger, and which ones are orphaned
-                              — and the half-built copies an interrupted seed left behind
+crom doctor                   every reservation in the ledger, which ones are orphaned,
+                              who holds each one's port, and the half-built copies an
+                              interrupted seed left behind
 crom forget NAMESPACE         drop a namespace deliberately, releasing its ports
 ```
 
@@ -351,17 +393,17 @@ successfully and reported as having no window, rather than as a window you canno
 
 Ports come from one ledger at `~/.local/state/crom/registry.json`, shared by every project
 on the machine — `crom doctor` prints every reservation in it, sorted by port, so a hole
-in the run is visible, and says which ones no config declares any more. A profile is
-assigned a free port the first time it resolves and keeps it forever, so a checked-in
-`.mcp.json` or an app's `CDP_URL` stays correct. Before handing out an *assigned* port
-crom binds it, which catches the unrelated dev server that grabbed 9222 an hour ago. A
-port you pin yourself skips that search, so its availability is checked at launch instead
-— `crom up` names the process holding it rather than timing out. Two projects that pin
-the same port get an error naming the config file on the other side, not a mysterious
-launch failure. Every read-modify-write of the ledger takes an exclusive lock, because
-several agents each bringing up a browser at once is the case crom is for — and the
-config files crom edits and the profile directories it seeds are locked the same way, for
-the same reason.
+in the run is visible, and says which ones no config declares any more and which ones have
+something other than crom's own browser on their port. A profile is assigned a free port
+the first time it resolves and keeps it forever, so a checked-in `.mcp.json` or an app's
+`CDP_URL` stays correct. Before handing out an *assigned* port crom binds it, which
+catches the unrelated dev server that grabbed 9222 an hour ago. A port you pin yourself
+skips that search, so its availability is checked at launch instead — `crom up` names the
+process holding it rather than timing out. Two projects that pin the same port get an
+error naming the config file on the other side, not a mysterious launch failure. Every
+read-modify-write of the ledger takes an exclusive lock, because several agents each
+bringing up a browser at once is the case crom is for — and the config files crom edits
+and the profile directories it seeds are locked the same way, for the same reason.
 
 Profile data is namespaced the same way: `<state_dir>/<namespace>/<name>`. Two projects
 can both have a `dev` profile and never see each other's cookies.
