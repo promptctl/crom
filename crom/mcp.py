@@ -3,16 +3,25 @@
 import json
 from pathlib import Path
 
-from .model import ProfileRef, ResolvedProfile
+from .model import CromError, ProfileRef, ResolvedProfile
 
 # What marks an entry in `.mcp.json` as crom's, and the only part of the key crom
-# chooses rather than derives. Four characters because the rest of the key is a budget:
-# Claude Code exposes an MCP tool to the model as `mcp__<key>__<tool>` and holds the
-# result to `^[A-Za-z0-9_-]{1,64}$`, so a key of 30-odd characters is all that fits
-# beside chrome-devtools-mcp's longest tool name, `performance_analyze_insight`. The
-# obvious prefix — the server's own `chrome-devtools-mcp` — spends 19 of those before
-# naming any profile at all. The command below still says which server this runs.
+# chooses rather than derives. Four characters, because the rest of the key is a budget
+# — see KEY_LIMIT. The obvious prefix, the server's own `chrome-devtools-mcp`, would
+# spend 19 of it before naming any profile at all; the command below still says which
+# server this entry runs.
 KEY_PREFIX = "crom"
+
+# Why the key has a length at all. Claude Code exposes an MCP server's tools to the
+# model as `mcp__<key>__<tool>`, and a tool name is held to `^[A-Za-z0-9_-]{1,64}$` —
+# so the key does not get 64 characters, it gets what is left after the two joins and
+# the longest tool name the server on the other side publishes. Spelled as the
+# subtraction rather than as the answer, because every term is a fact about someone
+# else's software: when chrome-devtools-mcp adds a longer tool, the budget moves, and
+# the line that has to change is the one naming the tool.
+_TOOL_NAME_LIMIT = 64
+_LONGEST_SERVER_TOOL = "performance_analyze_insight"
+KEY_LIMIT = _TOOL_NAME_LIMIT - len("mcp__") - len("__") - len(_LONGEST_SERVER_TOOL)
 
 # How a namespace or a profile name is spelled inside the key. Two substitutions,
 # because a name matches `^[a-z0-9][a-z0-9._-]*$` and the key alphabet is only
@@ -44,7 +53,17 @@ def entry_key(ref: ProfileRef) -> str:
     namespace, name = (
         "".join(_ESCAPES.get(char, char) for char in part) for part in (ref.namespace, ref.name)
     )
-    return f"{KEY_PREFIX}__{namespace}__{name}"
+    key = f"{KEY_PREFIX}__{namespace}__{name}"
+    if len(key) > KEY_LIMIT:
+        raise CromError(
+            f"profile '{ref}' does not fit in a .mcp.json entry key: it needs "
+            f"{len(key)} characters and only {KEY_LIMIT} are available, because Claude "
+            f"Code names this server's tools `mcp__{key}__<tool>` and refuses a tool "
+            f"name past {_TOOL_NAME_LIMIT} characters.\n"
+            f"Shorten the profile name, or give the project a shorter namespace with "
+            f"`crom init <namespace>`."
+        )
+    return key
 
 
 def server_entry(port: int) -> dict:

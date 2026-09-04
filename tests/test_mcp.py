@@ -15,7 +15,7 @@ import unittest
 from pathlib import Path
 
 from crom import mcp
-from crom.model import ProfileRef, ResolvedProfile, SeedFresh
+from crom.model import CromError, ProfileRef, ResolvedProfile, SeedFresh
 
 # The alphabet a namespace or profile name is built from, plus the two characters that
 # make key derivation hard: `-`, which is legal inside a name and so cannot separate
@@ -70,6 +70,26 @@ class EntryKeyTest(unittest.TestCase):
             key = mcp.entry_key(ProfileRef(namespace, name))
             self.assertNotIn(key, keys, f"{namespace}/{name} collides with {keys.get(key)}")
             keys[key] = f"{namespace}/{name}"
+
+    def test_a_ref_that_would_overrun_the_tool_name_is_refused(self):
+        # Long but legal: `_NAME_RE` allows 64 characters in each half, and a namespace
+        # is slugged from the project directory, so the user need not have chosen it.
+        long_ref = ProfileRef("a" * 40, "dev")
+        with self.assertRaises(CromError) as caught:
+            mcp.entry_key(long_ref)
+        self.assertIn(str(long_ref), str(caught.exception))
+        self.assertIn(str(mcp.KEY_LIMIT), str(caught.exception))
+
+    def test_a_ref_that_exactly_fills_the_budget_is_kept(self):
+        # `crom` + two `__` joins leaves KEY_LIMIT - 8 characters for the two names.
+        ref = ProfileRef("a" * (mcp.KEY_LIMIT - 8 - 3), "dev")
+        self.assertEqual(len(mcp.entry_key(ref)), mcp.KEY_LIMIT)
+
+    def test_the_budget_leaves_room_for_the_longest_tool_name(self):
+        # The whole reason KEY_LIMIT exists: `mcp__<key>__<tool>` is what Claude Code
+        # sends as a tool name, and the API holds a tool name to 64 characters.
+        longest = f"mcp__{'k' * mcp.KEY_LIMIT}__{mcp._LONGEST_SERVER_TOOL}"
+        self.assertEqual(len(longest), mcp._TOOL_NAME_LIMIT)
 
     def test_every_key_survives_into_a_tool_name(self):
         for length in (1, 2, 3):
