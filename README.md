@@ -197,9 +197,11 @@ target where it is.
 A namespace goes unscanned when crom does not know where it keeps its profile directories.
 That address comes from the namespace's own config, which may set `state_dir` to move them
 somewhere else, so a config that will not load takes the address with it — and reporting
-nothing found would be a guess dressed as a clean bill of health. A config that is simply
-gone is not one of those cases: a file that is not there sets no `state_dir`, so crom
-checks its default profile root and answers for real.
+nothing found would be a guess dressed as a clean bill of health. A config that is gone
+gets both answers: crom checks its default profile root, finding any staging directory
+sitting there, and reports the namespace as one it could not fully check, since that
+config may have set a `state_dir` crom can no longer read. Both come back every time,
+so a script must still check a gone namespace for an `error` entry.
 
 A seed running right now has a staging directory too, and `crom doctor` reports that one
 as well. The evidence on disk is identical, and crom does not try to tell them apart; the
