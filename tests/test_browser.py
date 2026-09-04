@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest import mock
 
 from crom import browser
-from crom.model import CromError
+from crom.model import CromError, Reason
 
 
 class ResolveTest(unittest.TestCase):
@@ -61,6 +61,10 @@ class ResolveTest(unittest.TestCase):
             with self.assertRaises(CromError) as caught:
                 browser.find_chrome()
         self.assertIn(str(broken), str(caught.exception))
+        # The other half of the pair pinned in test_config.py: `config` answers
+        # `CONFIG_INVALID` when `chrome_binary` is written wrong and `CHROME_UNUSABLE`
+        # when what it names will not run. Finding none at all is the second of those.
+        self.assertIs(caught.exception.reason, Reason.CHROME_UNUSABLE)
 
 
 if __name__ == "__main__":

@@ -121,6 +121,10 @@ class Reason(Enum):
     CONFIG_UNWRITABLE = ("config_unwritable", CromError)
     FLAGS_INVALID = ("flags_invalid", CromError)
     VARIABLE_UNKNOWN = ("variable_unknown", CromError)
+
+    # A name that will not survive crom's own machinery, from wherever it was typed.
+    # Not grouped with the config file above: `parse_ref` raises this for a reference
+    # typed at the CLI — `crom up a/b/c` — which never touched one.
     INVALID_NAME = ("invalid_name", CromError)
 
     # The port ledger crom keeps for itself.
@@ -138,6 +142,10 @@ class Reason(Enum):
     PORT_IN_USE = ("port_in_use", CromError)
     PORT_CHECK_FAILED = ("port_check_failed", CromError)
     PROCESS_TABLE_UNREADABLE = ("process_table_unreadable", CromError)
+
+    # The lock `locking.exclusive` takes, which is not a browser fact: the config file,
+    # the port ledger, the legacy registry and a profile directory are all taken under
+    # it, so it sits under nearly every command rather than beneath the ones above.
     LOCK_UNAVAILABLE = ("lock_unavailable", CromError)
 
     # A seed directory crom will not or cannot copy.

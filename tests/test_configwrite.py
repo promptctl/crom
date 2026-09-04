@@ -127,9 +127,13 @@ class LockingTest(unittest.TestCase):
         blocker = root / "file"
         blocker.write_text("not a directory")
 
-        with self.assertRaisesRegex(CromError, "could not take the lock"):
+        with self.assertRaisesRegex(CromError, "could not take the lock") as caught:
             with locking.exclusive(blocker / "child" / "target"):
                 pass
+        # `_writing` answers `CONFIG_UNWRITABLE` for its own `OSError` a few functions
+        # away, and this lock is taken under the config file among others — so that
+        # relabelling would read as right while telling the user a fine file is broken.
+        self.assertIs(caught.exception.reason, Reason.LOCK_UNAVAILABLE)
 
     def test_a_filesystem_that_refuses_locking_is_reported_not_crashed_through(self):
         """The guarantee has to cover acquiring the lock, not only creating the file.
@@ -141,9 +145,10 @@ class LockingTest(unittest.TestCase):
         """
         root = Path(tempfile.mkdtemp())
         with mock.patch("crom.locking.fcntl.flock", side_effect=OSError("ENOLCK")):
-            with self.assertRaisesRegex(CromError, "could not take the lock"):
+            with self.assertRaisesRegex(CromError, "could not take the lock") as caught:
                 with locking.exclusive(root / "target"):
                     pass
+        self.assertIs(caught.exception.reason, Reason.LOCK_UNAVAILABLE)
 
     def test_a_failure_to_unlock_does_not_replace_the_real_error(self):
         """Closing the descriptor releases the lock on every path out, so an explicit
@@ -445,8 +450,12 @@ class WriteFailureTest(unittest.TestCase):
         with mock.patch.object(
             Path, "mkdir", side_effect=Reason.CONFIG_UNWRITABLE.error("the precise reason")
         ):
-            with self.assertRaisesRegex(CromError, "^the precise reason$"):
+            with self.assertRaisesRegex(CromError, "^the precise reason$") as caught:
                 configwrite.write_default(self.target, namespace="myapp", seed=DEFAULT_SEED)
+        # The reason travels with the message through `_writing`'s `except CromError:
+        # raise`, which is what this test's docstring is actually about — re-tagging it
+        # would send the reader to check the file rather than the fact that failed.
+        self.assertIs(caught.exception.reason, Reason.CONFIG_UNWRITABLE)
 
 
 if __name__ == "__main__":
