@@ -229,6 +229,7 @@ class RequirePortAvailableTest(unittest.TestCase):
             with self.assertRaises(CromError) as caught:
                 chrome._require_port_available(self._profile(taken))
 
+        self.assertIs(caught.exception.reason, Reason.PORT_IN_USE)
         message = str(caught.exception)
         self.assertIn(str(taken), message)
         self.assertIn("myapp/dev", message)
@@ -345,6 +346,7 @@ class KillTest(unittest.TestCase):
         ):
             chrome.kill(self.profile)
 
+        self.assertIs(caught.exception.reason, Reason.CHROME_STOP_FAILED)
         message = str(caught.exception)
         self.assertIn("port 9300 is still held", message)
         self.assertIn("lsof", message)  # the message tells the user how to find the holder
@@ -361,9 +363,14 @@ class PortCheckBoundaryTest(unittest.TestCase):
     def test_a_probe_socket_that_cannot_be_made_is_reported_not_crashed_through(self):
         with (
             mock.patch.object(chrome.socket, "socket", side_effect=OSError("too many open files")),
-            self.assertRaisesRegex(CromError, "could not check whether port 9300 is free"),
+            self.assertRaises(CromError) as caught,
         ):
             chrome._port_is_free(9300)
+
+        # Not `PORT_IN_USE`: crom failed to *ask* whether the port was free, which is a
+        # different fact from an answer of "no" and a different thing to do about it.
+        self.assertIs(caught.exception.reason, Reason.PORT_CHECK_FAILED)
+        self.assertIn("could not check whether port 9300 is free", str(caught.exception))
 
     def test_a_stop_inherits_that_report_rather_than_a_traceback(self):
         """`down` and `rm` sit behind this now, and both live inside the exit-code contract."""
@@ -413,14 +420,18 @@ class ProcessBoundaryTest(unittest.TestCase):
         """`scan` is the single process-table reader, so every command that asks about
         process state arrives here — a raw error is a raw error from all of them."""
         with mock.patch("crom.chrome.subprocess.run", side_effect=FileNotFoundError("ps")):
-            with self.assertRaisesRegex(CromError, "`ps` was not found"):
+            with self.assertRaises(CromError) as caught:
                 chrome.scan()
+        self.assertIs(caught.exception.reason, Reason.PROCESS_TABLE_UNREADABLE)
+        self.assertIn("`ps` was not found", str(caught.exception))
 
     def test_a_failing_ps_is_reported_not_crashed_through(self):
         failure = subprocess.CalledProcessError(1, ["ps"], stderr="ps: bad option")
         with mock.patch("crom.chrome.subprocess.run", side_effect=failure):
-            with self.assertRaisesRegex(CromError, "`ps` exited 1"):
+            with self.assertRaises(CromError) as caught:
                 chrome.scan()
+        self.assertIs(caught.exception.reason, Reason.PROCESS_TABLE_UNREADABLE)
+        self.assertIn("`ps` exited 1", str(caught.exception))
 
     def test_a_browser_that_cannot_be_started_is_reported_with_its_profile(self):
         """Boundary error translation around `Popen`. Its sibling `_require_port_available`
@@ -430,6 +441,9 @@ class ProcessBoundaryTest(unittest.TestCase):
                 with self.assertRaises(CromError) as caught:
                     chrome.launch(temp_profile(self))
 
+        # `CHROME_LAUNCH_FAILED`, not `CHROME_STARTUP_FAILED`: the process never started,
+        # so there is nothing to have crashed and no log to go read.
+        self.assertIs(caught.exception.reason, Reason.CHROME_LAUNCH_FAILED)
         self.assertIn("myapp/dev", str(caught.exception))
 
     def test_a_sink_that_cannot_be_opened_is_reported_not_crashed_through(self):
@@ -439,8 +453,10 @@ class ProcessBoundaryTest(unittest.TestCase):
         a change of which call the sink is opened by."""
         with mock.patch.object(Path, "open", side_effect=OSError("No space left")):
             with mock.patch("crom.chrome._require_port_available"):
-                with self.assertRaisesRegex(CromError, "could not open .*crom-stderr.log"):
+                with self.assertRaises(CromError) as caught:
                     chrome.launch(temp_profile(self))
+        self.assertIs(caught.exception.reason, Reason.CHROME_LOG_UNWRITABLE)
+        self.assertRegex(str(caught.exception), "could not open .*crom-stderr.log")
 
 
 class LaunchReadinessTest(unittest.TestCase):
@@ -491,9 +507,12 @@ class LaunchReadinessTest(unittest.TestCase):
         self.proc.poll.return_value = 3
         started = time.monotonic()
         with mock.patch.object(chrome, "_probe_port", return_value=chrome._Silent()):
-            with self.assertRaisesRegex(CromError, "exited 3 during startup"):
+            with self.assertRaises(CromError) as caught:
                 chrome.launch(self.profile)
         elapsed = time.monotonic() - started
+
+        self.assertIs(caught.exception.reason, Reason.CHROME_STARTUP_FAILED)
+        self.assertIn("exited 3 during startup", str(caught.exception))
 
         # The point of the whole change: the answer arrives at the speed of the poll
         # interval, not the launch timeout. A generous bound — the regression it guards
@@ -544,6 +563,11 @@ class LaunchReadinessTest(unittest.TestCase):
             with self.assertRaises(CromError) as caught:
                 chrome.launch(self.profile)
 
+        # The ending that parts company with the other three: a stranger holding the port
+        # is the pre-launch refusal arriving late, not a Chrome that failed to come up.
+        # Retrying is provably futile here and merely unpromising there, which is the
+        # whole distinction the slug exists to carry.
+        self.assertIs(caught.exception.reason, Reason.PORT_IN_USE)
         message = str(caught.exception)
         self.assertIn("not as a Chrome DevTools endpoint", message)
         self.assertIn("HTTP 404 Not Found", message)  # what answered, quoted back

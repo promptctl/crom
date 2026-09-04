@@ -792,12 +792,14 @@ def launch(profile: ResolvedProfile) -> tuple[int, ...]:
             # could not see, which is the only path on which this leak actually closes.
             # Demanding the port alone would report the symptom and skip that.
             demand = _still_held
+            reason = Reason.CHROME_STARTUP_FAILED
         case _Exited(returncode):
             problem = (
                 f"Chrome for '{profile.ref}' exited {returncode} during startup, before "
                 f"it opened CDP port {profile.port}.{said}\nCommand was: {command}"
             )
             demand = _still_held
+            reason = Reason.CHROME_STARTUP_FAILED
         case _NeverAnswered():
             problem = (
                 f"Chrome for '{profile.ref}' was still running but had not opened CDP "
@@ -805,6 +807,7 @@ def launch(profile: ResolvedProfile) -> tuple[int, ...]:
                 f"Command was: {command}"
             )
             demand = _still_held
+            reason = Reason.CHROME_STARTUP_FAILED
         case _AnsweredByStranger(served):
             problem = (
                 f"port {profile.port} (assigned to '{profile.ref}') is answering, but not "
@@ -819,11 +822,19 @@ def launch(profile: ResolvedProfile) -> tuple[int, ...]:
             # saw only silence, which is no evidence at all — there the likely holder is
             # crom's own browser, and waiting is what keeps the next `up` honest.
             demand = _processes_held
+            # The reason parts company with the other three endings here, for the same
+            # evidence that decides `demand`. They saw silence and mean "it did not come
+            # up, go read the log"; this one saw a stranger holding the port, which is the
+            # pre-launch `_require_port_available` refusal arriving a moment later. Same
+            # next move, so the same slug — a second one would differ from `PORT_IN_USE`
+            # only in when crom noticed. [LAW:one-type-per-behavior]
+            reason = Reason.PORT_IN_USE
 
     # Every ending below the success arm is a failed launch, so the browser is stopped on
     # one path rather than in each arm. [LAW:dataflow-not-control-flow] What differs is the
-    # demand each ending can justify, and that is a value the arm supplies.
-    raise Reason.CHROME_STARTUP_FAILED.error(f"{problem}{_stop_after_failure(profile, demand)}")
+    # demand each ending can justify and what it can be called, and both are values the
+    # arm supplies.
+    raise reason.error(f"{problem}{_stop_after_failure(profile, demand)}")
 
 
 # What a caller demands of a stop, expressed as the thing that reads the world and reports

@@ -221,8 +221,10 @@ def parse_layer(raw_flags, raw_drops, where: str, source: Path) -> Layer:
         # information than it caught, never less — the alternative was a second copy of
         # the check here, written only to reach the file and stanza names, and a rule
         # spelled in two places is one that eventually disagrees with itself.
-        # [LAW:one-source-of-truth]
-        raise Reason.CONFIG_INVALID.error(f"{source}: {where} {fault}") from fault
+        # [LAW:one-source-of-truth] The reason travels with the fault for the same
+        # reason: `Layer` decided what went wrong, so re-tagging it here would be this
+        # deciding it a second time. Only the message gains anything.
+        raise fault.reason.error(f"{source}: {where} {fault}") from fault
 
 
 def _reject_reserved(
@@ -244,7 +246,7 @@ def _reject_reserved(
     for flag in (Flag.parse(text) for text in texts):
         reserved = RESERVED_SWITCHES.get(flag.switch)
         if reserved is not None:
-            raise Reason.CONFIG_INVALID.error(
+            raise Reason.FLAGS_INVALID.error(
                 f"{source}: {where}.{key} {verb} {flag.switch} — "
                 + reason_for(reserved).replace(_STANZA, where)
             )
