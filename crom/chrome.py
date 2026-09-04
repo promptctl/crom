@@ -946,10 +946,10 @@ def kill(profile: ResolvedProfile) -> tuple[int, ...]:
     delete a directory on: `os.kill` returns before the kernel has finished tearing the
     process down, and this used to return inside that window. `shutil.rmtree` walking a
     directory Chrome is still writing raises `FileNotFoundError` when an entry vanishes
-    mid-walk or `ENOTEMPTY` when one appears — reported after `rm` had already undeclared
-    the profile, so the retry it named was impossible. [LAW:no-ambient-temporal-coupling]
-    a transition `rm` depends on is owned
-    here rather than assumed to have completed by the time the caller looks.
+    mid-walk or `ENOTEMPTY` when one appears. When the delete ran last, that arrived
+    after `rm` had already undeclared the profile, so the retry it named was impossible.
+    [LAW:no-ambient-temporal-coupling] a transition `rm` depends on is owned here rather
+    than assumed to have completed by the time the caller looks.
 
     The port is half of that postcondition, and the half nobody owned. `up` after a `down`
     on the same port — which is all a restart is — races whatever still holds the CDP

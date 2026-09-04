@@ -1762,10 +1762,11 @@ class CliTest(unittest.TestCase):
     def test_an_os_level_refusal_becomes_a_message_and_an_exit_code(self):
         """Three ways the filesystem can refuse one command, all through `mcp.write`.
 
-        Read side, write side, and traversal: `--path <a-directory>` fails inside
-        `read_text`, a missing parent fails inside `write_text`, and a path whose parent
-        is a regular file fails before either. All three used to reach the user as a
-        stack trace out of `pathlib` — exit 1, and nothing else a script could read.
+        Three errno families across two call sites: `--path <a-directory>` fails in
+        `read_text`, while a missing parent and a parent that is a regular file both get
+        `False` from `path.exists()` — which swallows the `ENOTDIR` — and fail in
+        `write_text`. All three used to reach the user as a stack trace out of `pathlib`
+        — exit 1, and nothing else a script could read.
 
         `invoke` runs with `catch_exceptions=False`, which is what makes an escape
         visible here at all: the runner's default would have handed this test a tidy
@@ -1777,14 +1778,18 @@ class CliTest(unittest.TestCase):
         (self.project / "adir").mkdir()
         (self.project / "afile").touch()
 
-        for path, reason in (
-            ("adir", "Is a directory"),
-            ("nosuch/dir/.mcp.json", "No such file or directory"),
-            ("afile/x.json", "Not a directory"),
+        # `os.strerror` rather than the literal text: that half of the message comes from
+        # the C library and not from crom, so the C library is its oracle — and naming the
+        # errno says which family each case exercises. Still an independent check: crom
+        # reads `strerror` off the exception, so `str(e)` would not match.
+        for path, code in (
+            ("adir", errno.EISDIR),
+            ("nosuch/dir/.mcp.json", errno.ENOENT),
+            ("afile/x.json", errno.ENOTDIR),
         ):
             with self.subTest(path=path):
                 result = self.invoke("mcp", "dev", "--path", path, expect=1)
-                self.assertEqual(result.stderr.strip(), f"Error: {path}: {reason}")
+                self.assertEqual(result.stderr.strip(), f"Error: {path}: {os.strerror(code)}")
 
     def test_the_contract_covers_a_failure_no_command_anticipated(self):
         """The rule lives at the boundary, so a call site nobody patched is covered too.
