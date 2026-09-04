@@ -1192,7 +1192,7 @@ def init_cmd(namespace: str | None, seed_text: str | None):
         (
             ("namespace", declared_namespace, namespace),
             (
-                f"{DEFAULTS_STANZA}.seed",
+                "seed",
                 str(declared_seed),
                 None if stated_seed is None else configwrite.render_seed(stated_seed, base),
             ),

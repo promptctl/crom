@@ -317,7 +317,10 @@ class CliTest(unittest.TestCase):
 
         output = self.crom("init", "--seed", "default", expect=4)
 
-        self.assertIn("[defaults].seed", output)
+        # [LAW:one-source-of-truth] this label is also `declaration_differs.settings`, and
+        # `init` carries no `--json` — the rendered line is the only place it is observable.
+        # Line-exact, not `assertIn` over the text, which "[defaults].seed" ends in.
+        self.assertIn("  seed: declared fresh, you asked for default", output.splitlines())
         self.assertIn('seed = "fresh"', (self.project / ".crom.toml").read_text())
 
     def test_init_over_a_config_that_declares_no_namespace_says_so(self):
