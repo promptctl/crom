@@ -253,6 +253,7 @@ class RefusalTest(unittest.TestCase):
                 window.raise_profile(self.profile, (4242,))
 
         self.assertIn("'lots'", str(caught.exception))
+        self.assertIs(caught.exception.reason, Reason.WINDOW_RAISE_FAILED)
 
 
 if __name__ == "__main__":

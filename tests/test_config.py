@@ -96,8 +96,13 @@ class ProfileTest(unittest.TestCase):
 
     def test_a_duplicated_valueless_switch_is_not_told_to_join_values(self):
         """There is nothing to comma-join, and saying otherwise is a false claim."""
-        with self.assertRaisesRegex(CromError, r"Write the switch once: --no-pings"):
+        with self.assertRaisesRegex(CromError, r"Write the switch once: --no-pings") as caught:
             parse(MINIMAL + '[profiles.dev]\nflags = ["--no-pings", "--no-pings"]\n')
+        # One of flags.py's five raises, which all answer the same slug — pinned here and
+        # at one `drops` site rather than at all eleven call sites that reach them, since
+        # the eleventh assertion would state the same fact as the first.
+        # [LAW:polishing-by-subtraction]
+        self.assertIs(caught.exception.reason, Reason.FLAGS_INVALID)
 
     def test_a_switch_repeated_verbatim_is_told_to_write_it_once(self):
         """A copy-paste duplicate has nothing distinct to join, so suggesting
@@ -141,11 +146,16 @@ class ProfileTest(unittest.TestCase):
     def test_a_stanza_may_not_both_set_and_drop_one_switch(self):
         """Setting it here already replaces whatever was inherited, so the drop could not
         mean anything — and which of the two the author meant is only theirs to say."""
-        with self.assertRaisesRegex(CromError, r"both sets and drops --headless"):
+        with self.assertRaisesRegex(CromError, r"both sets and drops --headless") as caught:
             parse(
                 MINIMAL
                 + '[profiles.dev]\nflags = ["--headless=new"]\ndrop_flags = ["--headless"]\n'
             )
+        # The diagnosis is `Layer.__post_init__`'s, and `parse_layer` re-raises it rather
+        # than re-tagging — which it did not always do. Downgraded to CONFIG_INVALID the
+        # message stays word for word what it is now, so this is the assertion that would
+        # have caught it. [LAW:one-source-of-truth]
+        self.assertIs(caught.exception.reason, Reason.FLAGS_INVALID)
 
     def test_a_drop_entry_that_could_never_match_a_switch_is_refused(self):
         """Each of these would drop nothing and say nothing — a config stating a removal
@@ -156,8 +166,11 @@ class ProfileTest(unittest.TestCase):
             ('" --no-pings"', "whitespace"),
             ('"--${CROM_PROFILE}"', "interpolates a variable"),
         ):
-            with self.subTest(entry=entry), self.assertRaisesRegex(CromError, fault):
+            with self.subTest(entry=entry), self.assertRaisesRegex(
+                CromError, fault
+            ) as caught:
                 parse(MINIMAL + f"[profiles.dev]\ndrop_flags = [{entry}]\n")
+            self.assertIs(caught.exception.reason, Reason.FLAGS_INVALID)
 
     def test_a_drop_entry_is_diagnosed_by_the_fault_its_remedy_would_not_cure(self):
         """An entry can be both ill-shaped and value-carrying, and the value remedy is the

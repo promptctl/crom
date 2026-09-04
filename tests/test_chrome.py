@@ -544,9 +544,15 @@ class LaunchReadinessTest(unittest.TestCase):
         with (
             mock.patch.object(chrome, "LAUNCH_TIMEOUT_SECONDS", 0.3),
             mock.patch.object(chrome, "_probe_port", return_value=chrome._Silent()),
-            self.assertRaisesRegex(CromError, "was still running but had not opened CDP port"),
+            self.assertRaisesRegex(
+                CromError, "was still running but had not opened CDP port"
+            ) as caught,
         ):
             chrome.launch(self.profile)
+        # Four launch endings, one exit code, one kind — the case the epic opened on.
+        # Two of the arms were pinned already; leaving the other two unpinned would let
+        # a swap collapse the distinction this ticket exists to draw.
+        self.assertIs(caught.exception.reason, Reason.CHROME_STARTUP_FAILED)
 
     def test_a_stranger_on_the_port_is_not_reported_as_a_launched_browser(self):
         """The silent failure this outcome exists to end.
@@ -604,6 +610,7 @@ class LaunchReadinessTest(unittest.TestCase):
         message = str(caught.exception)
         self.assertIn("answered on CDP port 9300", message)
         self.assertIn("visible to `ps`", message)
+        self.assertIs(caught.exception.reason, Reason.CHROME_STARTUP_FAILED)
         # The command line, like every other launch failure — the reader's next step is to
         # look at what crom actually ran.
         self.assertIn("Command was:", message)
