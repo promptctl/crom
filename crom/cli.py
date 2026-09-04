@@ -252,8 +252,8 @@ def _start_under_lock(profile: ResolvedProfile) -> tuple[bool, tuple[int, ...]]:
     """Bring a profile up, for a caller already holding `seed.profile_lock`.
 
     Hands back whether *this* call started the browser and the PIDs it is running under,
-    rather than printing anything, because the three callers say different things about
-    the same outcome: `up` reports "Started" or "Already running", `restart` has just
+    rather than reporting it, because the three callers say different things about the
+    same outcome: `up` reports "Started" or "Already running", `restart` has just
     stopped whatever was there, and `show` mentions a launch only when it had to make one.
     [LAW:effects-at-boundaries] the decision is computed here and rendered at the command.
 
