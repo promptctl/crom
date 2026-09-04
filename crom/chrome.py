@@ -309,7 +309,7 @@ def _summarise(text: str) -> str:
     return textwrap.shorten(printable(text), PORT_REPLY_SUMMARY_CHARS, placeholder=" …")
 
 
-def _lsof_hint(port: int) -> str:
+def lsof_hint(port: int) -> str:
     """How to find out who holds a port, worded the same wherever crom has to ask."""
     return f"Find it with: lsof -nP -iTCP:{port} -sTCP:LISTEN"
 
@@ -538,7 +538,7 @@ def _probe_port(port: int) -> _PortAnswer:
             return _Silent()
 
 
-def _port_is_free(port: int) -> bool:
+def port_is_free(port: int) -> bool:
     """Whether a listener could take this port right now.
 
     Asked by binding rather than by connecting, because those are different questions and
@@ -547,8 +547,16 @@ def _port_is_free(port: int) -> bool:
     puts to the kernel. They part company whenever a socket outlives whoever was serving
     through it, so a port that `_probe_port` calls silent can still refuse the bind.
 
-    [LAW:one-source-of-truth] the pre-launch check and the post-stop wait ask the same
-    question here, so they cannot come to disagree about what a free port is.
+    [LAW:one-source-of-truth] the pre-launch check, the post-stop wait and `crom doctor`
+    ask the same question here, so they cannot come to disagree about what a free port is
+    — a doctor calling a port free that `up` then refuses would be reporting on a
+    different port than the one crom launches against.
+
+    Named without an underscore because `doctor` is outside this module: a port and
+    whether anything holds it is a fact about the machine, not an implementation detail of
+    launching. It takes the bare number for the same reason `find_pids_for_dir` takes a
+    bare path — the caller may have no `ResolvedProfile` to hand, and `doctor` reading a
+    hand-edited ledger frequently does not.
     """
     # Two `OSError`s with nothing in common but their type. A refused bind is the answer
     # — the port is held — while a socket that cannot be made at all (fd exhaustion) means
@@ -576,10 +584,10 @@ def _require_port_available(profile: ResolvedProfile) -> None:
     Without this the launch simply times out after 30s and blames the wrong thing.
     [LAW:no-silent-failure] the diagnosis belongs at the moment of failure.
     """
-    if not _port_is_free(profile.port):
+    if not port_is_free(profile.port):
         raise Reason.PORT_IN_USE.error(
             f"port {profile.port} (assigned to '{profile.ref}') is held by another "
-            f"process. {_lsof_hint(profile.port)}"
+            f"process. {lsof_hint(profile.port)}"
         )
 
 
@@ -813,7 +821,7 @@ def launch(profile: ResolvedProfile) -> tuple[int, ...]:
                 f"port {profile.port} (assigned to '{profile.ref}') is answering, but not "
                 f"as a Chrome DevTools endpoint — it served: {served}. Something else took "
                 f"the port while Chrome was starting, so the browser crom just launched "
-                f"could never be reached there.\n{_lsof_hint(profile.port)}{said}\n"
+                f"could never be reached there.\n{lsof_hint(profile.port)}{said}\n"
                 f"Command was: {command}"
             )
             # The one arm holding positive evidence of who owns the port: a foreign
@@ -895,8 +903,8 @@ def _processes_held(profile: ResolvedProfile) -> tuple[str, ...]:
 
 def _port_held(profile: ResolvedProfile) -> tuple[str, ...]:
     """The profile's CDP port, if it is not yet bindable again."""
-    return (f"port {profile.port} is still held. {_lsof_hint(profile.port)}",) * (
-        not _port_is_free(profile.port)
+    return (f"port {profile.port} is still held. {lsof_hint(profile.port)}",) * (
+        not port_is_free(profile.port)
     )
 
 
