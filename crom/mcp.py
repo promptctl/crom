@@ -90,21 +90,20 @@ def write(profile: ResolvedProfile, path: Path) -> None:
     entry to one profile and point it at another profile's port, and nothing downstream
     could tell that it had.
 
-    Preserves any other servers already declared in `path`. Raises ValueError
-    if `path` exists and its content isn't a JSON object we can merge into
-    (invalid JSON, a non-object root, or a non-object "mcpServers") — we
-    never overwrite a file we can't parse into that shape.
+    Preserves any other servers already declared in `path`, and refuses rather
+    than writing: a file that isn't a JSON object we can merge into, and a ref
+    `entry_key` cannot spell, both leave `path` exactly as they found it.
     """
     if path.exists():
         try:
             config = json.loads(path.read_text())
         except json.JSONDecodeError as e:
-            raise ValueError(f"{path} exists but is not valid JSON: {e}") from e
+            raise CromError(f"{path} exists but is not valid JSON: {e}") from e
         if not isinstance(config, dict):
-            raise ValueError(f"{path} must contain a JSON object, got {type(config).__name__}")
+            raise CromError(f"{path} must contain a JSON object, got {type(config).__name__}")
         servers = config.setdefault("mcpServers", {})
         if not isinstance(servers, dict):
-            raise ValueError(f'{path}: "mcpServers" must be an object, got {type(servers).__name__}')
+            raise CromError(f'{path}: "mcpServers" must be an object, got {type(servers).__name__}')
     else:
         config = {}
         servers = config.setdefault("mcpServers", {})

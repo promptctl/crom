@@ -132,23 +132,34 @@ class WriteTest(unittest.TestCase):
         self.assertEqual(self.servers()[mcp.entry_key(self.dev.ref)]["args"][-1],
                          "http://127.0.0.1:9500")
 
+    def test_rejects_a_ref_it_cannot_spell(self):
+        # The fourth instance of the same contract as the three below: a refused write
+        # leaves `path` as it found it. Asserted through `write` and not only through
+        # `entry_key`, because what is at stake is the order — deriving the key after
+        # `path.write_text` would clobber a good file for a profile it then refuses.
+        original = json.dumps({"mcpServers": {"other": {"command": "foo"}}})
+        self.path.write_text(original)
+        with self.assertRaises(CromError):
+            mcp.write(profile(ProfileRef("a" * 40, "dev"), 9222), self.path)
+        self.assertEqual(self.path.read_text(), original)
+
     def test_rejects_invalid_json(self):
         self.path.write_text("not json")
-        with self.assertRaises(ValueError):
+        with self.assertRaises(CromError):
             mcp.write(self.dev, self.path)
         self.assertEqual(self.path.read_text(), "not json")
 
     def test_rejects_non_object_root(self):
         original = json.dumps([1, 2, 3])
         self.path.write_text(original)
-        with self.assertRaises(ValueError):
+        with self.assertRaises(CromError):
             mcp.write(self.dev, self.path)
         self.assertEqual(self.path.read_text(), original)
 
     def test_rejects_non_object_mcp_servers(self):
         original = json.dumps({"mcpServers": "oops"})
         self.path.write_text(original)
-        with self.assertRaises(ValueError):
+        with self.assertRaises(CromError):
             mcp.write(self.dev, self.path)
         self.assertEqual(self.path.read_text(), original)
 
