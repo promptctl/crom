@@ -4,7 +4,7 @@ import json
 from enum import Enum, auto
 from pathlib import Path
 
-from .model import CromError, ProfileRef, ResolvedProfile
+from .model import ProfileRef, Reason, ResolvedProfile
 
 # What marks an entry in `.mcp.json` as crom's, and the only part of the key crom
 # chooses rather than derives. Four characters, because the rest of the key is a budget
@@ -93,7 +93,7 @@ def entry_key(ref: ProfileRef) -> str:
     )
     key = f"{KEY_PREFIX}__{namespace}__{name}"
     if len(key) > KEY_LIMIT:
-        raise CromError(
+        raise Reason.MCP_KEY_TOO_LONG.error(
             f"profile '{ref}' does not fit in a .mcp.json entry key: it needs "
             f"{len(key)} characters and only {KEY_LIMIT} are available, because Claude "
             f"Code names this server's tools `mcp__{key}__<tool>` and refuses a tool "
@@ -161,12 +161,12 @@ def write(profile: ResolvedProfile, path: Path) -> Legacy:
         try:
             config = json.loads(path.read_text())
         except json.JSONDecodeError as e:
-            raise CromError(f"{path} exists but is not valid JSON: {e}") from e
+            raise Reason.MCP_CONFIG_INVALID.error(f"{path} exists but is not valid JSON: {e}") from e
         if not isinstance(config, dict):
-            raise CromError(f"{path} must contain a JSON object, got {type(config).__name__}")
+            raise Reason.MCP_CONFIG_INVALID.error(f"{path} must contain a JSON object, got {type(config).__name__}")
         servers = config.setdefault("mcpServers", {})
         if not isinstance(servers, dict):
-            raise CromError(f'{path}: "mcpServers" must be an object, got {type(servers).__name__}')
+            raise Reason.MCP_CONFIG_INVALID.error(f'{path}: "mcpServers" must be an object, got {type(servers).__name__}')
     else:
         config = {}
         servers = {}

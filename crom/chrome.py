@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import IO
 
-from .model import CromError, ResolvedProfile
+from .model import CromError, Reason, ResolvedProfile
 
 LAUNCH_TIMEOUT_SECONDS = 30.0
 SHUTDOWN_TIMEOUT_SECONDS = 5.0
@@ -162,13 +162,13 @@ def scan() -> dict[str, tuple[int, ...]]:
             check=True,
         )
     except FileNotFoundError as e:
-        raise CromError(
+        raise Reason.PROCESS_TABLE_UNREADABLE.error(
             "could not read the process table: `ps` was not found on PATH.\n"
             "crom answers 'is this profile running' by reading `ps`, so it cannot work "
             "without it."
         ) from e
     except subprocess.CalledProcessError as e:
-        raise CromError(
+        raise Reason.PROCESS_TABLE_UNREADABLE.error(
             f"could not read the process table: `ps` exited {e.returncode}"
             f"{(chr(10) + e.stderr.strip()) if e.stderr else ''}"
         ) from e
@@ -564,7 +564,7 @@ def _port_is_free(port: int) -> bool:
     except OSError as e:
         # [LAW:no-silent-failure] `kill` reaches here too, so `down` and `rm` inherit this
         # sentence rather than a bare errno naming no port.
-        raise CromError(f"could not check whether port {port} is free: {e}") from e
+        raise Reason.PORT_CHECK_FAILED.error(f"could not check whether port {port} is free: {e}") from e
     return True
 
 
@@ -575,7 +575,7 @@ def _require_port_available(profile: ResolvedProfile) -> None:
     [LAW:no-silent-failure] the diagnosis belongs at the moment of failure.
     """
     if not _port_is_free(profile.port):
-        raise CromError(
+        raise Reason.PORT_IN_USE.error(
             f"port {profile.port} (assigned to '{profile.ref}') is held by another "
             f"process. {_lsof_hint(profile.port)}"
         )
@@ -682,7 +682,7 @@ def _stderr_sink(profile_dir: Path) -> Iterator[_StderrSink]:
     except OSError as e:
         # Named here for the same reason `Popen` and `ps` are: the CLI boundary answers
         # for a raw `OSError`, but with the path alone — never with what it was for.
-        raise CromError(f"could not open {path} to capture Chrome's output: {e}") from e
+        raise Reason.CHROME_LOG_UNWRITABLE.error(f"could not open {path} to capture Chrome's output: {e}") from e
 
     with handle:
         yield _StderrSink(handle=handle, path=path)
@@ -755,7 +755,7 @@ def launch(profile: ResolvedProfile) -> tuple[int, ...]:
             # `config` checks an explicit `chrome_binary` at parse time, so reaching here
             # means the binary moved or lost its permissions between then and now — which
             # the command below says and a bare errno does not. [LAW:no-silent-failure]
-            raise CromError(
+            raise Reason.CHROME_LAUNCH_FAILED.error(
                 f"could not start Chrome for '{profile.ref}': {e}\nCommand was: {command}"
             ) from e
 
@@ -819,7 +819,7 @@ def launch(profile: ResolvedProfile) -> tuple[int, ...]:
     # Every ending below the success arm is a failed launch, so the browser is stopped on
     # one path rather than in each arm. [LAW:dataflow-not-control-flow] What differs is the
     # demand each ending can justify, and that is a value the arm supplies.
-    raise CromError(f"{problem}{_stop_after_failure(profile, demand)}")
+    raise Reason.CHROME_STARTUP_FAILED.error(f"{problem}{_stop_after_failure(profile, demand)}")
 
 
 # What a caller demands of a stop, expressed as the thing that reads the world and reports
@@ -1002,7 +1002,7 @@ def kill(profile: ResolvedProfile) -> tuple[int, ...]:
     # escalation was spent belongs on the line that only appears when there was something
     # to spend it on.
     detail = "\n".join(f"  - {line}" for line in unmet)
-    raise CromError(f"could not stop '{profile.ref}':\n{detail}")
+    raise Reason.CHROME_STOP_FAILED.error(f"could not stop '{profile.ref}':\n{detail}")
 
 
 def _signal(pid: int, sig: int) -> None:

@@ -17,7 +17,7 @@ import fcntl
 from collections.abc import Iterator
 from pathlib import Path
 
-from .model import CromError
+from .model import Reason
 
 
 @contextlib.contextmanager
@@ -38,7 +38,7 @@ def exclusive(path: Path) -> Iterator[None]:
         # This primitive sits under nearly every command, so a raw OSError here — an
         # unwritable parent, a regular file where a directory belongs — would escape as
         # a traceback from all of them. [LAW:no-silent-failure] name the path instead.
-        raise CromError(f"could not take the lock at {lock_path}: {e}") from e
+        raise Reason.LOCK_UNAVAILABLE.error(f"could not take the lock at {lock_path}: {e}") from e
 
     with handle:
         try:
@@ -49,7 +49,7 @@ def exclusive(path: Path) -> Iterator[None]:
             # XDG_STATE_HOME can refuse it, and ENOLCK is reachable under resource
             # exhaustion — and this primitive sits under nearly every command, so a raw
             # OSError from here escapes as a traceback exactly as one from `open` did.
-            raise CromError(f"could not take the lock at {lock_path}: {e}") from e
+            raise Reason.LOCK_UNAVAILABLE.error(f"could not take the lock at {lock_path}: {e}") from e
         try:
             yield
         finally:
