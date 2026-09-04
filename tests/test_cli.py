@@ -2285,16 +2285,19 @@ class CliTest(unittest.TestCase):
         then hand the first person to reach it a `TypeError` where crom meant to hand them
         a sentence. So the agreement is asserted over the source instead.
 
-        Statically-named sites only: `chrome.launch` binds a reason to a local — one per
-        ending its match arms can reach — and raises through it, which no reader of the
-        source can resolve to a member. That site passes no fields, and the reasons it can
-        hold declare none; the constraint keeping it safe lives in `Reason`, which is where
-        this test sends anyone who breaks it.
+        A raise through a local or an expression names no member, so it answers to the one
+        rule still static: pass no fields — which is what makes it safe for the reasons it
+        can reach. Neither arm sees a reason *reachable through* such a site later
+        declaring one; that constraint lives in `Reason`.
         """
-        sites = [
-            (path.name, node)
+        trees = [
+            (path.name, ast.parse(path.read_text()))
             for path in sorted(Path(cli.__file__).parent.glob("*.py"))
-            for node in ast.walk(ast.parse(path.read_text()))
+        ]
+        sites = [
+            (name, node)
+            for name, tree in trees
+            for node in ast.walk(tree)
             if isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
             and node.func.attr == "error"
@@ -2315,6 +2318,22 @@ class CliTest(unittest.TestCase):
             if {k.arg for k in node.keywords} != set(Reason[node.func.value.attr].carries)
         ]
         self.assertEqual(wrong, [], "each raise site supplies exactly what its reason carries")
+
+        # Derived from `sites`, not a second spelling of its pattern: the two lists
+        # partition the same trees, so what counts as statically named is stated once.
+        named = {id(node) for _, node in sites}
+        dynamic = [
+            f"{name}:{node.lineno}: given {tuple(k.arg for k in node.exc.keywords)}"
+            for name, tree in trees
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Raise)
+            and isinstance(node.exc, ast.Call)
+            and isinstance(node.exc.func, ast.Attribute)
+            and node.exc.func.attr == "error"
+            and id(node.exc) not in named
+            and node.exc.keywords
+        ]
+        self.assertEqual(dynamic, [], "name the reason at the raise, or pass it no fields")
 
     def test_a_reader_that_left_does_not_turn_the_envelope_into_a_traceback(self):
         """The envelope is stdout, and stdout is what gets piped — so it can meet a
