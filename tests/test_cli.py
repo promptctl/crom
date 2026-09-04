@@ -1167,6 +1167,80 @@ class CliTest(unittest.TestCase):
         self.crom("init")
         self.assertEqual(self.invoke("mcp").stderr, "")
 
+    def _assert_mcp_wires(self, *profiles: tuple[ProfileRef, int]) -> None:
+        """Assert `.mcp.json` here declares exactly `profiles`, each on its own port.
+
+        Counted as well as matched, because the expected mapping is keyed by `entry_key`
+        itself: a derivation that collapsed two profiles onto one key would collapse this
+        expectation along with the file and the comparison would hold, having asserted
+        nothing. The count is the half of the claim measured against the file rather than
+        against the code that wrote it. [LAW:one-source-of-truth]
+
+        A ref and a port, rather than the `ResolvedProfile` `mcp.write` insists on. That
+        signature exists so no caller can key an entry to one profile and point it at
+        another's port; naming the pairing independently here is what lets a test notice
+        if one ever does.
+        """
+        servers = json.loads((self.project / ".mcp.json").read_text())["mcpServers"]
+        self.assertEqual(len(servers), len(profiles))
+        self.assertEqual(
+            servers, {mcp.entry_key(ref): mcp.server_entry(port) for ref, port in profiles}
+        )
+
+    def test_mcp_wires_a_second_profile_without_disturbing_the_first(self):
+        """The collision the derived key exists to close, at the only level that shows it.
+
+        The key was a constant, so wiring `ci` after `default` in one directory overwrote
+        `default` and exited 0. No unit test reaches the case: it needs the ledger to hand
+        out two real ports.
+
+        The file is asserted whole rather than looked up by the second key, because the
+        claim is that the write *added* to it — a membership check on `ci` alone passed
+        against the constant-key code too, which also left a correct-looking `ci` entry
+        behind. [LAW:behavior-not-structure]
+
+        Silence on stderr is the same claim from the other side: crom recognises a legacy
+        entry by a key it no longer writes, so the entry it wrote for `default` a moment
+        ago is not something it offers to rename. Keys alone would miss a spurious rename,
+        because renaming crom's own fresh entry still leaves two correct entries behind.
+        """
+        self.crom("init")
+        self.crom("add", "ci")
+        default_port = int(self.crom("port").strip())
+        ci_port = int(self.crom("port", "ci").strip())
+
+        self.crom("mcp")
+        second = self.invoke("mcp", "ci")
+
+        self._assert_mcp_wires(
+            (ProfileRef("myproj", "default"), default_port),
+            (ProfileRef("myproj", "ci"), ci_port),
+        )
+        self.assertEqual(second.stderr, "")
+
+    def test_mcp_wires_two_namespaces_that_share_a_profile_name(self):
+        """Both halves of the key carry weight, not the profile name alone.
+
+        These two profiles are both called `default`, so only the namespace tells their
+        entries apart. A key derived from the name alone passes the test above and still
+        collapses this pair — and it is the pair a developer meets first, since `default`
+        is the profile `crom init` declares in every project.
+        """
+        other = self.root / "otherproj"
+        other.mkdir()
+        self.crom("init", cwd=other)
+        other_port = int(self.crom("port", cwd=other).strip())  # registers the namespace
+        self.crom("init")
+        mine_port = int(self.crom("port").strip())
+
+        self.crom("mcp")
+        self.crom("mcp", "otherproj/default")
+
+        self._assert_mcp_wires(
+            (ProfileRef("myproj", "default"), mine_port),
+            (ProfileRef("otherproj", "default"), other_port),
+        )
+
     # --- collision avoidance, the whole point ---------------------------------------
 
     def test_two_projects_get_different_ports_and_directories(self):
