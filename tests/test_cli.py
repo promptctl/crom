@@ -1820,6 +1820,10 @@ class CliTest(unittest.TestCase):
         empty stderr to exit 120 and `Error: Broken pipe` — 120 rather than 1 because
         the wrapper never got installed, so interpreter shutdown then failed to flush
         stdout as well. Two regressions from one widened `except`.
+
+        The `--json` envelope inherits the carve-out rather than reopening it: a reader
+        that has already gone is the one failure with nowhere to put a document, so both
+        streams stay empty even when a caller asked for JSON.
         """
         self.crom("init")
         with mock.patch(
@@ -1837,6 +1841,200 @@ class CliTest(unittest.TestCase):
         ):
             result = self.invoke("list", expect=1)
         self.assertEqual(result.stderr.strip(), "Error: Cannot send")
+
+        # The same two errno values decide the envelope, and asserting both is what says
+        # the carve-out is keyed on `EPIPE` rather than on `BrokenPipeError`: one class,
+        # two answers. A reader that left gets silence on both streams; a socket crom
+        # really failed to write is an ordinary failure and gets its document.
+        with mock.patch(
+            "crom.chrome.scan", side_effect=BrokenPipeError(errno.EPIPE, "Broken pipe")
+        ):
+            gone = self.invoke("list", "--json", expect=1)
+        self.assertEqual((gone.stdout, gone.stderr), ("", ""))
+
+        with mock.patch(
+            "crom.chrome.scan", side_effect=BrokenPipeError(errno.ESHUTDOWN, "Cannot send")
+        ):
+            refused = self.invoke("list", "--json", expect=1)
+        self.assertEqual(
+            json.loads(refused.stdout)["error"],
+            {"code": 1, "kind": "os_error", "message": "Cannot send"},
+        )
+
+    @contextlib.contextmanager
+    def _two_profiles_pinning_one_port(self):
+        """A config `list` refuses to load, restored afterwards so one case cannot
+        decide what the next one sees."""
+        path = self.project / ".crom.toml"
+        original = path.read_text()
+        path.write_text(original + "\n[profiles.ci]\nport = 9401\n")
+        try:
+            yield
+        finally:
+            path.write_text(original)
+
+    def test_a_json_caller_gets_the_failure_as_data(self):
+        """A caller that asked for JSON gets a document on stdout for every exit code.
+
+        Each refusal is run twice — once plain, once with `--json` — because the promise
+        is that the flag *adds* the machine's copy rather than trading the human's away.
+        Comparing the two runs is what makes that checkable: stderr has to come back
+        byte-identical, so no script reading crom's messages today is disturbed, and plain
+        stdout has to stay empty, because `crom list > out` already assumes it.
+
+        The message is asserted to be the stderr sentence itself, not merely a non-empty
+        string: it is one string rendered to two streams, and a test that accepted any
+        text would pass against two wordings that had drifted apart.
+        [LAW:one-source-of-truth]
+        """
+        self.crom("init")
+        self.crom("add", "dev", "--port", "9401")
+
+        refusals = (
+            # 3: a namespace nothing declares.
+            (("up", "nosuchns/x"), contextlib.nullcontext(), 3, "not_found"),
+            # 1: the operating system refusing the process table.
+            (
+                ("list",),
+                mock.patch(
+                    "crom.chrome.scan",
+                    side_effect=PermissionError(13, "Permission denied", "/bin/ps"),
+                ),
+                1,
+                "os_error",
+            ),
+            # 4: two profiles pinning one port, which `list` meets while loading.
+            (("list",), self._two_profiles_pinning_one_port(), 4, "conflict"),
+        )
+
+        for args, refusal, code, kind in refusals:
+            with self.subTest(command=args[0], code=code):
+                with refusal:
+                    plain = self.invoke(*args, expect=code)
+                    asked = self.invoke(*args, "--json", expect=code)
+
+                self.assertEqual(plain.stdout, "")
+                self.assertEqual(asked.stderr, plain.stderr)
+
+                error = json.loads(asked.stdout)["error"]
+                self.assertEqual(error["code"], code)
+                self.assertEqual(error["kind"], kind)
+                self.assertEqual(f"Error: {error['message']}", plain.stderr.strip())
+
+    def test_the_kind_says_what_the_exit_code_cannot(self):
+        """Both of these are exit 1, and they are not the same failure.
+
+        crom refusing and the OS refusing share a code, because the published vocabulary
+        has four values and cannot grow without breaking the contract a script branches
+        on. So `kind` is the field that separates them — one means the request was wrong,
+        the other means the machine got in the way, and only the second is worth a retry.
+
+        This is also what stops `kind` from being `code` spelled a second time: derive one
+        from the other and this test fails, because there is no function from 1 to both
+        answers. [LAW:one-source-of-truth]
+        """
+        self.crom("init")
+
+        kinds = []
+        for error in (
+            PermissionError(13, "Permission denied", "/bin/ps"),
+            CromError("ps is not on PATH"),
+        ):
+            with mock.patch("crom.chrome.scan", side_effect=error):
+                result = self.invoke("list", "--json", expect=1)
+            kinds.append(json.loads(result.stdout)["error"]["kind"])
+
+        self.assertEqual(kinds, ["os_error", "failure"])
+
+    def test_a_reader_that_left_does_not_turn_the_envelope_into_a_traceback(self):
+        """The envelope is stdout, and stdout is what gets piped — so it can meet a
+        reader that has already gone.
+
+        Measured against the real binary before this was fixed: `crom up nosuchns/x
+        --json` with stdout on a reader-less pipe exited 120 with a stack trace, while the
+        same command without the flag exited 3 in silence. The envelope was being written
+        from the exception's `show`, which click calls from its own `except
+        ClickException` arm — and that arm's sibling `except OSError`, the one installing
+        `PacifyFlushWrapper` for `errno.EPIPE`, cannot catch what it raises. 120 rather
+        than 1 for the same reason as ever: the wrapper never got installed, so shutdown
+        then failed to flush too.
+
+        Writing it from the boundary instead puts it back inside the region click
+        protects. Patching `click.echo` reaches only that write — `click.exceptions` binds
+        its own `echo` by direct import, so the stderr prose is untouched by this mock and
+        an escape here can only have come from the envelope.
+        """
+        self.crom("init")
+        with mock.patch(
+            "crom.cli.click.echo", side_effect=BrokenPipeError(errno.EPIPE, "Broken pipe")
+        ):
+            result = self.invoke("up", "nosuchns/x", "--json", expect=1)
+
+        # Silence on both streams, which is the conventional end of a pipeline whose
+        # reader left — and exit 1, the same ending `crom list | head` already gets.
+        self.assertEqual((result.stdout, result.stderr), ("", ""))
+
+    def test_a_failure_raised_before_parsing_has_no_flag_to_honour_yet(self):
+        """Where the envelope's promise actually stops, asserted rather than left to be
+        discovered by a script author.
+
+        click runs the group callback before it parses the invoked subcommand's options,
+        and `main` does real work there — `migrate.run_if_needed()` and
+        `_bootstrap_user_config()`, either of which can refuse. A `CromError` from that
+        window is raised before `--json` has been parsed, so crom has not yet learned that
+        the caller asked, and the failure reaches them as prose only.
+
+        This is one line and not two ad-hoc gaps: the envelope answers for a command crom
+        has understood, which also excludes click's own usage errors (exit 2). Closing it
+        means moving migration and bootstrap out of the group callback so that nothing can
+        fail ahead of parsing — a change to when migration runs for every command, `crom
+        init` included, so it is its own piece of work rather than a rider on this one.
+
+        Asserted here so the limitation is known and stable. If it is ever closed, this
+        test is the one that should fail and be rewritten — not quietly deleted.
+        """
+        self.crom("init")
+        with mock.patch(
+            "crom.migrate.run_if_needed", side_effect=CromError("a legacy Chrome is still running")
+        ):
+            result = self.invoke("list", "--json", expect=1)
+
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr.strip(), "Error: a legacy Chrome is still running")
+
+    def test_every_command_offering_json_answers_a_failure_in_json(self):
+        """The envelope belongs to the flag, so every command carrying the flag has it.
+
+        The commands are discovered from click rather than listed here, which is the
+        whole claim: `--json` is one declaration whose callback records that it was
+        passed, so a command added tomorrow is covered without anyone remembering to
+        cover it. Naming them instead would test six instances of a rule and leave the
+        rule itself unasserted. [LAW:single-enforcer]
+
+        `load_ambient` is the seam because all six cross it to learn what is declared —
+        one refusal, six commands, and no command contains a line about envelopes.
+        """
+        self.crom("init")
+        offering = [
+            name
+            for name in cli.main.list_commands(None)
+            if any("--json" in option.opts for option in cli.main.get_command(None, name).params)
+        ]
+        # A discovery that found nothing would loop zero times and assert nothing — an
+        # answer-shaped void wearing a passing test as a costume. New commands may join
+        # freely; the loop is what covers them. [LAW:parse-dont-validate]
+        self.assertGreaterEqual(set(offering), {"up", "down", "restart", "show", "list", "config"})
+
+        for name in offering:
+            with self.subTest(command=name):
+                with mock.patch(
+                    "crom.cli.load_ambient", side_effect=CromError("no ambient config")
+                ):
+                    result = self.invoke(name, "--json", expect=1)
+                self.assertEqual(
+                    json.loads(result.stdout)["error"],
+                    {"code": 1, "kind": "failure", "message": "no ambient config"},
+                )
 
 
 
