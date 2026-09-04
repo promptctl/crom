@@ -468,6 +468,10 @@ class LaunchReadinessTest(unittest.TestCase):
             mock.patch("crom.chrome._require_port_available"),
             mock.patch.object(chrome, "find_pids", side_effect=lambda _p: tuple(self.running)),
             mock.patch.object(chrome, "_signal", self.record_signal),
+            # Stubbed free for the same reason `KillTest` stubs it: left real, every
+            # failing launch here would bind this port on the machine running the suite.
+            # The tests about a port that will *not* come free override it.
+            mock.patch.object(chrome, "_port_is_free", lambda _port: True),
         ):
             patch.start()
             self.addCleanup(patch.stop)
@@ -585,6 +589,104 @@ class LaunchReadinessTest(unittest.TestCase):
 
         self.assertEqual(self.signals, [(4242, signal.SIGTERM)])
 
+    def test_a_launch_that_saw_only_silence_waits_for_its_own_port_to_come_free(self):
+        """A port bound but never served is still crom's to wait out.
+
+        `_NeverAnswered` is reachable only while the probe keeps returning `_Silent`, so
+        nothing ever answered — but `_port_is_free` tests bindability, not answerability,
+        and a Chrome that bound the socket and was too slow to serve `/json/version` reads
+        as silence the whole way. Killing it leaves the socket in teardown, and the retry
+        that follows meets `_require_port_available` blaming "another process" for residue
+        of the launch crom itself just cleaned up. The wait is what closes that window.
+        """
+        asked: list[bool] = []
+
+        def port_is_free(_port: int) -> bool:
+            # Held for the first two looks, free after — the ordinary shape of a socket
+            # outliving the process that opened it.
+            asked.append(len(asked) >= 2)
+            return asked[-1]
+
+        with (
+            mock.patch.object(chrome, "SHUTDOWN_TIMEOUT_SECONDS", 5.0),
+            mock.patch.object(chrome, "_port_is_free", port_is_free),
+            mock.patch.object(chrome, "LAUNCH_TIMEOUT_SECONDS", 0.3),
+            mock.patch.object(chrome, "_probe_port", return_value=chrome._Silent()),
+            self.assertRaises(CromError) as caught,
+        ):
+            chrome.launch(self.profile)
+
+        # Asked past the two held looks and did not give up until one came back free. A
+        # cleanup that demanded the process table only would never have asked at all, and
+        # would have returned inside the window the next `up` then falls into.
+        self.assertTrue(asked and asked[-1], f"never saw the port come free: {asked}")
+        self.assertGreaterEqual(len(asked), 3)
+        # Waited it out rather than escalating: the browser itself was already gone.
+        self.assertEqual(self.signals, [(4242, signal.SIGTERM)])
+        self.assertNotIn("could not clear up", str(caught.exception))
+
+    def test_a_port_that_never_comes_free_is_reported_without_costing_the_diagnosis(self):
+        """[LAW:no-silent-failure] the residue is named, and named *alongside* the cause.
+
+        The launch error is the primary failure and the cleanup is secondary, so a port
+        that will not come free adds a line and takes nothing away. That is why demanding
+        the port here is affordable at all — unlike `kill`, this never raises over the one
+        message the user can act on.
+        """
+        with (
+            mock.patch.object(chrome, "SHUTDOWN_TIMEOUT_SECONDS", 0.2),
+            mock.patch.object(chrome, "_port_is_free", lambda _port: False),
+            mock.patch.object(chrome, "LAUNCH_TIMEOUT_SECONDS", 0.3),
+            mock.patch.object(chrome, "_probe_port", return_value=chrome._Silent()),
+            self.assertRaises(CromError) as caught,
+        ):
+            chrome.launch(self.profile)
+
+        message = str(caught.exception)
+        self.assertIn("was still running but had not opened CDP port", message)  # kept
+        self.assertIn("could not clear up", message)
+        self.assertIn(f"port {self.profile.port} is still held", message)
+        self.assertIn("lsof", message)
+        self.assertNotIn("are still running", message)  # the browser itself did stop
+
+    def test_a_process_table_crom_cannot_read_never_replaces_the_launch_diagnosis(self):
+        """The regression cleanup introduced: `scan` raising over the reason for the failure.
+
+        `_stop_after_failure` runs inside the f-string that builds the launch error, so a
+        `ps` that will not run used to propagate in its place — discarding the exit code,
+        the timeout and the quoted stderr in favour of an unrelated message, at exactly the
+        moment those were the only actionable things crom had.
+        """
+        self.proc.poll.return_value = 3
+        with (
+            mock.patch.object(chrome, "find_pids", side_effect=CromError("`ps` exited 1")),
+            mock.patch.object(chrome, "_probe_port", return_value=chrome._Silent()),
+            self.assertRaises(CromError) as caught,
+        ):
+            chrome.launch(self.profile)
+
+        message = str(caught.exception)
+        self.assertIn("exited 3 during startup", message)  # the diagnosis survives
+        self.assertIn("could not clear up", message)  # and the cleanup failure is said too
+        self.assertIn("`ps` exited 1", message)
+
+    def test_a_browser_crom_may_not_signal_is_reported_rather_than_crashed_through(self):
+        """`_signal` catches only `ProcessLookupError`, so a process crom does not own
+        raises `PermissionError` — an `OSError`, and one that would replace the diagnosis
+        exactly as the `ps` failure did. Enumerating half the ways cleanup can fail would
+        just move the bug."""
+        with (
+            mock.patch.object(chrome, "_signal", mock.Mock(side_effect=PermissionError("nope"))),
+            mock.patch.object(chrome, "LAUNCH_TIMEOUT_SECONDS", 0.3),
+            mock.patch.object(chrome, "_probe_port", return_value=chrome._Silent()),
+            self.assertRaises(CromError) as caught,
+        ):
+            chrome.launch(self.profile)
+
+        message = str(caught.exception)
+        self.assertIn("was still running but had not opened CDP port", message)
+        self.assertIn("nope", message)
+
     def test_a_stranger_still_gets_its_own_diagnosis_and_not_a_stop_failure(self):
         """Why cleanup demands the process table only, and never the port.
 
@@ -613,9 +715,8 @@ class LaunchReadinessTest(unittest.TestCase):
         """[LAW:no-silent-failure] residue crom could not clear is reported, not hidden.
 
         The one case where the leak survives: SIGKILL does not end it. The launch error
-        keeps its own diagnosis and grows a line saying a browser was left running and
-        which pid to chase, so `crom list` calling the profile running is at least an
-        answer the user has been warned about.
+        keeps its own diagnosis and grows a line naming the pid to chase, so `crom list`
+        calling the profile running is at least an answer the user has been warned about.
         """
         self.running = [4242]
         with (
@@ -629,7 +730,7 @@ class LaunchReadinessTest(unittest.TestCase):
 
         message = str(caught.exception)
         self.assertIn("was still running but had not opened CDP port", message)  # kept
-        self.assertIn("left it running", message)
+        self.assertIn("could not clear up", message)
         self.assertIn("ps -p 4242", message)  # and how to chase what is left
         self.assertEqual(self.signals, [(4242, signal.SIGTERM), (4242, signal.SIGKILL)])
 
@@ -645,7 +746,7 @@ class LaunchReadinessTest(unittest.TestCase):
 
         self.assertIn("exited 3 during startup", str(caught.exception))
         self.assertEqual(self.signals, [])
-        self.assertNotIn("left it running", str(caught.exception))
+        self.assertNotIn("could not clear up", str(caught.exception))
 
     def test_a_stranger_ends_the_wait_without_serving_out_the_timeout(self):
         """A listener holding the port is why Chrome cannot have it; waiting changes that
@@ -1254,7 +1355,7 @@ class StderrCaptureTest(unittest.TestCase):
             self.bounded(lambda: chrome.launch(profile), seconds=30.0)
 
         self.assertIn("had not opened CDP port", str(caught.exception))
-        self.assertNotIn("left it running", str(caught.exception))
+        self.assertNotIn("could not clear up", str(caught.exception))
         self.assertEqual(chrome.find_pids_for_dir(profile.profile_dir), ())
 
     def test_the_failure_that_stranded_the_browser_still_reads_as_that_failure(self):

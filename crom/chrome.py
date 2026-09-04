@@ -772,12 +772,14 @@ def launch(profile: ResolvedProfile) -> tuple[int, ...]:
                 f"Chrome for '{profile.ref}' exited {returncode} during startup, before "
                 f"it opened CDP port {profile.port}.{said}\nCommand was: {command}"
             )
+            demand = _still_held
         case _NeverAnswered():
             problem = (
                 f"Chrome for '{profile.ref}' was still running but had not opened CDP "
                 f"port {profile.port} within {LAUNCH_TIMEOUT_SECONDS:.0f}s.{said}\n"
                 f"Command was: {command}"
             )
+            demand = _still_held
         case _AnsweredByStranger(served):
             problem = (
                 f"port {profile.port} (assigned to '{profile.ref}') is answering, but not "
@@ -786,14 +788,30 @@ def launch(profile: ResolvedProfile) -> tuple[int, ...]:
                 f"could never be reached there.\n{_lsof_hint(profile.port)}{said}\n"
                 f"Command was: {command}"
             )
+            # The one arm holding positive evidence of who owns the port: a foreign
+            # listener answered on it. Waiting for it to come free is provably futile, and
+            # the two shutdown timeouts would be spent to learn nothing. Every other arm
+            # saw only silence, which is no evidence at all — there the likely holder is
+            # crom's own browser, and waiting is what keeps the next `up` honest.
+            demand = _processes_held
 
     # Every ending below the success arm is a failed launch, so the browser is stopped on
-    # one path rather than in each arm. [LAW:dataflow-not-control-flow]
-    raise CromError(f"{problem}{_stop_after_failure(profile)}")
+    # one path rather than in each arm. [LAW:dataflow-not-control-flow] What differs is the
+    # demand each ending can justify, and that is a value the arm supplies.
+    raise CromError(f"{problem}{_stop_after_failure(profile, demand)}")
 
 
-def _stop_after_failure(profile: ResolvedProfile) -> str:
-    """End the browser a failed `launch` started, and describe whatever would not end.
+# What a caller demands of a stop, expressed as the thing that reads the world and reports
+# whatever still contradicts the demand — empty meaning "kept". Which halves are demanded
+# is a value crossing this boundary rather than a flag inside the escalation, because the
+# callers demand genuinely different things and none is a special case of a mode: `kill`
+# needs the profile relaunchable, and a failed `launch` demands what its ending justifies.
+# [LAW:dataflow-not-control-flow]
+_Release = Callable[[ResolvedProfile], tuple[str, ...]]
+
+
+def _stop_after_failure(profile: ResolvedProfile, demand: _Release) -> str:
+    """End what a failed `launch` started, and describe whatever would not end.
 
     The browser is crom's to stop here and nowhere else: crom started it seconds ago, so
     nothing has had time to open a tab in it, and it is unreachable — that is what the
@@ -801,34 +819,27 @@ def _stop_after_failure(profile: ResolvedProfile) -> str:
     list`, which keys on the user-data-dir, calls the profile healthily running. True, and
     useless, since the browser cannot be driven.
 
-    The demand is `_processes_held` rather than `kill`'s `_still_held`, because the port is
-    not crom's to insist on from here. In the `_AnsweredByStranger` arm the port belongs to
-    a foreign listener that will not yield inside any deadline, so demanding it would spend
-    two shutdown timeouts and then bury an exact diagnosis under "could not stop".
-
     Killing is the whole job; the profile directory is left intact. `crom-stderr.log` in it
     is the post-mortem for the very failure being cleaned up after, and this runs after
     `sink.quoted()` has already been read, so the browser dies with nothing left to say.
 
-    [LAW:no-silent-failure] A browser that survives SIGKILL is not quietly abandoned — the
-    launch error grows a line naming the pids, so residue crom could not clear is at worst
-    reported rather than hidden.
+    [LAW:no-silent-failure] Nothing here is swallowed and nothing here may replace the
+    diagnosis it is appended to. Residue crom could not clear is reported as extra lines,
+    and so is a cleanup that could not run at all: `scan` raises when `ps` is missing, and
+    `os.kill` raises for a process crom does not own. Both used to propagate out of the
+    f-string building the launch error, discarding the exit code, the timeout, the quoted
+    stderr — the only actionable things crom had — in favour of an unrelated `ps` message.
+    A failure to clean up is exactly "whatever would not end", so it lands in the return
+    value like any other, and this stays a function that cannot raise.
     """
-    unmet = _escalate(profile, find_pids(profile), _processes_held)
+    try:
+        unmet = _escalate(profile, find_pids(profile), demand)
+    except (CromError, OSError) as e:
+        unmet = (f"crom could not tell: {e}",)
     residue = "".join(f"\n  - {line}" for line in unmet)
-    return (
-        f"\nThe browser crom started could not be stopped, so this failed launch has "
-        f"left it running:{residue}"
-    ) * bool(unmet)
-
-
-# What a caller demands of a stop, expressed as the thing that reads the world and reports
-# whatever still contradicts the demand — empty meaning "kept". Which halves are demanded
-# is a value crossing this boundary rather than a flag inside the escalation, because the
-# two callers demand genuinely different things and neither is a special case of a mode:
-# `kill` needs the profile relaunchable, and a failed `launch` needs only that crom left no
-# browser behind. [LAW:dataflow-not-control-flow]
-_Release = Callable[[ResolvedProfile], tuple[str, ...]]
+    # Worded for both halves and for the arm that could not look, since one message covers
+    # a surviving browser, a port that never came free, and a `ps` that would not run.
+    return f"\ncrom could not clear up after this failed launch:{residue}" * bool(unmet)
 
 
 def _processes_held(profile: ResolvedProfile) -> tuple[str, ...]:
