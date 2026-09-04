@@ -13,6 +13,7 @@ from crom.model import (
     Layer,
     ProfileRef,
     Reason,
+    Resolution,
     ProfileSpec,
     ResolvedProfile,
     parse_ref,
@@ -29,16 +30,20 @@ class ParseRefTest(unittest.TestCase):
         self.assertEqual(parse_ref("other/dev", "myapp"), ProfileRef("other", "dev"))
 
     def test_a_third_segment_is_an_error_not_a_guess(self):
-        with self.assertRaisesRegex(CromError, "invalid profile reference"):
+        with self.assertRaisesRegex(CromError, "invalid profile reference") as caught:
             parse_ref("a/b/c", "myapp")
+        # `parse_ref` reuses `validate_name`'s slug for a reference typed at the CLI,
+        # which is the case the grouping comment in `Reason` used to hide.
+        self.assertIs(caught.exception.reason, Reason.INVALID_NAME)
 
     def test_the_reference_type_validates_its_own_fields(self):
         """The module docstring promises names are "checked once, where they enter, and
         never again" — which is a property of the type, not of caller discipline. A
         caller that never went through `parse_ref` gets the same guarantee, so
         `resolve_spec` can compose a path from these fields without wondering."""
-        with self.assertRaisesRegex(CromError, "invalid namespace"):
+        with self.assertRaisesRegex(CromError, "invalid namespace") as caught:
             ProfileRef("../escape", "dev")
+        self.assertIs(caught.exception.reason, Reason.INVALID_NAME)
         with self.assertRaisesRegex(CromError, "invalid profile name"):
             ProfileRef("myapp", "Not A Name")
 
@@ -193,6 +198,15 @@ class ComposeTest(unittest.TestCase):
         # `internal` is the one slug that means "file a bug" rather than "fix your
         # input", so it must not be reachable by anything a config file can say — and
         # a reader who gets it has been told the right thing about whose fault it is.
+        self.assertIs(caught.exception.reason, Reason.INTERNAL)
+
+    def test_a_resolution_that_answers_nothing_is_a_crom_bug_not_a_config_fault(self):
+        """`Resolution` exists to say where a value came from, so one holding no answers
+        has nothing to report and no honest way to render itself. Nothing a config file
+        can say reaches this — only crom building the type wrong does, which is what
+        `internal` is for and why it must stay unreachable from any input."""
+        with self.assertRaisesRegex(CromError, "nothing was resolved") as caught:
+            Resolution(question="--headless", answers=())
         self.assertIs(caught.exception.reason, Reason.INTERNAL)
         with self.assertRaisesRegex(CromError, "must name where it was written"):
             Layer(drops=frozenset({"--headless"}))

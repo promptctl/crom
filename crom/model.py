@@ -113,7 +113,12 @@ class Reason(Enum):
     NAMESPACE_RESERVED = ("namespace_reserved", Conflict)
     PORT_CONFLICT = ("port_conflict", Conflict)
     PORT_EXHAUSTED = ("port_exhausted", Conflict)
-    PROFILE_DIFFERS = ("profile_differs", Conflict)
+    # Not `profile_differs`: `_reject_restatement` raises this for `crom add` comparing a
+    # profile's declaration *and* for `crom init` comparing the project's own namespace
+    # and defaults, a command that names no profile at all. One slug rather than two
+    # because the next move is the same either way — edit the file or change the request
+    # — and a slug earns its place by separating next moves, not by being finer.
+    DECLARATION_DIFFERS = ("declaration_differs", Conflict)
 
     # A config file crom cannot act on.
     CONFIG_INVALID = ("config_invalid", CromError)
@@ -127,7 +132,8 @@ class Reason(Enum):
     # typed at the CLI — `crom up a/b/c` — which never touched one.
     INVALID_NAME = ("invalid_name", CromError)
 
-    # The port ledger crom keeps for itself.
+    # The port ledger crom keeps for itself — and, during migration, the legacy registry
+    # `migrate._read_legacy` reads, which is a different file at a different path.
     REGISTRY_INVALID = ("registry_invalid", CromError)
     REGISTRY_UNSUPPORTED = ("registry_unsupported", CromError)
 
@@ -166,6 +172,10 @@ class Reason(Enum):
     AUTOMATION_DENIED = ("automation_denied", CromError)
     PLATFORM_UNSUPPORTED = ("platform_unsupported", CromError)
     WINDOW_RAISE_FAILED = ("window_raise_failed", CromError)
+
+    # Where crom keeps things, when the home directory that anchors it cannot be found.
+    # `paths` resolves the XDG config and state directories under nearly every command,
+    # so this is no more a desktop fact than the lock above is a browser one.
     HOME_UNKNOWN = ("home_unknown", CromError)
 
     # Housekeeping that failed after the request was understood.

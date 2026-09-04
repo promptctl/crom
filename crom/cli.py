@@ -755,7 +755,7 @@ def _reject_restatement(
         if asked is not None and declared != asked
     ]
     if differing:
-        raise Reason.PROFILE_DIFFERS.error("\n".join((subject, *differing, remedy)))
+        raise Reason.DECLARATION_DIFFERS.error("\n".join((subject, *differing, remedy)))
 
 
 @main.command("add")
