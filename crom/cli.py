@@ -65,7 +65,7 @@ from .model import (
     slug_for,
     validate_name,
 )
-from .paths import PROJECT_CONFIG_CANDIDATES, user_config_file
+from .paths import PROJECT_CONFIG_CANDIDATES, registry_file, user_config_file
 
 EXIT_FAILURE = 1
 EXIT_NOT_FOUND = 3
@@ -239,15 +239,16 @@ def _answer(ctx: click.Context, error: Exception, message: str) -> _Failure:
 
 # How `crom --help` groups its commands, as data rather than as prose that has to be
 # re-edited alongside every new command. Alphabetical order — click's default — presented
-# eleven commands as a flat undifferentiated list, so the help named every piece and
+# the commands as one flat undifferentiated list, so the help named every piece and
 # nothing about how the pieces fit; a reader could learn that `mcp`, `port` and `forget`
 # exist without learning that the first two are things you do *to a running profile* and
 # the third is not. [FRAMING:representation] a listing is a map of the CLI, and the CLI's
-# real structure is these three jobs.
+# real structure is these jobs.
 _COMMAND_SECTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Run a browser", ("up", "down", "restart", "show", "list")),
     ("Point tools at one", ("mcp", "env", "port")),
     ("Declare what exists", ("init", "add", "rm", "config", "forget")),
+    ("Look after crom's own state", ("doctor",)),
 )
 
 
@@ -1578,6 +1579,54 @@ def forget_cmd(namespace: str):
     """Drop a namespace from the registry, releasing its reserved ports."""
     released = registry.forget_namespace(validate_name("namespace", namespace))
     click.echo(f"Forgot namespace '{namespace}' ({released} port reservation(s) released)")
+
+
+@main.command("doctor")
+@_json_option
+def doctor_cmd(as_json: bool):
+    """Show the port ledger — including reservations no config declares.
+
+    `crom list` reads the config files and reports what they declare; this reads the
+    ledger and reports what crom is actually holding. A profile deleted from a
+    `.crom.toml` keeps its reservation, so the two answers differ exactly where
+    something has leaked — which is the only reason to run this.
+    """
+    ledger = registry.reservations()
+    # By port, because the port is what the ledger is a ledger of: a run of numbers with
+    # a hole in it, or two rows landing on one number, is what a reader is here to see,
+    # and neither is visible in an order sorted by name. The ref breaks ties rather than
+    # leaving equal ports in dict order — `_reject_foreign_claim` keeps ports unique
+    # through crom's own writers, and a ledger that got past them is this command's
+    # subject, not its impossible case.
+    rows = sorted(ledger.items(), key=lambda entry: (entry[1].port, entry[0]))
+
+    path = registry_file()
+    # Named on both sides, so the human and the machine are told the same thing. The file
+    # is the answer's other half while hand-editing it is the only way to release one
+    # orphaned reservation: a reader who has just been shown a leak needs to know where
+    # it is written. That also makes an object the shape here where `crom list` gives an
+    # array — an array has nowhere to put it. [FRAMING:representation]
+    _emit(
+        as_json,
+        {
+            "registry": str(path),
+            "reservations": [held.describe(ref=ref) for ref, held in rows],
+        },
+        [
+            # Unconditional, so an empty ledger reads as an answer rather than as output
+            # that got cut off. `reservation(s)` is how `crom forget` already counts the
+            # same noun. [LAW:dataflow-not-control-flow]
+            f"{len(rows)} reservation(s) in {path}",
+            *(
+                f"  {held.port:<6}{ref:30s}{'pinned' if held.pinned else '':8s}"
+                # Not registry's own "assigned by crom" for a missing source: `pinned`
+                # is already its own column here, so this one answers for the config
+                # file alone and says plainly that the ledger records none.
+                f"{held.source or '(no config recorded)'}"
+                for ref, held in rows
+            ),
+        ],
+    )
 
 
 def _delete_profile_data(profile: ResolvedProfile) -> None:

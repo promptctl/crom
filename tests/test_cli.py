@@ -26,7 +26,7 @@ from click.testing import CliRunner
 from crom import cli, config, configwrite, mcp
 from crom.config import load_ambient
 from crom.model import Conflict, CromError, ProfileRef, Reason
-from crom.paths import state_home, user_config_file
+from crom.paths import registry_file, state_home, user_config_file
 
 # README.md is the only place a reader learns the failure envelope's vocabulary, so it
 # holds two enumerations the code owns. Located from this file rather than from the
@@ -135,10 +135,9 @@ class CliTest(unittest.TestCase):
     def failure(self, *args, cwd: Path | None = None) -> CromError:
         """The `CromError` behind a failed command, for the reasons no envelope carries.
 
-        `--json` is on `up`, `down`, `restart`, `show`, `list` and `config`; `add`, `init`
-        and `rm` answer in prose only, so their slug is unobservable from outside — click's
-        standalone mode turns `CromGroup.invoke`'s answer into a `SystemExit`, and the
-        chain goes with it. Standing that mode down keeps the link the boundary already
+        A command that answers in prose only has no envelope, so its slug is unobservable
+        from outside — click's standalone mode turns `CromGroup.invoke`'s answer into a
+        `SystemExit`, and the chain goes with it. Standing that mode down keeps the link the boundary already
         builds — `raise _answer(...) from error` — which is how a test reads these reasons
         without calling a command's callback by hand and losing everything that runs
         before it.
@@ -1370,6 +1369,84 @@ class CliTest(unittest.TestCase):
         self.crom("forget", "otherproj")
         self.crom("up", "otherproj/default", expect=3)
 
+    # --- the ledger, and seeing into it ---------------------------------------------
+
+    def test_doctor_reports_a_reservation_no_config_still_declares(self):
+        """The leak the command exists for, and the reason `crom list` cannot report it.
+
+        `crom list` reads the config files; the ledger is a second map of the same
+        profiles, and deleting a stanza updates one of them. The reservation then holds
+        its port forever — invisible to every command, and skipped by the next profile
+        crom assigns, so the numbers develop a hole nothing explains.
+
+        `crom list` is asserted here rather than taken on trust. Without it this passes
+        against a `doctor` that only re-renders what the config declares, which is the one
+        thing this command must not be. [LAW:verifiable-goals]
+        """
+        config_file = self.project / ".crom.toml"
+        config_file.write_text('namespace = "myapp"\n\n[profiles.alpha]\n[profiles.beta]\n')
+        self.crom("list")  # resolving both stanzas is what reserves both ports
+
+        config_file.write_text('namespace = "myapp"\n\n[profiles.alpha]\n')
+
+        self.assertNotIn("myapp/beta", self.crom("list"))
+        self.assertIn("myapp/beta", self.crom("doctor"))
+
+    def test_doctor_publishes_the_ledger_it_read_and_every_row_in_it(self):
+        """The whole row, so the published shape is pinned rather than sampled.
+
+        The ledger's own path is in the answer because releasing one orphaned reservation
+        means editing that file by hand until `crom doctor` can do it — a reader shown a
+        leak needs to know where it is written. It is in both renderings, which is why the
+        JSON is an object where `crom list` gives an array: an array has nowhere to put a
+        fact about the listing itself. [FRAMING:representation]
+
+        Ports ascend because the ledger is a ledger of ports: a hole in the run, or two
+        rows on one number, is what a reader is here to find, and neither survives an
+        order sorted by name.
+        """
+        (self.project / ".crom.toml").write_text(
+            'namespace = "myapp"\n\n[profiles.dev]\nport = 9333\n[profiles.qa]\n'
+        )
+        self.crom("list")
+
+        answer = json.loads(self.crom("doctor", "--json"))
+
+        self.assertEqual(answer["registry"], str(registry_file()))
+        self.assertIn(
+            {
+                "ref": "myapp/dev",
+                "port": 9333,
+                "pinned": True,
+                "source": str(self.project / ".crom.toml"),
+            },
+            answer["reservations"],
+        )
+        ports = [row["port"] for row in answer["reservations"]]
+        self.assertEqual(ports, sorted(ports))
+
+    def test_doctor_reads_a_ledger_that_was_repaired_by_hand(self):
+        """Hand-editing this file is how an orphan is released today, so the command that
+        finds orphans has to survive a file that was hand-edited.
+
+        `registry._read` checks every entry and no key, so an edit can leave a name
+        `ProfileRef` would refuse. The row carries that name whole for exactly this
+        reason: split into `namespace` and `profile` the way a profile record is, doctor
+        would have to refuse the row, and the one command that could show the mess would
+        be the one command that could not run on the machine that has it.
+        [LAW:types-are-the-program] the row claims only what a ledger key really is.
+        """
+        self.crom("list")
+        ledger = json.loads(registry_file().read_text())
+        ledger["ports"]["Not A Ref!"] = {"port": 9444, "pinned": False, "source": None}
+        registry_file().write_text(json.dumps(ledger))
+
+        rows = json.loads(self.crom("doctor", "--json"))["reservations"]
+
+        self.assertIn(
+            {"ref": "Not A Ref!", "port": 9444, "pinned": False, "source": None}, rows
+        )
+
     # --- removal --------------------------------------------------------------------
 
     def test_rm_undeclares_the_profile_and_deletes_its_data(self):
@@ -2509,11 +2586,21 @@ class CliTest(unittest.TestCase):
         The commands are discovered from click rather than listed here, which is the
         whole claim: `--json` is one declaration whose callback records that it was
         passed, so a command added tomorrow is covered without anyone remembering to
-        cover it. Naming them instead would test six instances of a rule and leave the
+        cover it. Naming them instead would test the rule's instances and leave the
         rule itself unasserted. [LAW:single-enforcer]
 
-        `load_ambient` is the seam because all six cross it to learn what is declared —
-        one refusal, six commands, and no command contains a line about envelopes.
+        Readying is the seam because `CromGroup.command_class` puts it in front of every
+        command by construction, so the induced failure reaches a command added tomorrow
+        for the same reason the envelope does. `load_ambient` stood here first, on the
+        grounds that all six commands crossed it to learn what is declared — which was
+        true, and was a coincidence: `crom doctor` reads the ledger and asks no config
+        anything, because a doctor has to answer on the machine whose config is the
+        problem. A seam that holds for the commands that happen to exist is a claim about
+        them and not about the flag. [LAW:behavior-not-structure]
+
+        Its sibling below covers the other dimension — that *both* calls in the readying
+        window answer, rather than that every command does — so neither subsumes the
+        other.
         """
         self.crom("init")
         offering = _commands_offering_json()
@@ -2522,11 +2609,12 @@ class CliTest(unittest.TestCase):
         # freely; the loop is what covers them. [LAW:parse-dont-validate]
         self.assertGreaterEqual(offering, {"up", "down", "restart", "show", "list", "config"})
 
+        sentence = "a legacy Chrome is still running"
         for name in offering:
             with self.subTest(command=name):
                 with mock.patch(
-                    "crom.cli.load_ambient",
-                    side_effect=Reason.CONFIG_INVALID.error("no ambient config"),
+                    "crom.migrate.run_if_needed",
+                    side_effect=Reason.MIGRATION_NEEDS_QUIET.error(sentence),
                 ):
                     result = self.invoke(name, "--json", expect=1)
                 self.assertEqual(
@@ -2534,12 +2622,12 @@ class CliTest(unittest.TestCase):
                     {
                         "code": 1,
                         "kind": "failure",
-                        "reason": "config_invalid",
-                        # Present and empty rather than absent, because `config_invalid`
+                        "reason": Reason.MIGRATION_NEEDS_QUIET.value,
+                        # Present and empty rather than absent, because this reason
                         # looked nothing up. A caller reads `fields` the same way for
                         # every failure instead of testing for the key first.
                         "fields": {},
-                        "message": "no ambient config",
+                        "message": sentence,
                     },
                 )
 
