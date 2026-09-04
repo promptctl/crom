@@ -30,6 +30,11 @@ KEY_LIMIT = _TOOL_NAME_LIMIT - len("mcp__") - len("__") - len(_LONGEST_SERVER_TO
 # absent — it is the character names actually use, and it survives untouched.
 _ESCAPES = {"_": "_u", ".": "_d"}
 
+# The key every crom wrote before the key was derived from the profile (0f4b8a2). It
+# names no profile, so an entry still sitting under it says which browser it points at
+# and nothing about whose browser that is — `write` explains what is done with that.
+LEGACY_KEY = "chrome-devtools-mcp"
+
 
 def entry_key(ref: ProfileRef) -> str:
     """The `mcpServers` key `ref` owns, and that no other profile can be handed.
@@ -93,6 +98,24 @@ def write(profile: ResolvedProfile, path: Path) -> None:
     Preserves any other servers already declared in `path`, and refuses rather
     than writing: a file that isn't a JSON object we can merge into, and a ref
     `entry_key` cannot spell, both leave `path` exactly as they found it.
+
+    An entry under `LEGACY_KEY` that is *this* wiring is renamed rather than left
+    beside it. Recognising it is exact, not a guess: `server_entry` has produced one
+    shape since crom's first commit, so every entry crom ever wrote for a port equals
+    `server_entry(port)` today, and [LAW:one-source-of-truth] comparing against the
+    producer means the two cannot drift into disagreeing about crom's own handwriting.
+    Anything a human wrote under that key differs somewhere and survives untouched —
+    which is the direction to fail in, since the alternative is deleting config crom
+    did not write.
+
+    Matching this profile's port, rather than any port the ledger holds, is what makes
+    the upgrade a rename and never a re-pointing: the entry dropped and the entry
+    written name the same browser, so the file behaves identically and only the key
+    moves. A legacy entry on some *other* profile's port is left alone — it still
+    works, crom cannot tell whose it is (ports get recycled, so the ledger would answer
+    confidently and sometimes wrongly), and it is renamed when that profile is next
+    wired. The key is derived before the drop, so a ref `entry_key` refuses leaves the
+    legacy entry wired rather than dropping it for a replacement that never arrives.
     """
     if path.exists():
         try:
@@ -106,7 +129,13 @@ def write(profile: ResolvedProfile, path: Path) -> None:
             raise CromError(f'{path}: "mcpServers" must be an object, got {type(servers).__name__}')
     else:
         config = {}
-        servers = config.setdefault("mcpServers", {})
+        servers = {}
 
-    servers[entry_key(profile.ref)] = server_entry(profile.port)
+    key = entry_key(profile.ref)
+    entry = server_entry(profile.port)
+    # [LAW:dataflow-not-control-flow] the filter runs on every write; whether a legacy
+    # entry is there to drop is a fact about the data, not a branch in the mechanics.
+    servers = {n: e for n, e in servers.items() if (n, e) != (LEGACY_KEY, entry)}
+    servers[key] = entry
+    config["mcpServers"] = servers
     path.write_text(json.dumps(config, indent=2) + "\n")
