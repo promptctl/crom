@@ -22,7 +22,7 @@ import socket
 import subprocess
 import textwrap
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -768,24 +768,89 @@ def launch(profile: ResolvedProfile) -> tuple[int, ...]:
         case _Answered():
             return find_pids(profile)
         case _Exited(returncode):
-            raise CromError(
+            problem = (
                 f"Chrome for '{profile.ref}' exited {returncode} during startup, before "
                 f"it opened CDP port {profile.port}.{said}\nCommand was: {command}"
             )
         case _NeverAnswered():
-            raise CromError(
-                f"Chrome for '{profile.ref}' is still running but did not open CDP port "
-                f"{profile.port} within {LAUNCH_TIMEOUT_SECONDS:.0f}s.{said}\n"
+            problem = (
+                f"Chrome for '{profile.ref}' was still running but had not opened CDP "
+                f"port {profile.port} within {LAUNCH_TIMEOUT_SECONDS:.0f}s.{said}\n"
                 f"Command was: {command}"
             )
         case _AnsweredByStranger(served):
-            raise CromError(
+            problem = (
                 f"port {profile.port} (assigned to '{profile.ref}') is answering, but not "
                 f"as a Chrome DevTools endpoint — it served: {served}. Something else took "
                 f"the port while Chrome was starting, so the browser crom just launched "
-                f"cannot be reached there.\n{_lsof_hint(profile.port)}{said}\n"
+                f"could never be reached there.\n{_lsof_hint(profile.port)}{said}\n"
                 f"Command was: {command}"
             )
+
+    # Every ending below the success arm is a failed launch, so the browser is stopped on
+    # one path rather than in each arm. [LAW:dataflow-not-control-flow]
+    raise CromError(f"{problem}{_stop_after_failure(profile)}")
+
+
+def _stop_after_failure(profile: ResolvedProfile) -> str:
+    """End the browser a failed `launch` started, and describe whatever would not end.
+
+    The browser is crom's to stop here and nowhere else: crom started it seconds ago, so
+    nothing has had time to open a tab in it, and it is unreachable — that is what the
+    failure *was*. Left alone it keeps the profile directory and the port while `crom
+    list`, which keys on the user-data-dir, calls the profile healthily running. True, and
+    useless, since the browser cannot be driven.
+
+    The demand is `_processes_held` rather than `kill`'s `_still_held`, because the port is
+    not crom's to insist on from here. In the `_AnsweredByStranger` arm the port belongs to
+    a foreign listener that will not yield inside any deadline, so demanding it would spend
+    two shutdown timeouts and then bury an exact diagnosis under "could not stop".
+
+    Killing is the whole job; the profile directory is left intact. `crom-stderr.log` in it
+    is the post-mortem for the very failure being cleaned up after, and this runs after
+    `sink.quoted()` has already been read, so the browser dies with nothing left to say.
+
+    [LAW:no-silent-failure] A browser that survives SIGKILL is not quietly abandoned — the
+    launch error grows a line naming the pids, so residue crom could not clear is at worst
+    reported rather than hidden.
+    """
+    unmet = _escalate(profile, find_pids(profile), _processes_held)
+    residue = "".join(f"\n  - {line}" for line in unmet)
+    return (
+        f"\nThe browser crom started could not be stopped, so this failed launch has "
+        f"left it running:{residue}"
+    ) * bool(unmet)
+
+
+# What a caller demands of a stop, expressed as the thing that reads the world and reports
+# whatever still contradicts the demand — empty meaning "kept". Which halves are demanded
+# is a value crossing this boundary rather than a flag inside the escalation, because the
+# two callers demand genuinely different things and neither is a special case of a mode:
+# `kill` needs the profile relaunchable, and a failed `launch` needs only that crom left no
+# browser behind. [LAW:dataflow-not-control-flow]
+_Release = Callable[[ResolvedProfile], tuple[str, ...]]
+
+
+def _processes_held(profile: ResolvedProfile) -> tuple[str, ...]:
+    """The processes still bound to this profile, named for whoever must chase them.
+
+    Worded for the errors it is printed in — `kill`'s, and a failed `launch`'s — which is
+    why it may speak of SIGKILL: both reach it only once `_escalate` has spent both
+    signals. Every earlier round reads it only for emptiness.
+    """
+    pids = find_pids(profile)
+    listed = ", ".join(map(str, pids))
+    return (
+        f"pid(s) {listed} are still running — SIGTERM then SIGKILL did not end them. "
+        f"Inspect them with: ps -p {listed}",
+    ) * bool(pids)
+
+
+def _port_held(profile: ResolvedProfile) -> tuple[str, ...]:
+    """The profile's CDP port, if it is not yet bindable again."""
+    return (f"port {profile.port} is still held. {_lsof_hint(profile.port)}",) * (
+        not _port_is_free(profile.port)
+    )
 
 
 def _still_held(profile: ResolvedProfile) -> tuple[str, ...]:
@@ -801,36 +866,44 @@ def _still_held(profile: ResolvedProfile) -> tuple[str, ...]:
     Both halves are read in one place so that the wait and the failure message cannot come
     to disagree about what stopped means. [LAW:one-source-of-truth] An empty tuple is the
     whole promise kept, which is the only condition `kill` returns on.
-
-    The lines are worded for the one place they are ever printed — the error `kill` raises
-    once escalation is spent — which is why the process line may speak of SIGKILL. Every
-    earlier round reads these only for emptiness.
     """
-    pids = find_pids(profile)
-    listed = ", ".join(map(str, pids))
-    return tuple(
-        detail
-        for detail, unmet in (
-            (
-                f"pid(s) {listed} are still running — SIGTERM then SIGKILL did not end "
-                f"them. Inspect them with: ps -p {listed}",
-                bool(pids),
-            ),
-            (
-                f"port {profile.port} is still held. {_lsof_hint(profile.port)}",
-                not _port_is_free(profile.port),
-            ),
-        )
-        if unmet
-    )
+    return _processes_held(profile) + _port_held(profile)
 
 
-def _await_release(profile: ResolvedProfile) -> tuple[str, ...]:
-    """Wait up to the shutdown timeout for the profile to give up process and port alike."""
+def _await_release(profile: ResolvedProfile, held: _Release) -> tuple[str, ...]:
+    """Wait up to the shutdown timeout for the profile to give up whatever `held` demands."""
     deadline = time.time() + SHUTDOWN_TIMEOUT_SECONDS
-    while time.time() < deadline and _still_held(profile):
+    while time.time() < deadline and held(profile):
         time.sleep(0.1)
-    return _still_held(profile)
+    return held(profile)
+
+
+def _escalate(
+    profile: ResolvedProfile, pids: tuple[int, ...], held: _Release
+) -> tuple[str, ...]:
+    """SIGTERM then SIGKILL whatever runs under this profile, until `held` reports nothing.
+
+    A table walked the same way each round — signal whatever is still alive, then wait for
+    it — rather than a graceful path and a separate forced one.
+    [LAW:dataflow-not-control-flow] A profile with nothing to signal signals nothing and
+    returns as soon as `held` is satisfied, which is what makes this safe to call
+    unconditionally on a launch that may have died before it started anything.
+
+    Takes the pids rather than reading them, so the caller signals and reports the same
+    set. Re-reading here would open a window in which a process that appeared meanwhile
+    gets signalled but is absent from what the caller returns.
+    """
+    survivors = pids
+    unmet: tuple[str, ...] = ()
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        for pid in survivors:
+            _signal(pid, sig)
+        unmet = _await_release(profile, held)
+        if not unmet:
+            return ()
+        # Re-read only between rounds, so the second round signals what the first left.
+        survivors = find_pids(profile)
+    return unmet
 
 
 def kill(profile: ResolvedProfile) -> tuple[int, ...]:
@@ -853,10 +926,10 @@ def kill(profile: ResolvedProfile) -> tuple[int, ...]:
     live endpoint belonging to a corpse. Waiting on `_still_held` rather than on the
     process table alone is what makes "stopped" mean "relaunchable".
 
-    Escalation is a table walked the same way each round — signal whatever is still
-    alive, then wait for it — rather than a graceful path and a separate forced one.
-    [LAW:dataflow-not-control-flow] A profile that was never running signals nothing and
-    returns `()` as soon as its port answers free, which is what makes `rm` and `down`
+    Escalation itself lives in `_escalate`, which a failed `launch` also uses to clear up
+    after itself. What this adds is the demand: `_still_held`, both halves, which is what
+    makes "stopped" mean "relaunchable". A profile that was never running signals nothing
+    and returns `()` as soon as its port answers free, which is what makes `rm` and `down`
     safe to call unconditionally.
 
     The uniform rule has a price, taken deliberately: a stopped profile whose port some
@@ -876,18 +949,9 @@ def kill(profile: ResolvedProfile) -> tuple[int, ...]:
     delete as a retryable `CromError` rather than a traceback.
     """
     pids = find_pids(profile)
-    survivors = pids
-    unmet: tuple[str, ...] = ()
-    for sig in (signal.SIGTERM, signal.SIGKILL):
-        for pid in survivors:
-            _signal(pid, sig)
-        unmet = _await_release(profile)
-        if not unmet:
-            return pids
-        # Re-read only between rounds. Rescanning before the first round would spend a
-        # second `ps` to re-learn what `pids` already holds, and open a window in which a
-        # process that appeared meanwhile gets signalled but is not in the returned set.
-        survivors = find_pids(profile)
+    unmet = _escalate(profile, pids, _still_held)
+    if not unmet:
+        return pids
 
     # [LAW:no-silent-failure] Returning here would report a running browser as stopped —
     # to `down`, which would print "Stopped", and to `rm`, which would go on to delete a
