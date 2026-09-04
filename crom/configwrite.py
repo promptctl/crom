@@ -115,8 +115,8 @@ def _load(path: Path) -> tomlkit.TOMLDocument:
     """Read a config for editing, or fail naming the file a human has to repair.
 
     This runs *before* `config.parse` ever sees the file, and on every command:
-    `main` calls `_bootstrap_user_config()` unconditionally, which reaches here through
-    `ensure_profile` → `_declare` before any scope is loaded. So an unparseable
+    `_bootstrap_user_config()` reaches here through `ensure_profile` → `_declare`
+    before any scope is loaded. So an unparseable
     `~/.config/crom/config.toml` raised a raw `tomlkit` error from every invocation —
     including the ones the user would reach for to fix it. [LAW:no-silent-failure] the
     same guard `config.parse` and `registry._read` already apply to their own files.
@@ -171,8 +171,8 @@ def _writing(path: Path) -> Iterator[None]:
     disk or a read-only mount names the file the user has: `_save` writes a `.tmp` and
     `os.replace`s it, so the raw `OSError` the CLI boundary reports names the temp file.
     Translating at the calls that touch the disk covers every caller rather than the one
-    whose failure was traced — `migrate.run` reaches `_save` through `ensure_profile`
-    before anything else in `main`.
+    whose failure was traced — `migrate.run` reaches `_save` through `ensure_profile`,
+    before any command runs.
 
     `CromError` passes through untouched: anything nested that raises one has already
     produced the precise diagnosis — the file it names, the key, the fix — and rewording

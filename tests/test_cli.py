@@ -69,9 +69,9 @@ class CliTest(unittest.TestCase):
         self.env = mock.patch.dict(
             os.environ,
             {
-                # HOME as well as the XDG variables, and not optional: `main` runs
-                # `migrate.run_if_needed()` before every command, and migration locates
-                # the legacy installation through `Path.home()` — the one lookup that
+                # HOME as well as the XDG variables, and not optional:
+                # `migrate.run_if_needed()` runs before every command, and migration
+                # locates the legacy installation through `Path.home()` — the lookup that
                 # deliberately ignores XDG, because that is where the pre-namespace crom
                 # actually wrote. Without this the suite would find a developer's real
                 # `~/.config/crom/profiles.json` and migrate their actual profiles.
@@ -140,8 +140,8 @@ class CliTest(unittest.TestCase):
         standalone mode turns `CromGroup.invoke`'s answer into a `SystemExit`, and the
         chain goes with it. Standing that mode down keeps the link the boundary already
         builds — `raise _answer(...) from error` — which is how a test reads these reasons
-        without calling a command's callback by hand and losing everything `main` does
-        first.
+        without calling a command's callback by hand and losing everything that runs
+        before it.
 
         The command runs identically either way: only click's handling of what it raised
         differs, so a test may still assert on what the run left behind.
@@ -162,10 +162,9 @@ class CliTest(unittest.TestCase):
     def test_the_suite_cannot_reach_the_real_home(self):
         """A guard rail rather than a feature test.
 
-        `main` runs `migrate.run_if_needed()` before every command, and migration
-        locates the legacy installation through `Path.home()` — the one lookup that
-        deliberately ignores XDG, because that is where the pre-namespace crom actually
-        wrote. A harness redirecting only the XDG variables would let this suite find a
+        `migrate.run_if_needed()` runs before every command, and migration locates the
+        legacy installation through `Path.home()` — the one lookup that deliberately
+        ignores XDG, because that is where the pre-namespace crom actually wrote. A harness redirecting only the XDG variables would let this suite find a
         developer's real `~/.config/crom/profiles.json` and migrate their profiles
         mid-run. If this fails, stop and fix the harness before trusting any result.
         """
@@ -183,7 +182,7 @@ class CliTest(unittest.TestCase):
     def test_a_corrupt_user_config_is_reset_rather_than_left_for_the_user(self):
         """A config crom cannot parse takes out every command, repairs included.
 
-        `main` runs `_bootstrap_user_config()` before anything else, so the failure used
+        `_bootstrap_user_config()` runs before any command does, so the failure used
         to arrive from `crom config` and `crom list` too — the two commands someone
         reaches for to find out what is wrong. There is no command crom could have named
         as the fix, which is what makes resetting the file the only useful answer.
@@ -906,6 +905,26 @@ class CliTest(unittest.TestCase):
 
         self.assertIn("myproj/default", output)
         self.assertIn("[profiles.default]", (self.project / ".crom.toml").read_text())
+
+    def test_a_bare_crom_launches_the_default_profile_like_any_other_command(self):
+        """`crom` with no arguments is `crom up`, and it is one now rather than nearly one.
+
+        The group used to carry `invoke_without_command` and reach `up`'s callback
+        through `ctx.invoke`, which goes around `Command.invoke` — so everything
+        `CromCommand` does to ready a command would have needed spelling a second time to
+        cover the bare invocation. `CromGroup.parse_args` supplies the name instead,
+        making it an ordinary invocation; this says it still means what the README says
+        it means. [LAW:one-source-of-truth]
+        """
+        self.crom("init")
+
+        with mock.patch("crom.chrome.launch", return_value=(4321,)):
+            with mock.patch("crom.seed.materialize_under_lock"):
+                bare = self.crom()
+                named = self.crom("up")
+
+        self.assertEqual(bare, named)
+        self.assertIn("myproj/default", bare)
 
     def test_removing_an_undeclared_profile_does_not_declare_it_first(self):
         """`rm` converges a profile toward not existing, so creating one on the way would
@@ -2399,34 +2418,90 @@ class CliTest(unittest.TestCase):
         # reader left — and exit 1, the same ending `crom list | head` already gets.
         self.assertEqual((result.stdout, result.stderr), ("", ""))
 
-    def test_a_failure_raised_before_parsing_has_no_flag_to_honour_yet(self):
-        """Where the envelope's promise actually stops, asserted rather than left to be
-        discovered by a script author.
+    def test_a_failure_while_readying_crom_still_answers_the_flag_on_the_command_line(self):
+        """Nothing crom does happens ahead of the parse, so nothing it does can miss the
+        flag.
 
-        click runs the group callback before it parses the invoked subcommand's options,
-        and `main` does real work there — `migrate.run_if_needed()` and
-        `_bootstrap_user_config()`, either of which can refuse. A `CromError` from that
-        window is raised before `--json` has been parsed, so crom has not yet learned that
-        the caller asked, and the failure reaches them as prose only.
+        Migration and the user-config bootstrap can both refuse, and they used to run
+        from the group callback — which click calls *before* `make_context` parses the
+        invoked subcommand's options, so `--json` had not been recorded yet and the
+        refusal reached a machine as prose over an empty stdout. `CromCommand.invoke`
+        runs them past the parse instead, which is the whole of what turns this into a
+        document.
 
-        This is one line and not two ad-hoc gaps: the envelope answers for a command crom
-        has understood, which also excludes click's own usage errors (exit 2). Closing it
-        means moving migration and bootstrap out of the group callback so that nothing can
-        fail ahead of parsing — a change to when migration runs for every command, `crom
-        init` included, so it is its own piece of work rather than a rider on this one.
-
-        Asserted here so the limitation is known and stable. If it is ever closed, this
-        test is the one that should fail and be rewritten — not quietly deleted.
+        Both halves, because the claim is about the window and not about migration: a
+        command is readied by two calls, and either one refusing has the same answer.
+        Which reason fills each is not under test — the envelope's other keys are covered
+        by the tests that raise from inside a command — so each half carries the reason
+        its own failure would really carry, and the assertion is the same either way.
         """
         self.crom("init")
+        readying = (
+            ("crom.migrate.run_if_needed", Reason.MIGRATION_NEEDS_QUIET, "a legacy Chrome is still running"),
+            ("crom.cli._bootstrap_user_config", Reason.CONFIG_UNWRITABLE, "could not write the user config"),
+        )
+        for target, reason, sentence in readying:
+            with self.subTest(target=target):
+                with mock.patch(target, side_effect=reason.error(sentence)):
+                    result = self.invoke("list", "--json", expect=1)
+
+                self.assertEqual(
+                    json.loads(result.stdout)["error"],
+                    {
+                        "code": 1,
+                        "kind": "failure",
+                        "reason": reason.value,
+                        "fields": {},
+                        "message": sentence,
+                    },
+                )
+                self.assertEqual(result.stderr.strip(), f"Error: {sentence}")
+
+    def test_an_eager_option_is_answered_without_readying_crom_at_all(self):
+        """Every `--help` still answers on a machine where no command can run.
+
+        click answers an eager option while the command line is still being parsed, so it
+        never reaches `CromCommand.invoke`. That is what keeps the help text reachable on
+        the machine where someone is most likely to be reaching for it. Readying that ran
+        any earlier would take it out with everything else: from the group callback,
+        bootstrap happened before click could descend into a subcommand, so
+        `crom up --help` failed where `crom --help` worked — splitting the two things a
+        confused user tries, on exactly the machine where they are confused.
+
+        The commands come from the click group rather than a list here, so a command
+        added tomorrow is covered without anyone remembering to cover it.
+        [LAW:single-enforcer]
+
+        The refused readying is the premise and not decoration: `crom list` failing under
+        it is what stops this passing on a healthy home and pinning nothing.
+        [LAW:verifiable-goals]
+        """
         with mock.patch(
-            "crom.migrate.run_if_needed",
-            side_effect=Reason.MIGRATION_NEEDS_QUIET.error("a legacy Chrome is still running"),
+            "crom.cli._bootstrap_user_config",
+            side_effect=Reason.CONFIG_UNWRITABLE.error("could not write the user config"),
         ):
-            result = self.invoke("list", "--json", expect=1)
+            self.crom("list", expect=1)
+
+            self.assertIn("Usage:", self.crom("--help"))
+            for name in cli.main.commands:
+                with self.subTest(command=name):
+                    self.assertIn("Usage:", self.crom(name, "--help"))
+
+    def test_bad_usage_is_the_one_failure_left_without_an_envelope(self):
+        """The carve-out the README publishes, and now the only one.
+
+        A malformed command line fails *during* the parse, so the `--json` sitting on it
+        was never understood either — there is no flag to honour rather than a flag
+        arriving too late. That is what keeps this outside the envelope permanently,
+        where the readying failures above were only outside by accident of ordering, and
+        it is why closing that accident does not promise envelopes for typos.
+        """
+        self.crom("init")
+
+        result = self.invoke("list", "--nosuchflag", "--json", expect=2)
 
         self.assertEqual(result.stdout, "")
-        self.assertEqual(result.stderr.strip(), "Error: a legacy Chrome is still running")
+        self.assertIn("No such option", result.stderr)
 
     def test_every_command_offering_json_answers_a_failure_in_json(self):
         """The envelope belongs to the flag, so every command carrying the flag has it.
@@ -2556,7 +2631,7 @@ class CliTest(unittest.TestCase):
     def test_the_version_answers_where_every_other_command_fails(self):
         """Asking crom which crom this is must not require a crom that works.
 
-        `main` migrates and bootstraps a user config before every command, so a home
+        crom migrates and bootstraps a user config before every command, so a home
         crom cannot write to takes every one of them out — which is exactly the machine
         someone is standing on when they need to know what they are running. `--version`
         is answered while the command line is still being parsed, before any of that.
