@@ -766,7 +766,23 @@ def launch(profile: ResolvedProfile) -> tuple[int, ...]:
 
     match outcome:
         case _Answered():
-            return find_pids(profile)
+            pids = find_pids(profile)
+            if not pids:
+                # CDP answering and `ps` naming the process are two separate reads, and
+                # nothing makes them agree. Returning `()` here would hand back an
+                # answer-shaped void — indistinguishable from a stopped profile at every
+                # caller, so `up` would report `"running": true` with no pids, `restart`
+                # would index into an empty tuple, and `show` would raise no window while
+                # claiming success. The promise in this function's first line is "its PIDs
+                # once CDP answers"; keeping that promise means failing when it cannot be
+                # kept. [LAW:parse-dont-validate]
+                raise CromError(
+                    f"Chrome for '{profile.ref}' answered on CDP port {profile.port}, but "
+                    f"no main browser process using {profile.profile_dir} is visible to "
+                    f"`ps`. crom cannot report or stop a browser it cannot see.{said}\n"
+                    f"Command was: {command}"
+                )
+            return pids
         case _Exited(returncode):
             problem = (
                 f"Chrome for '{profile.ref}' exited {returncode} during startup, before "

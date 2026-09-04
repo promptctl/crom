@@ -560,6 +560,26 @@ class LaunchReadinessTest(unittest.TestCase):
             self.assertEqual(chrome.launch(self.profile), (4242,))
         self.assertEqual(self.signals, [])
 
+    def test_a_browser_cdp_answers_for_but_ps_cannot_see_is_a_failed_launch(self):
+        """`launch` promises "its PIDs once CDP answers", so it must fail when it has none.
+
+        CDP answering and `ps` naming the process are two separate reads and nothing makes
+        them agree. Returning `()` would hand back an answer-shaped void — the same value a
+        stopped profile produces — so `up` would report `"running": true` carrying no pids,
+        and `restart`, which names the pid it started, would index into an empty tuple and
+        escape the CLI's exit-code contract with a bare `IndexError`.
+        [LAW:parse-dont-validate] the promise is kept, or the call fails saying so.
+        """
+        with (
+            mock.patch.object(chrome, "_probe_port", return_value=chrome._Answered()),
+            mock.patch.object(chrome, "find_pids", return_value=()),
+            self.assertRaises(CromError) as caught,
+        ):
+            chrome.launch(self.profile)
+
+        self.assertIn("not", str(caught.exception))
+        self.assertIn("visible to `ps`", str(caught.exception))
+
     def test_a_browser_that_never_answered_is_stopped_rather_than_left_running(self):
         """The leak this ticket exists to close, on the arm that always leaked.
 
