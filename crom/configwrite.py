@@ -126,7 +126,9 @@ def _load(path: Path) -> tomlkit.TOMLDocument:
     try:
         return tomlkit.parse(path.read_text())
     except (tomlkit.exceptions.ParseError, OSError) as e:
-        raise Reason.CONFIG_INVALID.error(f"{path}: cannot be read as TOML ({e}).\nRepair the file.") from e
+        raise Reason.CONFIG_INVALID.error(
+            f"{path}: cannot be read as TOML ({e}).\nRepair the file."
+        ) from e
 
 
 def _profiles_table(doc: tomlkit.TOMLDocument, path: Path, *, create: bool = False):

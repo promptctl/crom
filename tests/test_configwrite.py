@@ -419,7 +419,9 @@ class WriteFailureTest(unittest.TestCase):
         `CromError` raised by something nested inside it is already the precise message,
         and rewording it as a filesystem failure would send the reader to check the wrong
         fact — so it must pass through untouched."""
-        with mock.patch.object(Path, "mkdir", side_effect=Reason.CONFIG_UNWRITABLE.error("the precise reason")):
+        with mock.patch.object(
+            Path, "mkdir", side_effect=Reason.CONFIG_UNWRITABLE.error("the precise reason")
+        ):
             with self.assertRaisesRegex(CromError, "^the precise reason$"):
                 configwrite.write_default(self.target, namespace="myapp", seed=DEFAULT_SEED)
 

@@ -738,7 +738,10 @@ class LaunchReadinessTest(unittest.TestCase):
         """
         self.proc.poll.return_value = 3
         with (
-            mock.patch.object(chrome, "find_pids", side_effect=Reason.PROCESS_TABLE_UNREADABLE.error("`ps` exited 1")),
+            mock.patch.object(
+                chrome, "find_pids",
+                side_effect=Reason.PROCESS_TABLE_UNREADABLE.error("`ps` exited 1"),
+            ),
             mock.patch.object(chrome, "_probe_port", return_value=chrome._Silent()),
             self.assertRaises(CromError) as caught,
         ):

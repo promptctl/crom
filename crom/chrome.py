@@ -564,7 +564,9 @@ def _port_is_free(port: int) -> bool:
     except OSError as e:
         # [LAW:no-silent-failure] `kill` reaches here too, so `down` and `rm` inherit this
         # sentence rather than a bare errno naming no port.
-        raise Reason.PORT_CHECK_FAILED.error(f"could not check whether port {port} is free: {e}") from e
+        raise Reason.PORT_CHECK_FAILED.error(
+            f"could not check whether port {port} is free: {e}"
+        ) from e
     return True
 
 
@@ -682,7 +684,9 @@ def _stderr_sink(profile_dir: Path) -> Iterator[_StderrSink]:
     except OSError as e:
         # Named here for the same reason `Popen` and `ps` are: the CLI boundary answers
         # for a raw `OSError`, but with the path alone — never with what it was for.
-        raise Reason.CHROME_LOG_UNWRITABLE.error(f"could not open {path} to capture Chrome's output: {e}") from e
+        raise Reason.CHROME_LOG_UNWRITABLE.error(
+            f"could not open {path} to capture Chrome's output: {e}"
+        ) from e
 
     with handle:
         yield _StderrSink(handle=handle, path=path)

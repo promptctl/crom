@@ -722,7 +722,9 @@ def parse_ref(text: str, ambient: str) -> ProfileRef:
     elif len(parts) == 2:
         namespace, name = parts
     else:
-        raise Reason.INVALID_NAME.error(f"invalid profile reference {text!r}: expected 'name' or 'namespace/name'")
+        raise Reason.INVALID_NAME.error(
+            f"invalid profile reference {text!r}: expected 'name' or 'namespace/name'"
+        )
     # No validation here: splitting is this function's job, and `ProfileRef` validates
     # its own fields. [LAW:single-enforcer] one place decides what a legal name is.
     return ProfileRef(namespace, name)
