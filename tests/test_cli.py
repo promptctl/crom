@@ -73,7 +73,14 @@ class CliTest(unittest.TestCase):
         previous = Path.cwd()
         os.chdir(cwd or self.project)
         try:
-            result = CliRunner().invoke(cli.main, list(args))
+            # `catch_exceptions=False` because the default one lies about this boundary:
+            # it turns an escaping exception into a tidy `exit_code == 1` with nothing in
+            # `output`, which is precisely how a real process behaves *only after*
+            # `CromGroup.invoke` has caught it. Under the default, every `expect=1` in this
+            # file passes just as happily against a command that printed a stack trace.
+            # [FRAMING:representation] the runner is a map of the terminal; this keeps a
+            # crash looking like a crash.
+            result = CliRunner().invoke(cli.main, list(args), catch_exceptions=False)
         finally:
             os.chdir(previous)
         self.assertEqual(
@@ -1750,6 +1757,55 @@ class CliTest(unittest.TestCase):
         self.assertTrue(profile_dir.startswith(str(self.project / ".crom" / "profiles")))
         self.assertFalse(profile_dir.startswith(str(state_home())))
 
+
+    # --- the failure contract ---------------------------------------------------------
+
+    def test_an_os_level_refusal_becomes_a_message_and_an_exit_code(self):
+        """Three ways the filesystem can refuse one command, all through `mcp.write`.
+
+        Read side, write side, and traversal: `--path <a-directory>` fails inside
+        `read_text`, a missing parent fails inside `write_text`, and a path whose parent
+        is a regular file fails before either. All three used to reach the user as a
+        stack trace out of `pathlib` — exit 1, and nothing else a script could read.
+
+        `invoke` runs with `catch_exceptions=False`, which is what makes an escape
+        visible here at all: the runner's default would have handed this test a tidy
+        `exit_code == 1` and an empty stderr, and the assertions below would have passed
+        against the exact bug they exist to catch.
+        """
+        self.crom("init")
+        self.crom("add", "dev")
+        (self.project / "adir").mkdir()
+        (self.project / "afile").touch()
+
+        for path, reason in (
+            ("adir", "Is a directory"),
+            ("nosuch/dir/.mcp.json", "No such file or directory"),
+            ("afile/x.json", "Not a directory"),
+        ):
+            with self.subTest(path=path):
+                result = self.invoke("mcp", "dev", "--path", path, expect=1)
+                self.assertEqual(result.stderr.strip(), f"Error: {path}: {reason}")
+
+    def test_the_contract_covers_a_failure_no_command_anticipated(self):
+        """The rule lives at the boundary, so a call site nobody patched is covered too.
+
+        `chrome.scan` guards `ps` being absent and `ps` exiting nonzero — and not a `ps`
+        on PATH that cannot be executed. It is the single process-table reader, so that
+        `PermissionError` escaped from `list`, `up`, `down`, `rm`, `config` and migration
+        alike, and closing it took no edit to `chrome.py`.
+
+        This is the claim the test above cannot make: a `try/except OSError` inside
+        `mcp_cmd` closes the reported bug and leaves this one open, so it is the pair that
+        distinguishes one boundary rule from a fourth pointwise patch.
+        [LAW:single-enforcer]
+        """
+        self.crom("init")
+        with mock.patch(
+            "crom.chrome.scan", side_effect=PermissionError(13, "Permission denied", "/bin/ps")
+        ):
+            result = self.invoke("list", expect=1)
+        self.assertEqual(result.stderr.strip(), "Error: /bin/ps: Permission denied")
 
 
 

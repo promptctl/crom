@@ -1,7 +1,8 @@
 """Maps commands onto crom's core and renders the result for a human or a machine.
 
-This is the outer boundary: everything below it raises `CromError` and returns data;
-everything user-visible — exit codes, stderr, JSON shape — is decided here.
+This is the outer boundary: below it a failure is either a `CromError` or the operating
+system refusing; everything user-visible — exit codes, stderr, JSON shape — is decided
+here.
 
 [LAW:effects-at-boundaries] The core computes descriptions; this layer performs and
 prints them. [CLI binding] stdout carries the answer, stderr carries diagnostics, and
@@ -61,15 +62,31 @@ EXIT_FAILURE = 1
 EXIT_NOT_FOUND = 3
 EXIT_CONFLICT = 4
 
-# Which exception means which exit code. [LAW:dataflow-not-control-flow] the mapping is
-# a table consulted once, not a chain of except clauses repeated per command.
-_EXIT_CODES = ((NotFound, EXIT_NOT_FOUND), (Conflict, EXIT_CONFLICT), (CromError, EXIT_FAILURE))
+# Which exception means which exit code — every exception this CLI answers for, and the
+# only place a code is assigned. [LAW:dataflow-not-control-flow] the mapping is a table
+# consulted once, not a chain of except clauses repeated per command.
+_EXIT_CODES = (
+    (NotFound, EXIT_NOT_FOUND),
+    (Conflict, EXIT_CONFLICT),
+    (CromError, EXIT_FAILURE),
+    (OSError, EXIT_FAILURE),
+)
 
 
 class _Failure(click.ClickException):
     def __init__(self, message: str, exit_code: int):
         super().__init__(message)
         self.exit_code = exit_code
+
+
+def _failure(error: Exception, message: str) -> _Failure:
+    """`message`, carrying whichever exit code `_EXIT_CODES` assigns `error`.
+
+    [LAW:one-source-of-truth] the wording of a failure and its code are two questions:
+    each arm below answers the first for its own kind of error, and none of them answers
+    the second, so a code cannot be spelled anywhere but the table.
+    """
+    return _Failure(message, next(c for kind, c in _EXIT_CODES if isinstance(error, kind)))
 
 
 # How `crom --help` groups its commands, as data rather than as prose that has to be
@@ -87,14 +104,39 @@ _COMMAND_SECTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
 
 
 class CromGroup(click.Group):
-    """Turns core errors into the CLI's exit-code contract, in one place."""
+    """Turns a failed command into the CLI's exit-code contract, in one place."""
 
     def invoke(self, ctx):
+        """Answer for both ways a command fails: crom's own refusals, and the OS's.
+
+        Catching `CromError` alone left the second half escaping as a raw traceback, and
+        the codebase had begun closing that one call site at a time —
+        `_delete_profile_data` wraps `rmtree`, `configwrite._writing` wraps the config
+        save, `seed._copy` wraps the seed stat — while `crom mcp --path <a-directory>`
+        still printed a stack trace out of `read_text`. [LAW:single-enforcer] a rule kept
+        per command is a rule the next command is written without; kept here, a new
+        command cannot reintroduce the hole, because it never had to remember.
+
+        Those wrappers stay. They say more than this floor can — which retry is left,
+        which seed could not be read — and enrichment is not enforcement.
+
+        The line stops at `OSError` on purpose: that is the world refusing crom, and it
+        names something the user can go fix. Anything else arriving here is crom being
+        wrong about its own state, and a traceback is the honest report of that.
+        [LAW:no-silent-failure]
+        """
         try:
             return super().invoke(ctx)
         except CromError as error:
-            code = next(c for kind, c in _EXIT_CODES if isinstance(error, kind))
-            raise _Failure(str(error), code) from error
+            raise _failure(error, str(error)) from error
+        except OSError as error:
+            # The path and the reason, in the shape crom's own filesystem errors already
+            # take (`configwrite._writing`). An `OSError` carries neither reliably —
+            # `os.kill` names no file, `shutil.Error` carries no `strerror` — so the
+            # missing halves drop out as values rather than as branches.
+            # [LAW:dataflow-not-control-flow]
+            parts = (error.filename, error.strerror or error)
+            raise _failure(error, ": ".join(str(part) for part in parts if part)) from error
 
     def format_commands(self, ctx, formatter) -> None:
         """Render the command list in sections, and never omit a command.
