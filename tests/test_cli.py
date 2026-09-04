@@ -49,6 +49,17 @@ def _readme_names(fragment: str) -> tuple[str, ...]:
     return names
 
 
+def _commands_offering_json() -> set[str]:
+    """Both callers are drift guards: a change to how `--json` is declared has to fail
+    them for the right reason, rather than being patched into agreement in two places.
+    """
+    return {
+        name
+        for name in cli.main.list_commands(None)
+        if any("--json" in option.opts for option in cli.main.get_command(None, name).params)
+    }
+
+
 class CliTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -2430,15 +2441,11 @@ class CliTest(unittest.TestCase):
         one refusal, six commands, and no command contains a line about envelopes.
         """
         self.crom("init")
-        offering = [
-            name
-            for name in cli.main.list_commands(None)
-            if any("--json" in option.opts for option in cli.main.get_command(None, name).params)
-        ]
+        offering = _commands_offering_json()
         # A discovery that found nothing would loop zero times and assert nothing — an
         # answer-shaped void wearing a passing test as a costume. New commands may join
         # freely; the loop is what covers them. [LAW:parse-dont-validate]
-        self.assertGreaterEqual(set(offering), {"up", "down", "restart", "show", "list", "config"})
+        self.assertGreaterEqual(offering, {"up", "down", "restart", "show", "list", "config"})
 
         for name in offering:
             with self.subTest(command=name):
@@ -2514,11 +2521,7 @@ class CliTest(unittest.TestCase):
         exactly as long as nobody touched the CLI. [LAW:behavior-not-structure]
         """
         commands = set(cli.main.list_commands(None))
-        offering = {
-            name
-            for name in commands
-            if any("--json" in option.opts for option in cli.main.get_command(None, name).params)
-        }
+        offering = _commands_offering_json()
         # The sentence is wrapped across lines in the file, so whitespace is normalised
         # before it is matched. Either side admits only a backticked list, so the search
         # cannot begin early at some unrelated backtick and swallow the prose between.
