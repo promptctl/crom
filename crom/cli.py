@@ -21,7 +21,18 @@ from stat import S_ISREG
 
 import click
 
-from . import chrome, config, configwrite, flags, mcp, migrate, registry, resolve as resolver, seed
+from . import (
+    chrome,
+    config,
+    configwrite,
+    flags,
+    mcp,
+    migrate,
+    registry,
+    resolve as resolver,
+    seed,
+    window,
+)
 from .config import discover, load_ambient, load_user_scope, parse_layer, parse_port, parse_seed
 from .model import (
     DEFAULT_SEED,
@@ -67,7 +78,7 @@ class _Failure(click.ClickException):
 # the third is not. [FRAMING:representation] a listing is a map of the CLI, and the CLI's
 # real structure is these three jobs.
 _COMMAND_SECTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("Run a browser", ("up", "down", "list")),
+    ("Run a browser", ("up", "down", "restart", "show", "list")),
     ("Point tools at one", ("mcp", "env", "port")),
     ("Declare what exists", ("init", "add", "rm", "config", "forget")),
 )
@@ -237,6 +248,36 @@ def main(ctx):
         ctx.invoke(up_cmd, ref="default", as_json=False)
 
 
+def _start_under_lock(profile: ResolvedProfile) -> tuple[bool, tuple[int, ...]]:
+    """Bring a profile up, for a caller already holding `seed.profile_lock`.
+
+    Hands back whether *this* call started the browser and the PIDs it is running under,
+    rather than reporting it, because the three callers say different things about the
+    same outcome: `up` reports "Started" or "Already running", `restart` has just
+    stopped whatever was there, and `show` mentions a launch only when it had to make one.
+    [LAW:effects-at-boundaries] the decision is computed here and rendered at the command.
+
+    Written for a caller that already holds the lock, not one that takes it, because
+    `seed.profile_lock` is `flock` on a fresh descriptor and blocks even within one
+    process — so a `restart` built as "call down, then call up" would deadlock if the two
+    halves nested, and would drop the lock between them if they did not. The critical
+    section belongs to the command, which is the only participant that knows how much of
+    the work has to be indivisible. [LAW:no-ambient-temporal-coupling]
+    """
+    if not profile.profile_dir.exists():
+        # Say so before the copy, not after: a `chrome` seed moves hundreds of
+        # megabytes and an unexplained pause looks like a hang.
+        rendered = configwrite.render_seed(profile.seed, profile.config_dir)
+        click.echo(f"Creating {profile.ref} from seed '{rendered}' …", err=True)
+    seed.materialize_under_lock(profile)
+
+    pids = chrome.find_pids(profile)
+    started = not pids
+    if started:
+        pids = chrome.launch(profile)
+    return started, pids
+
+
 @main.command("up")
 @click.argument("ref", required=False, default="default")
 @click.option("--json", "as_json", is_flag=True, help="Emit the profile record as JSON.")
@@ -252,17 +293,7 @@ def up_cmd(session: _Session, ref: str, as_json: bool):
     # the second caller finds the first's Chrome and reports it, which is what `up` has
     # always claimed to do.
     with seed.profile_lock(profile):
-        if not profile.profile_dir.exists():
-            # Say so before the copy, not after: a `chrome` seed moves hundreds of
-            # megabytes and an unexplained pause looks like a hang.
-            rendered = configwrite.render_seed(profile.seed, profile.config_dir)
-            click.echo(f"Creating {profile.ref} from seed '{rendered}' …", err=True)
-        seed.materialize_under_lock(profile)
-
-        pids = chrome.find_pids(profile)
-        started = not pids
-        if started:
-            pids = chrome.launch(profile)
+        started, pids = _start_under_lock(profile)
 
     verb = "Started" if started else "Already running"
     _emit(
@@ -295,6 +326,108 @@ def down_cmd(session: _Session, ref: str, as_json: bool):
         else f"{profile.ref} was not running"
     )
     _emit(as_json, profile.describe(running=False, pids=pids), [message])
+
+
+@main.command("restart")
+@click.argument("ref", required=False, default="default")
+@click.option("--json", "as_json", is_flag=True)
+@click.pass_obj
+def restart_cmd(session: _Session, ref: str, as_json: bool):
+    """Stop a profile and start it again on its current config."""
+    profile = session.working(ref)
+    # Both halves under one hold of the lock, which is the whole of what this command adds
+    # over typing `crom down && crom up`. Released in between, another crom process is free
+    # to land in the gap: a concurrent `up` sees nothing running and starts the browser, so
+    # this command's own start then finds a live Chrome and reports a restart it did not
+    # perform — on the old configuration, which is the one thing a restart exists to
+    # replace. `rm` in the gap is worse, and deletes the directory this is about to launch
+    # against. [LAW:no-ambient-temporal-coupling] the indivisible span is stated here, by
+    # the only participant that knows how wide it is.
+    #
+    # `chrome.kill` is what makes the start safe to follow it directly: it returns only
+    # once the profile holds neither a process nor its CDP port, so this cannot race its
+    # own socket teardown and lose the port to the corpse of the browser it just stopped.
+    with seed.profile_lock(profile):
+        stopped = chrome.kill(profile)
+        if stopped:
+            # Said before the start rather than assembled with the result afterwards, so
+            # the fact survives a start that fails. A restart whose launch half fails
+            # leaves the user with no browser at all, and an error naming only the start
+            # would hide that crom stopped the working one they had. It doubles as the
+            # progress line for the pause while Chrome comes up. [CLI binding] stderr.
+            click.echo(
+                f"Stopped {profile.ref} (pid {', '.join(map(str, stopped))}); "
+                f"starting it again …",
+                err=True,
+            )
+        # The `started` flag is discarded rather than reported: `kill` has just guaranteed
+        # nothing is running, so a start here is always a start, and the interesting fact
+        # is what was stopped. That is what `stopped` carries.
+        _, pids = _start_under_lock(profile)
+
+    was = ", ".join(map(str, stopped))
+    now = ", ".join(map(str, pids))
+    message = (
+        f"Restarted {profile.ref} on {profile.cdp_url} (was pid {was}, now pid {now})"
+        if stopped
+        else f"{profile.ref} was not running; started it on {profile.cdp_url}"
+    )
+    # `stopped` rides alongside the record rather than inside it: what a restart replaced is
+    # a fact about this command, not about the profile, and `describe()` is the shape every
+    # command's JSON shares. Without it a `--json` caller cannot tell a browser that was
+    # replaced from one that was merely started, which is the single distinction this
+    # command exists to report. [LAW:one-source-of-truth] `describe()` stays canonical.
+    _emit(
+        as_json,
+        {**profile.describe(running=True, pids=pids), "stopped": list(stopped)},
+        [message],
+    )
+
+
+@main.command("show")
+@click.argument("ref", required=False, default="default")
+@click.option("--json", "as_json", is_flag=True)
+@click.pass_obj
+def show_cmd(session: _Session, ref: str, as_json: bool):
+    """Bring a profile's window to the front, launching it if it is not running."""
+    profile = session.working(ref)
+    # Starting and raising under one hold, so the PIDs raised are the PIDs observed. A
+    # `down` landing between the two would leave `window.raise_profile` asking macOS for a
+    # process that no longer exists, and the -1719 it answers with reads as "the browser
+    # exited" — true, but it would be describing a race this command could have prevented.
+    #
+    # The raise is inside the lock rather than after it for that reason alone; it costs one
+    # osascript round trip, which is the same order as the `ps` call `_start_under_lock`
+    # already makes while holding it.
+    with seed.profile_lock(profile):
+        started, pids = _start_under_lock(profile)
+        if started:
+            # Said before the raise rather than assembled with the result afterwards, so
+            # the fact survives a raise that fails. Withheld Automation access is likeliest
+            # on a first run — the same run likeliest to have started the browser — and a
+            # user shown only the raise error would go hunting for a launch failure that
+            # never happened. On stderr because for `show` the answer is the raise itself;
+            # a launch on the way to it is progress, like `_start_under_lock`'s own
+            # "Creating … from seed" line. [CLI binding]
+            click.echo(f"Started {profile.ref} on {profile.cdp_url}", err=True)
+        windows = window.raise_profile(profile, pids)
+
+    raised = (
+        f"Raised {profile.ref}"
+        if windows
+        else f"Raised {profile.ref}, but it has no open windows to show — it is running "
+        f"headless, or its last window was closed."
+    )
+    # The window count rides alongside the record for the same reason `restart` carries
+    # what it stopped: the human line already distinguishes a raise that found a window
+    # from one that did not, and a `--json` caller confirming the window actually came
+    # forward — the whole point of the command — could otherwise only get there by parsing
+    # the prose. [FRAMING:representation] one result, and both maps of it say the same.
+    _emit(
+        as_json,
+        {**profile.describe(running=True, pids=pids), "started": started, "windows": windows},
+        [raised],
+    )
 
 
 @main.command("list")
