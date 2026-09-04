@@ -399,6 +399,24 @@ def _bootstrap_user_config() -> None:
 
 
 @click.group(cls=CromGroup, invoke_without_command=True)
+# The version is read from the installed distribution's metadata, which the build copies
+# out of pyproject.toml, so crom holds no second spelling of it to fall behind a release.
+# [LAW:one-source-of-truth]
+#
+# `package_name` is named rather than left to click, which otherwise infers it by
+# inspecting the caller's frame globals — making the distribution crom asks about a fact
+# about which module this decorator happens to sit in.
+#
+# The version alone, as `crom port` prints a port alone: stdout carries the answer, so a
+# script reads it without splitting a sentence for it. [CLI binding] click's default,
+# `<prog>, version <v>`, would also spell that answer differently from one invocation to
+# the next, since `prog` is argv[0].
+#
+# Eager, as click makes every `--version`: it answers and exits while the command line is
+# still being parsed, so nothing in the body below has run. That is the difference between
+# a version crom can always state and one it can state only on a machine whose home crom
+# can already use. [LAW:no-ambient-temporal-coupling]
+@click.version_option(package_name="crom", message="%(version)s")
 @click.pass_context
 def main(ctx):
     """crom — a real Chrome per project, each on a port that never moves.
