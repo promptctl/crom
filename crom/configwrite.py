@@ -125,7 +125,12 @@ def _load(path: Path) -> tomlkit.TOMLDocument:
         return tomlkit.document()
     try:
         return tomlkit.parse(path.read_text())
-    except (tomlkit.exceptions.ParseError, OSError) as e:
+    except tomlkit.exceptions.ParseError as e:
+        # `ParseError` alone, though this once caught `OSError` beside it. "Repair the
+        # file" is the wrong remedy for a file whose contents are fine and whose
+        # permissions are not, and the CLI boundary answers that case better than any slug
+        # here could: `<path>: <strerror>`, with the errno name the OS already published.
+        # [LAW:polishing-by-subtraction] the wrong remedy is deleted rather than relabelled.
         raise Reason.CONFIG_INVALID.error(
             f"{path}: cannot be read as TOML ({e}).\nRepair the file."
         ) from e
