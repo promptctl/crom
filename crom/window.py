@@ -21,6 +21,16 @@ import subprocess
 
 from .model import CromError, ResolvedProfile
 
+# How long crom waits for `osascript` to answer. A raise costs milliseconds once macOS has
+# granted Automation access, so this bound is not sized for the work — it is sized for the
+# consent dialog. The first automation call from a new program can sit on a modal TCC
+# prompt, and `show` holds `seed.profile_lock` across this call, so an unbounded wait there
+# gates every other `up`, `down`, `restart` and `rm` on that profile behind a dialog nobody
+# may be looking at. Generous enough that a user who *is* looking at it can answer — that
+# click is the legitimate way to grant access, and timing it out would refuse the fix.
+# [LAW:no-ambient-temporal-coupling] the wait has a stated ceiling rather than a hope.
+RAISE_TIMEOUT_SECONDS = 30.0
+
 # Raise the process, then report how many windows it has.
 #
 # The `whose` specifier is written out twice on purpose, and the obvious tidy-up breaks
@@ -84,10 +94,24 @@ def _raise_one(profile: ResolvedProfile, pid: int) -> int:
             ["osascript", "-e", _RAISE_SCRIPT, str(pid)],
             capture_output=True,
             text=True,
+            timeout=RAISE_TIMEOUT_SECONDS,
         )
-    except FileNotFoundError as e:
+    except subprocess.TimeoutExpired as e:
         raise CromError(
-            "could not raise a window: `osascript` was not found on PATH.\n"
+            f"`osascript` did not answer within {RAISE_TIMEOUT_SECONDS:.0f}s while raising "
+            f"'{profile.ref}' (pid {pid}).\nThe usual cause is macOS's Automation consent "
+            f"dialog waiting on an answer — grant access in System Settings › Privacy & "
+            f"Security › Automation, or answer the prompt if it is on screen."
+        ) from e
+    except OSError as e:
+        # `OSError` rather than `FileNotFoundError` alone: a present-but-unexecutable
+        # `osascript` raises `PermissionError`, which is no less a reason this cannot work
+        # and no more deserving of a raw traceback outside the CLI's exit-code contract.
+        # `chrome.launch` catches the same breadth around its own `Popen` for that reason.
+        # One message carrying the error rather than an arm per cause: the sentence below
+        # is true of every way the command can fail to run. [LAW:dataflow-not-control-flow]
+        raise CromError(
+            f"could not run `osascript` to raise a window: {e}\n"
             "Raising one browser out of several identical ones needs macOS's own window "
             "server, so `crom show` works on macOS alone."
         ) from e

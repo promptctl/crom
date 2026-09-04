@@ -13,6 +13,7 @@ measurements above were taken of.
 """
 
 import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -73,6 +74,28 @@ class RaiseTest(unittest.TestCase):
         with answered(stdout="1\n") as run:
             self.assertEqual(window.raise_profile(self.profile, (11, 22)), 2)
         self.assertEqual([call.args[0][-1] for call in run.call_args_list], ["11", "22"])
+
+    def test_a_pid_that_cannot_be_raised_fails_the_whole_command(self):
+        """Fail-fast across several pids, pinned deliberately rather than left to `sum`.
+
+        `show` names the end state "this profile's window is in front". If one of the
+        profile's browsers refused to come forward, crom cannot say that happened, so the
+        command fails and names the pid that refused. The alternative — aggregating per-pid
+        outcomes — invents a partial-success mode for a state that is itself transient, and
+        hands every caller a result it has to interpret. [LAW:no-mode-explosion]
+
+        Pinned because the behaviour is currently a property of summing a generator, which
+        a later refactor to a list comprehension would silently reverse.
+        """
+        answers = [
+            CompletedProcess(args=[], returncode=0, stdout="1", stderr=""),
+            CompletedProcess(args=[], returncode=1, stderr="Invalid index. (-1719)", stdout=""),
+        ]
+        with mock.patch("crom.window.subprocess.run", side_effect=answers):
+            with self.assertRaises(CromError) as caught:
+                window.raise_profile(self.profile, (11, 22))
+
+        self.assertIn("22", str(caught.exception))
 
     def test_a_profile_with_no_running_browser_asks_macos_nothing(self):
         with answered() as run:
@@ -161,6 +184,35 @@ class RefusalTest(unittest.TestCase):
                 window.raise_profile(self.profile, (4242,))
 
         self.assertIn("macOS", str(caught.exception))
+
+    def test_a_prompt_nobody_answers_does_not_hold_the_lock_forever(self):
+        """`show` calls this while holding `seed.profile_lock`, so an unbounded wait here
+        gates every other command on the profile. The first automation call from a new
+        program can sit on macOS's consent dialog; the bound is what keeps a dialog nobody
+        is looking at from blocking `crom down`. [LAW:no-ambient-temporal-coupling]"""
+        expired = subprocess.TimeoutExpired(cmd="osascript", timeout=window.RAISE_TIMEOUT_SECONDS)
+        with mock.patch("crom.window.subprocess.run", side_effect=expired):
+            with self.assertRaises(CromError) as caught:
+                window.raise_profile(self.profile, (4242,))
+
+        message = str(caught.exception)
+        self.assertIn("Automation", message)
+        self.assertIn("System Settings", message)
+
+    def test_the_call_is_bounded_rather_than_left_to_wait_forever(self):
+        with answered() as run:
+            window.raise_profile(self.profile, (4242,))
+        self.assertEqual(run.call_args.kwargs["timeout"], window.RAISE_TIMEOUT_SECONDS)
+
+    def test_an_osascript_that_cannot_be_executed_is_reported_not_crashed_through(self):
+        """`FileNotFoundError` was never the only way running it can fail: a present but
+        unexecutable `osascript` raises `PermissionError`, which is no less a reason the
+        command cannot work and no more deserving of a traceback."""
+        with mock.patch("crom.window.subprocess.run", side_effect=PermissionError("denied")):
+            with self.assertRaises(CromError) as caught:
+                window.raise_profile(self.profile, (4242,))
+
+        self.assertIn("denied", str(caught.exception))
 
     def test_an_unreadable_window_count_is_reported_not_crashed_through(self):
         """osascript exited 0, so the number it printed is the only evidence of what
