@@ -199,6 +199,10 @@ class ComposeTest(unittest.TestCase):
         # input", so it must not be reachable by anything a config file can say — and
         # a reader who gets it has been told the right thing about whose fault it is.
         self.assertIs(caught.exception.reason, Reason.INTERNAL)
+        with self.assertRaisesRegex(CromError, "must name where it was written"):
+            Layer(drops=frozenset({"--headless"}))
+        # A stanza that says nothing contributes nothing to the report, so it needs no name.
+        self.assertEqual(Layer().origin, "")
 
     def test_a_resolution_that_answers_nothing_is_a_crom_bug_not_a_config_fault(self):
         """`Resolution` exists to say where a value came from, so one holding no answers
@@ -208,10 +212,6 @@ class ComposeTest(unittest.TestCase):
         with self.assertRaisesRegex(CromError, "nothing was resolved") as caught:
             Resolution(question="--headless", answers=())
         self.assertIs(caught.exception.reason, Reason.INTERNAL)
-        with self.assertRaisesRegex(CromError, "must name where it was written"):
-            Layer(drops=frozenset({"--headless"}))
-        # A stanza that says nothing contributes nothing to the report, so it needs no name.
-        self.assertEqual(Layer().origin, "")
 
     def test_the_standing_answer_is_the_last_layer_to_speak(self):
         composed = flags.compose(
