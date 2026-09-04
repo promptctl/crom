@@ -1393,6 +1393,27 @@ class CliTest(unittest.TestCase):
         self.assertIn("was pid 998, 999", output)
         self.assertIn("now pid 1234, 1235", output)
 
+    def test_restart_reports_the_stop_even_when_the_start_then_fails(self):
+        """A restart whose launch half fails leaves the user with no browser at all.
+
+        Told only that starting failed, they have no reason to think crom stopped the
+        working browser they had — so the fact is said before the start is attempted,
+        rather than assembled into a result line that a raise never reaches.
+        """
+        self.crom("init")
+        self.crom("add", "ci")
+
+        with (
+            mock.patch("crom.cli.seed.materialize_under_lock"),
+            mock.patch("crom.cli.chrome.kill", return_value=(999,)),
+            mock.patch("crom.cli.chrome.find_pids", return_value=()),
+            mock.patch("crom.cli.chrome.launch", side_effect=CromError("Chrome exited 1")),
+        ):
+            result = self.invoke("restart", "ci", expect=1)
+
+        self.assertIn("Stopped myproj/ci (pid 999)", result.output)
+        self.assertIn("Chrome exited 1", result.output)
+
     def test_restart_json_carries_what_it_stopped(self):
         """`--json` must be able to tell a browser that was replaced from one that was
         merely started — the single distinction this command exists to report, and one the

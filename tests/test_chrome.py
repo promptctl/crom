@@ -577,8 +577,39 @@ class LaunchReadinessTest(unittest.TestCase):
         ):
             chrome.launch(self.profile)
 
-        self.assertIn("not", str(caught.exception))
-        self.assertIn("visible to `ps`", str(caught.exception))
+        message = str(caught.exception)
+        self.assertIn("answered on CDP port 9300", message)
+        self.assertIn("visible to `ps`", message)
+        # The command line, like every other launch failure — the reader's next step is to
+        # look at what crom actually ran.
+        self.assertIn("Command was:", message)
+
+    def test_a_browser_the_first_scan_missed_is_still_stopped(self):
+        """Why this ending goes through the shared cleanup instead of raising on the spot.
+
+        The likeliest cause of "CDP answered but `ps` shows nothing" is a transient miss,
+        and `_escalate` re-reads `find_pids` between rounds — so a browser invisible to the
+        scan that diagnosed the failure is still signalled by the round after it. Raising
+        directly skipped that second look and left the browser running, holding the port
+        against every future launch of the profile, which is the leak
+        `test_a_browser_that_never_answered_is_stopped_rather_than_left_running` exists to
+        prevent. [LAW:no-silent-failure]
+        """
+        self.running = [4242]
+        scans = iter([()])  # the first scan misses; every later one sees the browser
+
+        def find_pids(_profile):
+            return next(scans, tuple(self.running))
+
+        with (
+            mock.patch.object(chrome, "_probe_port", return_value=chrome._Answered()),
+            mock.patch.object(chrome, "find_pids", find_pids),
+            self.assertRaises(CromError),
+        ):
+            chrome.launch(self.profile)
+
+        self.assertEqual(self.signals, [(4242, signal.SIGTERM)])
+        self.assertEqual(self.running, [])  # not left holding the profile and its port
 
     def test_a_browser_that_never_answered_is_stopped_rather_than_left_running(self):
         """The leak this ticket exists to close, on the arm that always leaked.

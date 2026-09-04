@@ -349,6 +349,17 @@ def restart_cmd(session: _Session, ref: str, as_json: bool):
     # own socket teardown and lose the port to the corpse of the browser it just stopped.
     with seed.profile_lock(profile):
         stopped = chrome.kill(profile)
+        if stopped:
+            # Said before the start rather than assembled with the result afterwards, so
+            # the fact survives a start that fails. A restart whose launch half fails
+            # leaves the user with no browser at all, and an error naming only the start
+            # would hide that crom stopped the working one they had. It doubles as the
+            # progress line for the pause while Chrome comes up. [CLI binding] stderr.
+            click.echo(
+                f"Stopped {profile.ref} (pid {', '.join(map(str, stopped))}); "
+                f"starting it again …",
+                err=True,
+            )
         # The `started` flag is discarded rather than reported: `kill` has just guaranteed
         # nothing is running, so a start here is always a start, and the interesting fact
         # is what was stopped. That is what `stopped` carries.
