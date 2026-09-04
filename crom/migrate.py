@@ -308,8 +308,8 @@ def _require_no_destination_collision(old_dirs: dict[str, Path], destination_roo
     legacy ones sat directly at `<state>/<name>`. That holds for every legacy name except
     one. A profile named `profiles` sat at `<state>/profiles`, which is exactly the root
     every migrated profile is moving into — so the move becomes "put this directory
-    inside itself", which `shutil` refuses with a raw `shutil.Error`, escaping the
-    exit-code contract partway through the loop.
+    inside itself", which `shutil` refuses with a raw `shutil.Error` partway through the
+    loop.
 
     `_NAME_RE` accepts `profiles`, and the old scheme validated nothing, so this is
     reachable by a user who once ran `crom add profiles`.

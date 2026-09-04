@@ -6,6 +6,7 @@ external system, not an implementation detail of crom.
 """
 
 import contextlib
+import errno
 import json
 import os
 import re
@@ -73,7 +74,14 @@ class CliTest(unittest.TestCase):
         previous = Path.cwd()
         os.chdir(cwd or self.project)
         try:
-            result = CliRunner().invoke(cli.main, list(args))
+            # `catch_exceptions=False` because the default one lies about this boundary:
+            # it turns an escaping exception into a tidy `exit_code == 1` with nothing in
+            # `output`, which is precisely how a real process behaves *only after*
+            # `CromGroup.invoke` has caught it. Under the default, every `expect=1` in this
+            # file passes just as happily against a command that printed a stack trace.
+            # [FRAMING:representation] the runner is a map of the terminal; this keeps a
+            # crash looking like a crash.
+            result = CliRunner().invoke(cli.main, list(args), catch_exceptions=False)
         finally:
             os.chdir(previous)
         self.assertEqual(
@@ -1642,9 +1650,8 @@ class CliTest(unittest.TestCase):
     def test_the_size_prompt_counts_only_what_the_delete_reclaims(self):
         """`_human_size` measures what removing the directory frees, so a symlink's
         target — which is not deleted — must not be counted, and a dangling link must
-        not raise. A raw OSError from a mid-walk `stat` is not a CromError either, so it
-        would escape the exit-code contract as a traceback from a helper whose only job
-        is to be informative before a destructive act."""
+        not raise — this helper's only job is to be informative before a destructive
+        act, and a failure to measure is not a reason to refuse the delete."""
         directory = self.root / "profile"
         (directory / "sub").mkdir(parents=True)
         (directory / "sub" / "real.bin").write_bytes(b"x" * 2048)
@@ -1664,8 +1671,7 @@ class CliTest(unittest.TestCase):
         `chrome.kill` — so `rmtree` can raise on a directory still being written. When
         the delete ran last, that failure left a half-removed directory belonging to a
         profile no command could name: `rm` resolves by name first, so the retry it
-        suggests was impossible. It also escaped as a traceback, since a bare `OSError`
-        is not a `CromError`.
+        suggests was impossible.
         """
         self.crom("init")
         self.crom("add", "ci")
@@ -1750,6 +1756,87 @@ class CliTest(unittest.TestCase):
         self.assertTrue(profile_dir.startswith(str(self.project / ".crom" / "profiles")))
         self.assertFalse(profile_dir.startswith(str(state_home())))
 
+
+    # --- the failure contract ---------------------------------------------------------
+
+    def test_an_os_level_refusal_becomes_a_message_and_an_exit_code(self):
+        """Three ways the filesystem can refuse one command, all through `mcp.write`.
+
+        Three errno families across two call sites: `--path <a-directory>` fails in
+        `read_text`, while a missing parent and a parent that is a regular file both get
+        `False` from `path.exists()` — which swallows the `ENOTDIR` — and fail in
+        `write_text`. All three used to reach the user as a stack trace out of `pathlib`
+        — exit 1, and nothing else a script could read.
+
+        `invoke` runs with `catch_exceptions=False`, which is what makes an escape
+        visible here at all: the runner's default would have handed this test a tidy
+        `exit_code == 1` and an empty stderr, and the assertions below would have passed
+        against the exact bug they exist to catch.
+        """
+        self.crom("init")
+        self.crom("add", "dev")
+        (self.project / "adir").mkdir()
+        (self.project / "afile").touch()
+
+        # `os.strerror` rather than the literal text: that half of the message comes from
+        # the C library and not from crom, so the C library is its oracle — and naming the
+        # errno says which family each case exercises. Still an independent check: crom
+        # reads `strerror` off the exception, so `str(e)` would not match.
+        for path, code in (
+            ("adir", errno.EISDIR),
+            ("nosuch/dir/.mcp.json", errno.ENOENT),
+            ("afile/x.json", errno.ENOTDIR),
+        ):
+            with self.subTest(path=path):
+                result = self.invoke("mcp", "dev", "--path", path, expect=1)
+                self.assertEqual(result.stderr.strip(), f"Error: {path}: {os.strerror(code)}")
+
+    def test_the_contract_covers_a_failure_no_command_anticipated(self):
+        """The rule lives at the boundary, so a call site nobody patched is covered too.
+
+        `chrome.scan` guards `ps` being absent and `ps` exiting nonzero — and not a `ps`
+        on PATH that cannot be executed. It is the single process-table reader, so that
+        `PermissionError` escaped from `list`, `up`, `down`, `rm`, `config` and migration
+        alike, and closing it took no edit to `chrome.py`.
+
+        This is the claim the test above cannot make: a `try/except OSError` inside
+        `mcp_cmd` closes the reported bug and leaves this one open, so it is the pair that
+        distinguishes one boundary rule from a fourth pointwise patch.
+        [LAW:single-enforcer]
+        """
+        self.crom("init")
+        with mock.patch(
+            "crom.chrome.scan", side_effect=PermissionError(13, "Permission denied", "/bin/ps")
+        ):
+            result = self.invoke("list", expect=1)
+        self.assertEqual(result.stderr.strip(), "Error: /bin/ps: Permission denied")
+
+    def test_a_reader_leaving_a_pipeline_is_not_a_failure_to_report(self):
+        """`crom list | head` ends the conventional Unix way: no message, exit 1.
+
+        Click installs a `PacifyFlushWrapper` and exits for an `errno.EPIPE` write, and
+        broadening the boundary to `OSError` took that over. Measured against the real
+        binary with stdout on a reader-less pipe, `crom list` went from exit 1 and an
+        empty stderr to exit 120 and `Error: Broken pipe` — 120 rather than 1 because
+        the wrapper never got installed, so interpreter shutdown then failed to flush
+        stdout as well. Two regressions from one widened `except`.
+        """
+        self.crom("init")
+        with mock.patch(
+            "crom.chrome.scan", side_effect=BrokenPipeError(errno.EPIPE, "Broken pipe")
+        ):
+            result = self.invoke("list", expect=1)
+        self.assertEqual(result.stderr, "")
+
+        # And the other half of the carve-out: `BrokenPipeError` is raised for ESHUTDOWN
+        # too, which is a socket crom really did fail to write and no reader leaving.
+        # Click declines it (its own test is `errno.EPIPE`), so handing that class back
+        # wholesale would return the traceback this PR closed.
+        with mock.patch(
+            "crom.chrome.scan", side_effect=BrokenPipeError(errno.ESHUTDOWN, "Cannot send")
+        ):
+            result = self.invoke("list", expect=1)
+        self.assertEqual(result.stderr.strip(), "Error: Cannot send")
 
 
 

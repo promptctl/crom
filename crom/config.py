@@ -448,8 +448,8 @@ def _parse_chrome_binary(raw, source: Path, config_dir: Path) -> Path:
     Checked for existence and executability here rather than discovered at `Popen`:
     `browser.py` promises crom names the paths it tried "rather than failing later inside
     Popen with a bare ENOENT", and that promise held only for the auto-detected path. A
-    typo'd `chrome_binary` used to surface as a raw `FileNotFoundError` traceback,
-    outside the CLI's exit-code contract entirely.
+    typo'd `chrome_binary` used to surface as a bare ENOENT out of `Popen`, naming
+    nothing the user had written.
     """
     if raw is None:
         return find_chrome()
@@ -685,8 +685,8 @@ def _reads_as_toml(source: Path) -> str | None:
     """Why `source` cannot be tokenized as TOML, or None when it can.
 
     `UnicodeDecodeError` sits beside the decode error rather than escaping: it is a
-    `ValueError`, so a config saved as UTF-16 used to leave `CromGroup.invoke` — which
-    catches only `CromError` — as a traceback. Both mean the same thing to every caller,
+    `ValueError`, which the CLI boundary does not answer for, so a config saved as UTF-16
+    used to leave `crom` as a traceback. Both mean the same thing to every caller,
     which is that there are no bytes here crom can read. [LAW:parse-dont-validate]
     """
     try:
