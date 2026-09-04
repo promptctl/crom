@@ -1249,7 +1249,7 @@ def mcp_cmd(session: _Session, ref: str, path: str):
     """Wire chrome-devtools-mcp at a profile by writing .mcp.json here."""
     profile = session.working(ref)
     try:
-        mcp.write(profile.port, Path(path))
+        mcp.write(profile, Path(path))
     except ValueError as e:
         raise CromError(str(e)) from e
     click.echo(f"Wrote {path} wired to {profile.ref} ({profile.cdp_url})")
