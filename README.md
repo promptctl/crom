@@ -230,10 +230,10 @@ Not every failure gets an envelope, and the rule is that one appears exactly whe
 command that takes `--json` was given it and parsed it. `up`, `down`, `restart`, `show`,
 `list` and `config` take the flag; `add`, `rm`, `init`, `port`, `env`, `mcp` and `forget`
 answer in prose only. Bad usage — exit `2`, an unknown flag or a missing argument — is
-parsing itself failing, so the flag never takes effect and the answer stays prose even
-with `--json` sitting on the command line. `crom --version` is not a command and answers
-in prose for the same reason. A broken pipe is deliberately outside all of it: when
-`crom list | head` loses its reader mid-write, crom ends silently with exit `1` and
+parsing itself failing, so the `--json` on that line was never understood either: there
+is no flag to honour, and the answer stays prose. `crom --version` is not a command and
+answers in prose for the same reason. A broken pipe is deliberately outside all of it:
+when `crom list | head` loses its reader mid-write, crom ends silently with exit `1` and
 nothing on either stream, because a reader that has already left is the one failure with
 nowhere to put a document.
 

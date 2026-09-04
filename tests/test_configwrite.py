@@ -288,7 +288,7 @@ class MalformedConfigTest(unittest.TestCase):
     """A config crom cannot read must produce an error, not a traceback.
 
     These paths run *before* `config.parse` ever validates the file:
-    `cli.main` calls `_bootstrap_user_config()` on every invocation, which reaches
+    `_bootstrap_user_config()` runs on every invocation and reaches
     `_declare` → `_load` and `declares` without a scope being loaded. So anything raw
     escaping here came back on every command, including the ones a user would reach for
     to repair the file.
@@ -386,7 +386,7 @@ class WriteFailureTest(unittest.TestCase):
 
     `_save` writes a `.tmp` and `os.replace`s it, so the raw failure names the temp file
     and `_writing` reports the one the user has. `migrate.run` reaches `_save` through
-    `ensure_profile` before anything else in `main`, which made a full disk or a read-only
+    `ensure_profile` before any command runs, which made a full disk or a read-only
     mount a failure of every command rather than of one.
     """
 

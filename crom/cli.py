@@ -218,9 +218,9 @@ def _answer(ctx: click.Context, error: Exception, message: str) -> _Failure:
     keeps one home rather than growing a second guard beside it.
     """
     answer = next(a for a in _ANSWERS if isinstance(error, a.error))
-    # Absent until click parses the subcommand's options, so a usage error or the
-    # migration `main` runs first reaches the user as prose even though the flag was on
-    # the command line. The envelope answers for a command crom has understood.
+    # Absent only where the parse itself failed, since nothing crom does runs ahead of
+    # it: a malformed command line reaches the user as prose because the flag on it was
+    # never understood either. The envelope answers for a command crom has understood.
     if ctx.meta.get(_JSON_REQUESTED, False):
         detail = answer.detail(error)
         envelope = {
@@ -251,8 +251,61 @@ _COMMAND_SECTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
 )
 
 
+class CromCommand(click.Command):
+    """Gets crom ready to run a command, once click knows which command that is.
+
+    Migration and the user-config bootstrap can both refuse — `_require_all_stopped`
+    raises on a legacy install whose Chrome is still up, and bootstrapping fails on a
+    home crom cannot write. They ran from the group callback, which click calls *before*
+    `make_context` parses the invoked subcommand, so `--json` had not been recorded yet
+    and `_answer` had nothing to honour: `crom list --json` answered a refusal with prose
+    and an empty stdout. Moving the work here does not catch that failure earlier, it
+    makes it happen later — past the parse, where the flag is already known and the
+    boundary can answer for it like any other. [LAW:no-ambient-temporal-coupling] the
+    ordering is stated as a place rather than left to which of click's phases happens to
+    run first.
+
+    `CromGroup.command_class` is what makes it a rule instead of a habit: every command
+    built by `@main.command` is this class, so a command added tomorrow is ready without
+    anyone remembering to ready it. [LAW:single-enforcer]
+
+    What this changes for a reader: an eager option answers while the command line is
+    still parsing, so it never arrives here. `crom up --help` used to fail on a machine
+    whose home crom could not use — the group callback bootstrapped before click could
+    descend into the subcommand — while `crom --help` worked, splitting the two things a
+    confused user reaches for on exactly the machine where they are confused.
+    """
+
+    def invoke(self, ctx):
+        migrate.run_if_needed()
+        _bootstrap_user_config()
+        ctx.obj = _Session()
+        return super().invoke(ctx)
+
+
 class CromGroup(click.Group):
     """Turns a failed command into the CLI's exit-code contract, in one place."""
+
+    command_class = CromCommand
+
+    def parse_args(self, ctx, args):
+        """A bare `crom` is `crom up`, said as an argument rather than as a second way in.
+
+        The group used to carry `invoke_without_command` and call `ctx.invoke(up_cmd,
+        ref="default", as_json=False)` — a dispatch path that bypasses
+        `Command.invoke`, so whatever readies a command would have had to be spelled a
+        second time to cover it, and `ref="default"` was already `up`'s own default
+        written out again. [LAW:one-source-of-truth] Supplying the name instead leaves one
+        road into a command body, which is the whole of what this ticket is about.
+
+        `resilient_parsing` is click's own discriminator for a parse that is not an
+        invocation — shell completion working out what `crom <TAB>` could mean, where
+        offering the command list is not a request to run `up`.
+        [LAW:dataflow-not-control-flow] the branch is on click's own enum rather than on
+        a condition crom invented to tell the two apart.
+        """
+        default_command = [] if ctx.resilient_parsing else ["up"]
+        return super().parse_args(ctx, args or default_command)
 
     def invoke(self, ctx):
         """Answer for both ways a command fails: crom's own refusals, and the OS's.
@@ -398,7 +451,7 @@ def _bootstrap_user_config() -> None:
     )
 
 
-@click.group(cls=CromGroup, invoke_without_command=True)
+@click.group(cls=CromGroup)
 # The version is read from the installed distribution's metadata, which the build copies
 # out of pyproject.toml, so crom holds no second spelling of it to fall behind a release.
 # [LAW:one-source-of-truth]
@@ -413,12 +466,11 @@ def _bootstrap_user_config() -> None:
 # the next, since `prog` is argv[0].
 #
 # Eager, as click makes every `--version`: it answers and exits while the command line is
-# still being parsed, so nothing in the body below has run. That is the difference between
-# a version crom can always state and one it can state only on a machine whose home crom
-# can already use. [LAW:no-ambient-temporal-coupling]
+# still being parsed, so it never reaches the readying `CromCommand.invoke` does. That is
+# the difference between a version crom can always state and one it can state only on a
+# machine whose home crom can already use. [LAW:no-ambient-temporal-coupling]
 @click.version_option(package_name="crom", message="%(version)s")
-@click.pass_context
-def main(ctx):
+def main():
     """crom — a real Chrome per project, each on a port that never moves.
 
     \b
@@ -463,11 +515,6 @@ def main(ctx):
     from what exists is refused — `crom add dev --port 9500` when `dev` is
     declared on another port names the difference and changes nothing.
     """
-    migrate.run_if_needed()
-    _bootstrap_user_config()
-    ctx.obj = _Session()
-    if ctx.invoked_subcommand is None:
-        ctx.invoke(up_cmd, ref="default", as_json=False)
 
 
 def _start_under_lock(profile: ResolvedProfile) -> tuple[bool, tuple[int, ...]]:
