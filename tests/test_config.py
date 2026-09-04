@@ -7,7 +7,16 @@ from unittest import mock
 
 from crom import config, flags
 from crom.paths import default_profiles_root
-from crom.model import DEFAULT_SEED, Conflict, CromError, Scope, SeedChrome, SeedFresh, SeedPath
+from crom.model import (
+    DEFAULT_SEED,
+    Conflict,
+    CromError,
+    Reason,
+    Scope,
+    SeedChrome,
+    SeedFresh,
+    SeedPath,
+)
 
 SOURCE = Path("/proj/.crom.toml")
 
@@ -204,8 +213,11 @@ class ProfileTest(unittest.TestCase):
         self.assertNotIn("carries a value", str(caught.exception))
 
     def test_drop_flags_must_be_a_list_of_strings(self):
-        with self.assertRaisesRegex(CromError, r"drop_flags must be a list of switch names"):
+        with self.assertRaisesRegex(
+            CromError, r"drop_flags must be a list of switch names"
+        ) as caught:
             parse(MINIMAL + "[profiles.dev]\ndrop_flags = 3\n")
+        self.assertIs(caught.exception.reason, Reason.CONFIG_INVALID)
 
     def test_unknown_keys_are_refused_rather_than_ignored(self):
         with self.assertRaisesRegex(CromError, "unknown key"):
@@ -213,8 +225,14 @@ class ProfileTest(unittest.TestCase):
 
     def test_reserved_switches_are_refused(self):
         for flag in ("--user-data-dir=/tmp/x", "--remote-debugging-port=1234"):
-            with self.subTest(flag=flag), self.assertRaisesRegex(CromError, "crom owns it"):
+            with self.subTest(flag=flag), self.assertRaisesRegex(
+                CromError, "crom owns it"
+            ) as caught:
                 parse(MINIMAL + f'[profiles.dev]\nflags = ["{flag}"]\n')
+            # Against `drop_flags = 3` above: both are "your config is wrong" at
+            # exit 1, and only the slug says whether the file is malformed or
+            # well-formed and asking for something crom will not give up.
+            self.assertIs(caught.exception.reason, Reason.FLAGS_INVALID)
 
     def test_a_feature_switch_in_flags_is_refused_and_points_at_the_features_table(self):
         """crom composes these two switches itself, so a flag naming one would be replaced
@@ -342,16 +360,21 @@ class ChromeBinaryTest(unittest.TestCase):
         plain = self.root / "tools" / "notes.txt"
         plain.write_text("hi")
         plain.chmod(0o644)
-        with self.assertRaisesRegex(CromError, "not executable"):
+        with self.assertRaisesRegex(CromError, "not executable") as caught:
             self._parse(MINIMAL + 'chrome_binary = "./tools/notes.txt"\n')
+        self.assertIs(caught.exception.reason, Reason.CHROME_UNUSABLE)
 
     def test_an_empty_binary_is_refused_by_name_not_resolved(self):
         """`Path("")` is `Path(".")`, so the empty string resolves to the config's own
         directory — which exists. The `is_file()` check still refuses it, but the message
         then says a directory that is plainly there "does not exist", sending the reader
         to check the wrong fact. Same stance `state_dir` takes."""
-        with self.assertRaisesRegex(CromError, "chrome_binary is empty"):
+        with self.assertRaisesRegex(CromError, "chrome_binary is empty") as caught:
             self._parse(MINIMAL + 'chrome_binary = ""\n')
+        # One key, two slugs: nothing was written down, versus something was and
+        # it will not run. The second is worth a "install Chrome" message and the
+        # first is worth an "edit your config" one.
+        self.assertIs(caught.exception.reason, Reason.CONFIG_INVALID)
 
 
 class SeedTest(unittest.TestCase):
@@ -456,8 +479,14 @@ class SeedPathGuardTest(unittest.TestCase):
             self._parse("~")
 
     def test_the_filesystem_root_is_refused(self):
-        with self.assertRaisesRegex(CromError, "your whole home directory or filesystem"):
+        with self.assertRaisesRegex(
+            CromError, "your whole home directory or filesystem"
+        ) as caught:
             self._parse("/")
+        # Every other bad value in a config file is `config_invalid`; this one is
+        # about what copying the named directory would do, and a caller told only
+        # "your config is wrong" would go looking for a typo.
+        self.assertIs(caught.exception.reason, Reason.SEED_UNSAFE)
 
     def test_an_ancestor_of_home_is_refused(self):
         ancestor = str(Path.home().resolve().parent)

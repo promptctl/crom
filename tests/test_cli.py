@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import tempfile
 import unittest
 from dataclasses import replace
@@ -1985,6 +1986,37 @@ class CliTest(unittest.TestCase):
                 "chrome_startup_failed": (1, "failure"),
             },
         )
+
+    def test_a_refusal_the_os_did_not_number_answers_with_no_reason_at_all(self):
+        """The one failure that reaches the envelope with nothing to put in `reason`.
+
+        `_errno_reason` looks the slug up in the OS's own errno table rather than
+        inventing a parallel spelling beside it, and not every `OSError` carries a number
+        to look up — `shutil.Error` aggregates per-file failures and carries none.
+        Documented, and until this test never once executed.
+
+        `null` is the honest answer and the only one that cannot be mistaken for a slug:
+        a stand-in like `"unknown"` would be an answer-shaped void, a value shaped like an
+        identification that a script could branch on as though crom had made one.
+        [LAW:parse-dont-validate]
+
+        `kind` still says `os_error`, which is the whole point of the two fields being
+        separate — crom knows the machine refused even when it cannot say how.
+        """
+        self.crom("init")
+
+        with mock.patch("crom.chrome.scan", side_effect=shutil.Error("gave up partway")):
+            result = self.invoke("list", "--json", expect=1)
+
+        error = json.loads(result.stdout)["error"]
+        # Subscripted rather than `.get`: present-and-null is the contract, so a key that
+        # went missing must fail here instead of reading as the null it should have been.
+        self.assertIsNone(error["reason"])
+        self.assertEqual(error["kind"], "os_error")
+        # An `OSError` carrying neither `filename` nor `strerror` still owes the user a
+        # sentence; the halves the boundary drops must not take the message with them.
+        # [LAW:no-silent-failure]
+        self.assertIn("gave up partway", error["message"])
 
     def test_every_reason_answers_with_the_class_its_own_row_names(self):
         """The whole table walked: each reason raises the exception its row declares, and
