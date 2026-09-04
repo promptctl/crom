@@ -604,12 +604,40 @@ class LaunchReadinessTest(unittest.TestCase):
         with (
             mock.patch.object(chrome, "_probe_port", return_value=chrome._Answered()),
             mock.patch.object(chrome, "find_pids", find_pids),
-            self.assertRaises(CromError),
+            self.assertRaises(CromError) as caught,
         ):
             chrome.launch(self.profile)
 
         self.assertEqual(self.signals, [(4242, signal.SIGTERM)])
         self.assertEqual(self.running, [])  # not left holding the profile and its port
+        # The stop worked, so nothing may say otherwise: the cleanup is the only voice
+        # that reports what survived, and here it has nothing to report.
+        self.assertNotIn("could not clear up", str(caught.exception))
+
+    def test_a_browser_that_stays_invisible_still_reports_the_port_it_holds(self):
+        """Why this ending demands `_still_held` and not the process table alone.
+
+        The scan that never recovers, which is the other half of the ending above. Nothing
+        is ever named, so nothing can be signalled, and the port is the only witness left
+        that the browser really is there. Demanding the process table alone would end here
+        reporting no residue at all, while the next `up` walks into a port still bound by
+        a browser crom just told the user nothing about. [LAW:no-silent-failure]
+        """
+        with (
+            mock.patch.object(chrome, "SHUTDOWN_TIMEOUT_SECONDS", 0.2),
+            mock.patch.object(chrome, "_probe_port", return_value=chrome._Answered()),
+            mock.patch.object(chrome, "find_pids", lambda _profile: ()),
+            mock.patch.object(chrome, "_port_is_free", lambda _port: False),
+            self.assertRaises(CromError) as caught,
+        ):
+            chrome.launch(self.profile)
+
+        message = str(caught.exception)
+        self.assertIn("visible to `ps`", message)  # the diagnosis survives the cleanup
+        self.assertIn("could not clear up", message)
+        self.assertIn(f"port {self.profile.port} is still held", message)
+        self.assertIn("lsof", message)
+        self.assertEqual(self.signals, [])  # no pid was ever seen, so none was signalled
 
     def test_a_browser_that_never_answered_is_stopped_rather_than_left_running(self):
         """The leak this ticket exists to close, on the arm that always leaked.

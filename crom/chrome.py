@@ -730,12 +730,13 @@ def launch(profile: ResolvedProfile) -> tuple[int, ...]:
     it never comes up, rather than returning a port nothing is listening on — or one that
     something else is listening on, which used to read as success.
 
-    The three ways that can go wrong get three messages, because they are three problems
-    with three different next steps: read what the browser printed and fix the binary,
-    look at the flags a browser that is still running never got past, or find out who took
-    the port. A reader can tell which happened from the message alone, without going back
-    to the machine to look. Every one of them also carries Chrome's own account of itself,
-    which is usually the only line a user can act on directly.
+    Every way this can go wrong gets its own message, because each is a different problem
+    with a different next step: read what the browser printed and fix the binary, look at
+    the flags a browser that is still running never got past, find out who took the port,
+    or go looking for a browser that answered CDP and then went unseen. A reader can tell
+    which happened from the message alone, without going back to the machine to look.
+    Every one of them also carries Chrome's own account of itself, which is usually the
+    only line a user can act on directly.
     """
     _require_port_available(profile)
     profile.profile_dir.mkdir(parents=True, exist_ok=True)
@@ -779,7 +780,7 @@ def launch(profile: ResolvedProfile) -> tuple[int, ...]:
             problem = (
                 f"Chrome for '{profile.ref}' answered on CDP port {profile.port}, but no "
                 f"main browser process using {profile.profile_dir} is visible to `ps`, so "
-                f"crom can neither report nor stop it.{said}\nCommand was: {command}"
+                f"crom cannot name the process it started.{said}\nCommand was: {command}"
             )
             # `_still_held`, with the same reasoning as the two endings that saw silence
             # rather than the one that met a stranger. A browser that answered and then
