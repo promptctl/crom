@@ -2255,8 +2255,8 @@ class CliTest(unittest.TestCase):
         the source rather than over one execution.
 
         What it looks for is a call on the bare name: `CromError(...)`, `NotFound(...)`,
-        `Conflict(...)`. The one legitimate construction — `self.raises(message, self)`,
-        inside `Reason.error` — is a call on an attribute and so is not one, which is why
+        `Conflict(...)`. The one legitimate construction — `self.raises(...)`, inside
+        `Reason.error` — is a call on an attribute and so is not one, which is why
         this needs no list of blessed exceptions to stay accurate.
 
         Same shape as `test_help_sections_cover_every_command`: a completeness check on a
