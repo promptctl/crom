@@ -143,6 +143,58 @@ class WriteTest(unittest.TestCase):
             mcp.write(profile(ProfileRef("a" * 40, "dev"), 9222), self.path)
         self.assertEqual(self.path.read_text(), original)
 
+    def test_upgrades_a_legacy_entry_wired_to_this_profile(self):
+        # The file a previous crom left: one entry under the constant key, naming the
+        # browser this profile owns. It is the same wiring, so it is renamed, not
+        # duplicated — the point of the ticket, and the end of the epic's interim state.
+        self.path.write_text(json.dumps({
+            "mcpServers": {mcp.LEGACY_KEY: mcp.server_entry(9222)}
+        }))
+        mcp.write(self.dev, self.path)
+        self.assertEqual(list(self.servers()), [mcp.entry_key(self.dev.ref)])
+        self.assertEqual(self.servers()[mcp.entry_key(self.dev.ref)], mcp.server_entry(9222))
+
+    def test_an_unrelated_server_survives_the_upgrade(self):
+        # [LAW:no-silent-failure] the upgrade may only ever touch the one entry it can
+        # prove is crom's; a neighbour losing fields to it would be invisible until the
+        # neighbour's own tool broke.
+        other = {"type": "stdio", "command": "foo", "args": ["--flag"], "env": {"A": "1"}}
+        self.path.write_text(json.dumps({
+            "mcpServers": {"other": other, mcp.LEGACY_KEY: mcp.server_entry(9222)}
+        }))
+        mcp.write(self.dev, self.path)
+        self.assertEqual(self.servers()["other"], other)
+        self.assertNotIn(mcp.LEGACY_KEY, self.servers())
+
+    def test_keeps_a_legacy_key_entry_crom_did_not_write(self):
+        # Same key, same port, hand-written body. Recognition is `== server_entry(port)`
+        # precisely so this survives: crom cannot show it wrote this, so it must not
+        # delete it.
+        theirs = {"command": "npx", "args": ["--browserUrl", "http://127.0.0.1:9222"]}
+        self.path.write_text(json.dumps({"mcpServers": {mcp.LEGACY_KEY: theirs}}))
+        mcp.write(self.dev, self.path)
+        self.assertEqual(self.servers()[mcp.LEGACY_KEY], theirs)
+        self.assertIn(mcp.entry_key(self.dev.ref), self.servers())
+
+    def test_keeps_a_legacy_entry_wired_to_another_port(self):
+        # crom's handwriting, but naming a browser that is not this profile's. Renaming
+        # it would need the ledger to say whose port that is, and a recycled port makes
+        # that answer confidently wrong — so it waits for its own profile to be wired.
+        stranger = mcp.server_entry(9500)
+        self.path.write_text(json.dumps({"mcpServers": {mcp.LEGACY_KEY: stranger}}))
+        mcp.write(self.dev, self.path)
+        self.assertEqual(self.servers()[mcp.LEGACY_KEY], stranger)
+        self.assertIn(mcp.entry_key(self.dev.ref), self.servers())
+
+    def test_a_ref_it_cannot_spell_leaves_a_legacy_entry_wired(self):
+        # The refusal must not land between the drop and the replacement: a profile that
+        # outgrew KEY_LIMIT would otherwise lose the wiring it still had.
+        original = json.dumps({"mcpServers": {mcp.LEGACY_KEY: mcp.server_entry(9222)}})
+        self.path.write_text(original)
+        with self.assertRaises(CromError):
+            mcp.write(profile(ProfileRef("a" * 40, "dev"), 9222), self.path)
+        self.assertEqual(self.path.read_text(), original)
+
     def test_rejects_invalid_json(self):
         self.path.write_text("not json")
         with self.assertRaises(CromError):
