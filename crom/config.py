@@ -152,7 +152,9 @@ def discover(start: Path | None = None) -> Path | None:
     if override:
         path = Path(override).expanduser().resolve()
         if not path.exists():
-            raise Reason.CONFIG_MISSING.error(f"CROM_CONFIG points at {path}, which does not exist")
+            raise Reason.CONFIG_MISSING.error(
+                f"CROM_CONFIG points at {path}, which does not exist", path=str(path)
+            )
         return path
 
     directory = (start or Path.cwd()).resolve()
@@ -614,7 +616,8 @@ def reject_duplicate_ports(profiles: dict[str, ProfileSpec], source: Path) -> No
             # on load or from `crom add` checking a declaration before it writes it.
             raise Reason.PORT_CONFLICT.error(
                 f"{source}: profiles '{claimed[spec.port]}' and '{spec.name}' both "
-                f"pin port {spec.port}"
+                f"pin port {spec.port}",
+                port=spec.port,
             )
         claimed[spec.port] = spec.name
 
@@ -624,7 +627,7 @@ def reject_duplicate_ports(profiles: dict[str, ProfileSpec], source: Path) -> No
 
 def load_file(source: Path, *, namespace: str | None = None) -> Scope:
     if not source.is_file():
-        raise Reason.CONFIG_MISSING.error(f"config file not found: {source}")
+        raise Reason.CONFIG_MISSING.error(f"config file not found: {source}", path=str(source))
     return parse(source.read_text(), source, namespace=namespace)
 
 

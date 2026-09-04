@@ -304,8 +304,11 @@ class ProfileTest(unittest.TestCase):
         self.assertEqual(scope.profiles["dev"].features, {"FromProfile": True})
 
     def test_two_profiles_may_not_pin_the_same_port(self):
-        with self.assertRaisesRegex(CromError, "both pin port"):
+        with self.assertRaisesRegex(CromError, "both pin port") as caught:
             parse(MINIMAL + "[profiles.a]\nport = 9401\n[profiles.b]\nport = 9401\n")
+        # The contested number as a number, so a caller picking the next free one does not
+        # have to find it inside a sentence naming three other things.
+        self.assertEqual(caught.exception.fields, {"port": 9401})
 
     def test_port_must_be_a_real_port(self):
         with self.assertRaisesRegex(CromError, "1..65535"):
@@ -463,10 +466,15 @@ class DiscoveryTest(unittest.TestCase):
         would run the command against a different project's config than the caller
         named — a fallback that changes which data is read, which is the worst kind.
         [LAW:no-silent-failure]"""
-        with mock.patch.dict(os.environ, {"CROM_CONFIG": str(self.root / "absent.toml")}):
+        # Written with a `..` in it so the field cannot pass by echoing the variable back:
+        # what crom went looking at is the resolved path, and that resolution is the lookup
+        # the caller cannot repeat without knowing how crom expands one.
+        typed = str(self.root / "sub" / ".." / "absent.toml")
+        with mock.patch.dict(os.environ, {"CROM_CONFIG": typed}):
             with self.assertRaisesRegex(CromError, "which does not exist") as caught:
                 config.discover(self.root)
         self.assertIs(caught.exception.reason, Reason.CONFIG_MISSING)
+        self.assertEqual(caught.exception.fields, {"path": str(self.root / "absent.toml")})
 
     def test_loading_a_file_that_is_not_there_names_it_rather_than_crashing(self):
         with self.assertRaisesRegex(CromError, "config file not found") as caught:
@@ -474,6 +482,7 @@ class DiscoveryTest(unittest.TestCase):
         # A `NotFound` at exit 3 like `namespace_unknown` and `profile_unknown`, and the
         # only one of the three about the file itself rather than a name written in it.
         self.assertIs(caught.exception.reason, Reason.CONFIG_MISSING)
+        self.assertEqual(caught.exception.fields, {"path": str(self.root / "absent.toml")})
 
     def test_finds_config_in_an_ancestor_directory(self):
         (self.root / ".crom.toml").write_text(MINIMAL)

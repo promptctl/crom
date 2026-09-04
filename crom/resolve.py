@@ -141,9 +141,12 @@ def scope_for(namespace: str, ambient: Scope, log=report.to_stderr) -> Scope:
                 f"are kept — `crom forget {namespace}` releases them if the project is gone."
             )
 
-    options = ", ".join(sorted({USER_NAMESPACE, ambient.namespace, *registry.namespaces()}))
+    # Built once and spent twice — joined for the reader, handed over whole for the
+    # script. The sentence is a rendering of the field, not a second list that could come
+    # to disagree with it. [LAW:one-source-of-truth]
+    known = tuple(sorted({USER_NAMESPACE, ambient.namespace, *registry.namespaces()}))
     raise Reason.NAMESPACE_UNKNOWN.error(
-        f"unknown namespace '{namespace}'. Known namespaces: {options}"
+        f"unknown namespace '{namespace}'. Known namespaces: {', '.join(known)}", known=known
     )
 
 
@@ -190,10 +193,13 @@ def spec_for(ref: ProfileRef, scope: Scope) -> ProfileSpec:
     """
     spec = scope.profiles.get(ref.name)
     if spec is None:
-        declared = ", ".join(sorted(scope.profiles)) or "(none)"
+        declared = tuple(sorted(scope.profiles))
         where = scope.source or "your user config"
         raise Reason.PROFILE_UNKNOWN.error(
-            f"profile '{ref}' is not declared in {where}.\nDeclared there: {declared}"
+            f"profile '{ref}' is not declared in {where}.\n"
+            f"Declared there: {', '.join(declared) or '(none)'}",
+            source=str(scope.source) if scope.source else None,
+            declared=declared,
         )
     return spec
 

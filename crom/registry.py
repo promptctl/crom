@@ -204,7 +204,9 @@ def remember_namespace(namespace: str, source: Path, log=report.to_stderr) -> No
                 raise Reason.NAMESPACE_CLAIMED.error(
                     f"namespace '{namespace}' is already claimed by {recorded}.\n"
                     f"{source} cannot use it too — they would share profile directories "
-                    f"and ports. Rename this project's `namespace`."
+                    f"and ports. Rename this project's `namespace`.",
+                    namespace=namespace,
+                    claimed_by=recorded,
                 )
             # Only the mapping goes; the reservations stay. See `forget_mapping`.
             data["namespaces"].pop(namespace, None)
@@ -338,7 +340,8 @@ def _reject_base_port_pin(key: str, pinned: int | None) -> None:
         raise Reason.PORT_CONFLICT.error(
             f"port {BASE_PORT} is reserved for '{_DEFAULT_REF}', which a bare `crom` "
             f"expects to find there without a lookup.\n"
-            f"Pin a different port for '{key}', or remove the pin to let crom assign one."
+            f"Pin a different port for '{key}', or remove the pin to let crom assign one.",
+            port=BASE_PORT,
         )
 
 
@@ -349,7 +352,8 @@ def _reject_foreign_claim(key: str, port: int, ports: dict[str, dict]) -> None:
         origin = entry.get("source") or "assigned by crom"
         raise Reason.PORT_CONFLICT.error(
             f"port {port} is already held by profile '{other_key}' ({origin}).\n"
-            f"Change the `port` for '{key}', or remove it to let crom assign a free one."
+            f"Change the `port` for '{key}', or remove it to let crom assign a free one.",
+            port=port,
         )
 
 

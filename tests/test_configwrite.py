@@ -354,6 +354,19 @@ class MalformedConfigTest(unittest.TestCase):
         # raises build their own message, so a swap changes nothing else this file reads.
         self.assertIs(caught.exception.reason, Reason.CONFIG_INVALID)
 
+    def test_removing_a_profile_that_is_not_there_names_the_ones_that_are(self):
+        """The typo case, which is the one a user actually reaches.
+
+        The names come out of the table this function just read, so the answer to "then
+        what *is* declared here" costs nothing and needs no second read of the file.
+        """
+        self.target.write_text('namespace = "myapp"\n[profiles.dev]\n[profiles.ci]\n')
+        with self.assertRaises(NotFound) as caught:
+            configwrite.remove_profile(self.target, "dve")
+        self.assertEqual(
+            caught.exception.fields, {"source": str(self.target), "declared": ("ci", "dev")}
+        )
+
     def test_removing_from_a_file_with_no_profiles_is_still_not_found(self):
         """Routing through the shared helper must not turn "absent" into "malformed"."""
         self.target.write_text('namespace = "myapp"\n')
@@ -362,6 +375,10 @@ class MalformedConfigTest(unittest.TestCase):
         # Both `NotFound`, both exit 3: the slug is the only field that says the
         # file was found and the profile in it was not.
         self.assertIs(caught.exception.reason, Reason.PROFILE_UNKNOWN)
+        # An empty `declared`, which is the honest answer here and not an absent one: the
+        # file was read and it declares nothing. `resolve`'s site of this same reason
+        # fills the same two names from a scope, so a caller reads one shape either way.
+        self.assertEqual(caught.exception.fields, {"source": str(self.target), "declared": ()})
 
 
 class WriteFailureTest(unittest.TestCase):

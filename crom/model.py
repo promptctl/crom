@@ -41,6 +41,16 @@ _NAME_RE = re.compile(rf"^[a-z0-9][a-z0-9._-]{{0,{NAME_LIMIT - 1}}}\Z")
 FALLBACK_NAMESPACE = "project"
 
 
+# What a failure carries beside its sentence: the values crom looked up on the way to
+# refusing, in the shapes JSON already has. A `Path` is not one of them — whoever holds
+# the path renders it, so the envelope writes what it is given rather than translating on
+# the way out. For crom's own refusals that is the raise site; the one failure with no
+# raise site, the OS's, is rendered by the boundary that receives it.
+# [LAW:effects-at-boundaries]
+FieldValue = str | int | tuple[str, ...] | None
+Fields = dict[str, FieldValue]
+
+
 class CromError(Exception):
     """A failure with a message meant for the user, raised anywhere below the CLI.
 
@@ -48,15 +58,21 @@ class CromError(Exception):
     enforcement: a raise that forgot to say why is a `TypeError`, not a gap a reviewer
     has to notice. [LAW:types-are-the-program]
 
-    `super().__init__` is handed the message alone. An `Exception` built with two
+    `fields` is that same sentence's data left unflattened — the namespaces crom knows,
+    the profiles a config declares — and it is required for the same reason the reason
+    is: a raise site cannot decide to omit it, because `Reason.error` builds it from what
+    the reason declares, whether that is three names or none.
+
+    `super().__init__` is handed the message alone. An `Exception` built with several
     arguments renders as the tuple — `str(e)` becomes `"('msg', <Reason...>)"` — which
     would corrupt both the sentence click prints to stderr and the envelope's `message`,
     the two the CLI asserts are one string rendered twice.
     """
 
-    def __init__(self, message: str, reason: "Reason"):
+    def __init__(self, message: str, reason: "Reason", fields: "Fields"):
         super().__init__(message)
         self.reason = reason
+        self.fields = fields
 
 
 class NotFound(CromError):
@@ -92,33 +108,94 @@ class Reason(Enum):
     Slugs are a promise: rename one and every script branching on it breaks silently, so
     a wrong-but-published name stays. `@unique` makes two reasons sharing a slug a
     definition-time error rather than an aliased member that answers to the wrong name.
+
+    A reason also declares what it `carries` — the field names its envelope holds beside
+    the sentence — and that is the fourth thing derived from this one fact, after the
+    class, the kind and the exit code. A payload whose shape varies needs a discriminator
+    to say which shape it is, and the reason already *is* the discriminator, so the schema
+    belongs to it rather than beside it. [LAW:types-are-the-program] a reason answering
+    with another reason's fields is unrepresentable: `error` builds the payload from
+    `carries` and refuses anything else.
+
+    A field earns its place the way a slug does, and by the same test read one level down:
+    a slug separates next moves, and a field carries what crom *looked up* on the way to
+    refusing. The namespaces that do exist, the profiles a config declares, the file
+    already holding a name — a caller cannot reach any of those without matching English.
+    The namespace it typed is not among them; echoing an argument back is a second copy of
+    something the caller is already holding, which is why `namespace_reserved` carries
+    nothing at all: the one reserved name is a constant, not a lookup.
     """
 
-    def __new__(cls, slug: str, raises: type[CromError]) -> "Reason":
+    def __new__(
+        cls, slug: str, raises: type[CromError], carries: tuple[str, ...] = ()
+    ) -> "Reason":
         member = object.__new__(cls)
         member._value_ = slug
         member.raises = raises
+        member.carries = carries
         return member
 
-    def error(self, message: str) -> CromError:
-        return self.raises(message, self)
+    def error(self, message: str, **fields: FieldValue) -> CromError:
+        """Build this reason's failure — the only way any `CromError` comes into being.
+
+        The payload is rebuilt in `carries` order rather than kept in call order, so the
+        envelope's keys read the same whichever way a raise site happened to name them:
+        the declaration decides the shape, and a raise site only supplies values.
+        [LAW:one-source-of-truth]
+
+        A mismatch is a `TypeError` here and a failing suite before that — the sweep in
+        `test_cli` reads every `Reason.<X>.error(...)` call in the package and compares its
+        keywords against this table, because a raise site runs only once something has
+        already gone wrong and a landmine in an error path is the worst place to leave one.
+        """
+        if fields.keys() != set(self.carries):
+            raise TypeError(f"{self.value} carries {self.carries}, given {tuple(fields)}")
+        return self.raises(message, self, {name: fields[name] for name in self.carries})
 
     # Nothing crom was asked for is there. (exit 3)
-    CONFIG_MISSING = ("config_missing", NotFound)
-    NAMESPACE_UNKNOWN = ("namespace_unknown", NotFound)
-    PROFILE_UNKNOWN = ("profile_unknown", NotFound)
+    # `path` is the file crom went looking at, which is never simply what the caller
+    # typed: one site has expanded and resolved `CROM_CONFIG`, the other was handed a
+    # path discovered by walking up from the working directory.
+    CONFIG_MISSING = ("config_missing", NotFound, ("path",))
+    # `known`, and deliberately not the namespace that was asked for: that one arrived in
+    # the caller's own argument and repeating it back is a second copy of something the
+    # caller is holding. The list of namespaces that *do* exist is the registry read crom
+    # did on the caller's behalf, and the sentence is otherwise its only copy.
+    NAMESPACE_UNKNOWN = ("namespace_unknown", NotFound, ("known",))
+    # `source` is null for the one scope that has no file behind it — `user`, on a machine
+    # whose user config has not been written yet, which is the null `Scope.source` already
+    # documents. Null rather than the sentence's "your user config": that phrase is prose
+    # for a human, and a script offered it as a path would try to open it.
+    # [LAW:parse-dont-validate]
+    PROFILE_UNKNOWN = ("profile_unknown", NotFound, ("source", "declared"))
 
     # Two claims on one resource, or a claim crom reserves for itself. (exit 4)
-    NAMESPACE_CLAIMED = ("namespace_claimed", Conflict)
+    # `namespace` here, where `namespace_unknown` refuses it, because this reason's loudest
+    # case is a bare `crom init` whose namespace crom derived from the directory name —
+    # the caller never typed it and has nothing to compare against `claimed_by`.
+    NAMESPACE_CLAIMED = ("namespace_claimed", Conflict, ("namespace", "claimed_by"))
+    # Nothing: the reserved name is a constant crom publishes, so a field would restate
+    # `USER_NAMESPACE` to a caller that could read it from the slug alone.
     NAMESPACE_RESERVED = ("namespace_reserved", Conflict)
-    PORT_CONFLICT = ("port_conflict", Conflict)
+    # `port` and nothing finer, because it is what all three raise sites hold in common —
+    # two profiles pinning one number, a pin on the number held for `user/default`, and a
+    # number another profile already reserved. The one thing that would separate them is
+    # who the other claimant is, and "the other claimant" is not the same thing in all
+    # three, so naming it once would mean inventing it twice. [LAW:one-source-of-truth]
+    PORT_CONFLICT = ("port_conflict", Conflict, ("port",))
+    # Nothing: the floor of the search is crom's own constant and the machine being full
+    # leaves a caller exactly one next move, so no field would separate anything.
     PORT_EXHAUSTED = ("port_exhausted", Conflict)
     # Not `profile_differs`: `_reject_restatement` raises this for `crom add` comparing a
     # profile's declaration *and* for `crom init` comparing the project's own namespace
     # and defaults, a command that names no profile at all. One slug rather than two
     # because the next move is the same either way — edit the file or change the request
     # — and a slug earns its place by separating next moves, not by being finer.
-    DECLARATION_DIFFERS = ("declaration_differs", Conflict)
+    # `settings` names which of them differ, in the config file's own key names rather
+    # than any display label. The declared and asked-for values stay in the sentence: they
+    # are for a human deciding which one is right, and a script that acted on them would be
+    # editing the user's config from the text of a refusal.
+    DECLARATION_DIFFERS = ("declaration_differs", Conflict, ("settings",))
 
     # A config file crom cannot act on.
     CONFIG_INVALID = ("config_invalid", CromError)
