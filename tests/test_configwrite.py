@@ -225,8 +225,11 @@ class HeaderInvariantTest(unittest.TestCase):
         self.target = self.root / ".crom.toml"
 
     def test_creating_a_config_without_a_header_is_refused(self):
-        with self.assertRaisesRegex(CromError, "will not create a config without a header"):
+        with self.assertRaisesRegex(
+            CromError, "will not create a config without a header"
+        ) as caught:
             configwrite.ensure_profile(self.target, ProfileSpec(name="ci", seed=SeedFresh()))
+        self.assertIs(caught.exception.reason, Reason.CONFIG_HEADER_REQUIRED)
         self.assertFalse(self.target.exists())
 
     def test_an_existing_file_needs_no_header(self):
@@ -292,8 +295,24 @@ class MalformedConfigTest(unittest.TestCase):
 
     def test_unparseable_toml_is_reported_against_the_file(self):
         self.target.write_text("this is not = = valid toml [[[")
-        with self.assertRaisesRegex(CromError, "cannot be read as TOML"):
+        with self.assertRaisesRegex(CromError, "cannot be read as TOML") as caught:
             configwrite.declares(self.target, "ci")
+        self.assertIs(caught.exception.reason, Reason.CONFIG_INVALID)
+
+    def test_a_config_that_cannot_be_read_is_not_reported_as_malformed(self):
+        """The other half of `_load`'s `except`, which catches `ParseError` alone.
+
+        "Repair the file" is the wrong remedy for a file whose contents are fine and
+        whose permissions are not, and no slug here would be right — so the `OSError`
+        travels to the CLI boundary intact and is answered there with the errno name
+        the OS already published. Widening this back to `OSError` would relabel a
+        permissions problem as a syntax one and send the user to edit a file they
+        still cannot open, which is why the escape is the assertion.
+        """
+        self.target.write_text('namespace = "myapp"\n')
+        with mock.patch.object(Path, "read_text", side_effect=PermissionError(13, "denied")):
+            with self.assertRaises(PermissionError):
+                configwrite.declares(self.target, "ci")
 
     def test_a_profiles_key_that_is_not_a_table_is_refused_when_declaring(self):
         """`setdefault` returns the existing value, so the later item assignment raised a
@@ -327,8 +346,11 @@ class MalformedConfigTest(unittest.TestCase):
     def test_removing_from_a_file_with_no_profiles_is_still_not_found(self):
         """Routing through the shared helper must not turn "absent" into "malformed"."""
         self.target.write_text('namespace = "myapp"\n')
-        with self.assertRaises(NotFound):
+        with self.assertRaises(NotFound) as caught:
             configwrite.remove_profile(self.target, "ci")
+        # Both `NotFound`, both exit 3: the slug is the only field that says the
+        # file was found and the profile in it was not.
+        self.assertIs(caught.exception.reason, Reason.PROFILE_UNKNOWN)
 
 
 class WriteFailureTest(unittest.TestCase):
@@ -350,8 +372,9 @@ class WriteFailureTest(unittest.TestCase):
         with mock.patch.object(
             Path, "write_text", side_effect=OSError(28, "No space left on device")
         ):
-            with self.assertRaisesRegex(CromError, "No space left on device"):
+            with self.assertRaisesRegex(CromError, "No space left on device") as caught:
                 configwrite.ensure_profile(self.target, ProfileSpec(name="ci", seed=SeedFresh()))
+        self.assertIs(caught.exception.reason, Reason.CONFIG_UNWRITABLE)
 
     def test_a_declaration_that_already_exists_is_a_reported_no_op(self):
         """Not a failure, and not silent either: the bool is how `crom add` chooses

@@ -13,7 +13,7 @@ from pathlib import Path
 from unittest import mock
 
 from crom import paths, registry
-from crom.model import Conflict, CromError, ProfileRef
+from crom.model import Conflict, CromError, ProfileRef, Reason
 
 
 class LedgerTest(unittest.TestCase):
@@ -146,8 +146,9 @@ class XdgTest(unittest.TestCase):
         variable that would fix it — `RuntimeError` is not a `CromError`."""
         with mock.patch.dict(os.environ, {}, clear=True):
             with mock.patch.object(Path, "home", side_effect=RuntimeError("no home")):
-                with self.assertRaisesRegex(CromError, "XDG_STATE_HOME"):
+                with self.assertRaisesRegex(CromError, "XDG_STATE_HOME") as caught:
                     paths.state_home()
+        self.assertIs(caught.exception.reason, Reason.HOME_UNKNOWN)
 
 
 
