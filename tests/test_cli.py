@@ -1232,6 +1232,163 @@ class CliTest(unittest.TestCase):
 
         self.assertEqual(events, ["lock", "kill", "unlock"])
 
+    # --- restart --------------------------------------------------------------------
+
+    def test_restart_stops_and_starts_inside_one_critical_section(self):
+        """The claim that makes `crom restart` more than `crom down && crom up`.
+
+        Released between the halves, another crom process is free to land in the gap. A
+        concurrent `up` sees nothing running and starts the browser, so this command's own
+        start then finds a live Chrome and reports a restart it never performed — on the
+        old command line, which is the one thing a restart exists to replace. An `rm` in
+        the gap deletes the directory this is about to launch against.
+
+        So the claim under test is the *span* of the lock, not that both halves happen.
+        [LAW:no-ambient-temporal-coupling]
+        """
+        self.crom("init")
+        self.crom("add", "ci")
+
+        events: list[str] = []
+        real_lock = cli.seed.profile_lock
+
+        @contextlib.contextmanager
+        def tracking_lock(profile):
+            events.append("lock")
+            with real_lock(profile):
+                yield
+            events.append("unlock")
+
+        with (
+            mock.patch("crom.cli.seed.profile_lock", tracking_lock),
+            mock.patch("crom.cli.seed.materialize_under_lock"),
+            mock.patch("crom.cli.chrome.kill", lambda _p: events.append("kill") or (999,)),
+            mock.patch("crom.cli.chrome.find_pids", return_value=()),
+            mock.patch("crom.cli.chrome.launch", lambda _p: events.append("launch") or (1234,)),
+        ):
+            self.crom("restart", "ci")
+
+        self.assertEqual(events, ["lock", "kill", "launch", "unlock"])
+
+    def test_restart_names_the_process_it_replaced(self):
+        """Both pids, because the point of the command is that the browser is a new one.
+        A message saying only "Restarted" cannot be told from `up` reporting a browser it
+        left alone, which is the failure this whole command exists to prevent."""
+        self.crom("init")
+        self.crom("add", "ci")
+
+        with (
+            mock.patch("crom.cli.seed.materialize_under_lock"),
+            mock.patch("crom.cli.chrome.kill", return_value=(999,)),
+            mock.patch("crom.cli.chrome.find_pids", return_value=()),
+            mock.patch("crom.cli.chrome.launch", return_value=(1234,)),
+        ):
+            output = self.crom("restart", "ci")
+
+        self.assertIn("Restarted myproj/ci", output)
+        self.assertIn("was pid 999", output)
+        self.assertIn("now pid 1234", output)
+
+    def test_restart_of_a_stopped_profile_starts_it_rather_than_erroring(self):
+        """`restart` converges toward running, so the state it was asked to reach is
+        reached — it just has nothing to report stopping. Erroring here would be crom
+        telling a user to run `crom up` instead, which is the thing README.md promises
+        it never does."""
+        self.crom("init")
+        self.crom("add", "ci")
+
+        with (
+            mock.patch("crom.cli.seed.materialize_under_lock"),
+            mock.patch("crom.cli.chrome.kill", return_value=()),
+            mock.patch("crom.cli.chrome.find_pids", return_value=()),
+            mock.patch("crom.cli.chrome.launch", return_value=(1234,)),
+        ):
+            output = self.crom("restart", "ci")
+
+        self.assertIn("was not running", output)
+        self.assertIn("started it", output)
+
+    # --- show -----------------------------------------------------------------------
+
+    def test_show_raises_the_running_browser_without_starting_one(self):
+        self.crom("init")
+        self.crom("add", "ci")
+
+        with (
+            mock.patch("crom.cli.seed.materialize_under_lock"),
+            mock.patch("crom.cli.chrome.find_pids", return_value=(999,)),
+            mock.patch("crom.cli.chrome.launch", side_effect=AssertionError("must not launch")),
+            mock.patch("crom.cli.window.raise_profile", return_value=1) as raised,
+        ):
+            output = self.crom("show", "ci")
+
+        self.assertEqual(raised.call_args.args[1], (999,))
+        self.assertIn("Raised myproj/ci", output)
+        self.assertNotIn("Started", output)
+
+    def test_show_starts_a_stopped_profile_and_says_it_did(self):
+        """The convergence README.md describes: if the only thing between a command and
+        its job is another crom command, crom runs it and says so. `show` names the end
+        state 'this profile's window is in front', and a profile that is not running is
+        one `crom up` away from it."""
+        self.crom("init")
+        self.crom("add", "ci")
+
+        with (
+            mock.patch("crom.cli.seed.materialize_under_lock"),
+            mock.patch("crom.cli.chrome.find_pids", return_value=()),
+            mock.patch("crom.cli.chrome.launch", return_value=(1234,)),
+            mock.patch("crom.cli.window.raise_profile", return_value=1),
+        ):
+            output = self.crom("show", "ci")
+
+        self.assertIn("Started myproj/ci", output)
+        self.assertIn("Raised myproj/ci", output)
+
+    def test_show_raises_inside_the_lock_it_found_the_pid_under(self):
+        """The pid raised must be the pid observed. A `down` landing between the two would
+        have crom asking macOS for a process that no longer exists, and the error macOS
+        answers with describes a race this command is in a position to prevent."""
+        self.crom("init")
+        self.crom("add", "ci")
+
+        events: list[str] = []
+        real_lock = cli.seed.profile_lock
+
+        @contextlib.contextmanager
+        def tracking_lock(profile):
+            events.append("lock")
+            with real_lock(profile):
+                yield
+            events.append("unlock")
+
+        with (
+            mock.patch("crom.cli.seed.profile_lock", tracking_lock),
+            mock.patch("crom.cli.seed.materialize_under_lock"),
+            mock.patch("crom.cli.chrome.find_pids", return_value=(999,)),
+            mock.patch("crom.cli.window.raise_profile", lambda _p, _pids: events.append("raise") or 1),
+        ):
+            self.crom("show", "ci")
+
+        self.assertEqual(events, ["lock", "raise", "unlock"])
+
+    def test_show_says_so_when_there_is_no_window_to_bring_forward(self):
+        """A browser running headless is raised successfully and shows the user nothing.
+        Reporting 'Raised' alone would be crom claiming a window that is not there, and
+        the user would be left looking for it. [LAW:no-silent-failure]"""
+        self.crom("init")
+        self.crom("add", "ci")
+
+        with (
+            mock.patch("crom.cli.seed.materialize_under_lock"),
+            mock.patch("crom.cli.chrome.find_pids", return_value=(999,)),
+            mock.patch("crom.cli.window.raise_profile", return_value=0),
+        ):
+            output = self.crom("show", "ci")
+
+        self.assertIn("no open windows", output)
+        self.assertIn("headless", output)
+
     def test_rm_stops_and_deletes_inside_one_critical_section(self):
         """A `crom up` racing this command must land wholly before it or wholly after.
 

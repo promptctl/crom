@@ -155,6 +155,8 @@ or namespace, `4` a port or declaration conflict.
 crom                          launch the default profile
 crom up [REF]                 launch, or report the running browser
 crom down [REF]               stop it
+crom restart [REF]            stop it and start it again on its current config
+crom show [REF]               bring its window to the front, launching it if needed
 crom list [--all]             profiles addressable from here; --all covers every namespace
 crom add NAME [--seed SEED]   declare a profile in the config governing this directory
 crom rm REF                   stop it if running, undeclare it, release its port, delete its data
@@ -171,6 +173,18 @@ crom forget NAMESPACE         drop a namespace deliberately, releasing its ports
 `default`, with two exceptions: `crom config` without a REF reports the ambient scope
 alone (which config is in effect, and what it declares) rather than resolving a profile,
 and `crom rm` requires a REF — it will not guess which profile you meant to delete.
+
+`crom restart` holds one profile lock across both halves, so a concurrent `crom up` or
+`crom rm` lands wholly before it or wholly after rather than in the gap between the stop
+and the start. Typing `crom down && crom up` leaves that gap open.
+
+`crom show` is the one macOS-only command. Every crom-managed Chrome is the same
+application bundle, so `activate` cannot pick between them — it raises whichever instance
+the window server prefers. crom targets the exact process instead, which is unambiguous
+however many are running, and that needs AppleScript. macOS gates it behind Automation
+access granted to the program that ran crom, not to crom itself; when that is withheld,
+crom names the System Settings pane that grants it. A profile running headless is raised
+successfully and reported as having no window, rather than as a window you cannot find.
 
 ## How collisions are avoided
 
