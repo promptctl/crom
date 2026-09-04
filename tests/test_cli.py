@@ -308,8 +308,7 @@ class CliTest(unittest.TestCase):
 
         output = self.crom("init", "other", expect=4)
 
-        self.assertIn("declared chosen", output)
-        self.assertIn("you asked for other", output)
+        self.assertIn("  namespace: declared chosen, you asked for other", output.splitlines())
         self.assertIn("chosen", (self.project / ".crom.toml").read_text())
 
     def test_init_refuses_to_restate_a_different_seed(self):
@@ -425,8 +424,7 @@ class CliTest(unittest.TestCase):
 
         output = self.crom("add", "ci", "--seed", "fresh", expect=4)
 
-        self.assertIn("declared default", output)
-        self.assertIn("you asked for fresh", output)
+        self.assertIn("  seed: declared default, you asked for fresh", output.splitlines())
         self.assertNotIn('seed = "fresh"', (self.project / ".crom.toml").read_text())
 
     def test_pinning_the_port_a_profile_was_merely_assigned_is_refused(self):
@@ -442,7 +440,10 @@ class CliTest(unittest.TestCase):
 
         output = self.crom("add", "ci", "--port", assigned, expect=4)
 
-        self.assertIn(f"unpinned — crom assigned {assigned}", output)
+        self.assertIn(
+            f"  port: declared (unpinned — crom assigned {assigned}), you asked for {assigned}",
+            output.splitlines(),
+        )
         # Read back through the parser rather than grepped: the template's own comments
         # mention `port = 9401`, so a substring test would answer about the prose.
         self.assertIsNone(load_ambient(self.project).profiles["ci"].port)
@@ -568,8 +569,11 @@ class CliTest(unittest.TestCase):
 
         output = self.crom("add", "ci", "--flag", "--disable-blink-features=B", expect=4)
 
-        self.assertIn("flags", output)
-        self.assertIn("--disable-blink-features=B", output)
+        self.assertIn(
+            "  flags: declared --disable-blink-features=A, "
+            "you asked for --disable-blink-features=B",
+            output.splitlines(),
+        )
 
     def test_adding_a_profile_that_states_one_switch_twice_is_refused(self):
         self.crom("init")
@@ -592,8 +596,7 @@ class CliTest(unittest.TestCase):
 
         output = self.crom("add", "ci", "--flag", "--headless", expect=4)
 
-        self.assertIn("flags", output)
-        self.assertIn("--headless", output)
+        self.assertIn("  flags: declared (unset), you asked for --headless", output.splitlines())
         self.assertNotIn("--headless", (self.project / ".crom.toml").read_text())
 
     def test_a_refused_add_writes_nothing_and_leaves_the_project_usable(self):
