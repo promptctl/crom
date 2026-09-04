@@ -1127,6 +1127,46 @@ class CliTest(unittest.TestCase):
         entry_key = mcp.entry_key(ProfileRef("myproj", "default"))
         self.assertIn(f"http://127.0.0.1:{port}", entry["mcpServers"][entry_key]["args"])
 
+    def _legacy_file(self, port: int) -> None:
+        """The file a crom older than 0f4b8a2 left here: one entry under the constant key."""
+        (self.project / ".mcp.json").write_text(
+            json.dumps({"mcpServers": {mcp.LEGACY_KEY: mcp.server_entry(port)}})
+        )
+
+    def test_mcp_names_the_entry_it_wrote(self):
+        # The key stopped being a constant at 0f4b8a2, so it is no longer something the
+        # user can predict — and it is what they need to find their profile in the file.
+        self.crom("init")
+        self.assertIn(
+            mcp.entry_key(ProfileRef("myproj", "default")), self.invoke("mcp").stdout
+        )
+
+    def test_mcp_reports_the_legacy_entry_it_renamed(self):
+        self.crom("init")
+        self._legacy_file(int(self.crom("port").strip()))
+        result = self.invoke("mcp")
+        self.assertIn(mcp.LEGACY_KEY, result.stderr)
+        self.assertIn(mcp.entry_key(ProfileRef("myproj", "default")), result.stderr)
+        # Renaming an entry is convergence — work crom did that the user did not ask for
+        # — so it goes where crom says such things, not into the answer a script parses.
+        self.assertNotIn(mcp.LEGACY_KEY, result.stdout)
+
+    def test_mcp_reports_a_legacy_entry_it_left_in_place(self):
+        # The outcome nothing else makes visible: the file is left declaring two
+        # chrome-devtools servers, and only this line says why crom did not merge them.
+        self.crom("init")
+        self._legacy_file(int(self.crom("port").strip()) + 100)
+        result = self.invoke("mcp")
+        self.assertIn(mcp.LEGACY_KEY, result.stderr)
+        self.assertIn("two chrome-devtools servers", result.stderr)
+        self.assertIn(mcp.LEGACY_KEY, json.loads((self.project / ".mcp.json").read_text())["mcpServers"])
+
+    def test_mcp_says_nothing_about_a_legacy_entry_that_was_never_there(self):
+        # The common case, and the reason the outcome is three-valued rather than a
+        # message crom always prints: there is nothing here it did on the user's behalf.
+        self.crom("init")
+        self.assertEqual(self.invoke("mcp").stderr, "")
+
     # --- collision avoidance, the whole point ---------------------------------------
 
     def test_two_projects_get_different_ports_and_directories(self):
