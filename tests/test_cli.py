@@ -1775,12 +1775,20 @@ class CliTest(unittest.TestCase):
     def test_doctor_claims_no_uncertainty_about_where_personal_profiles_live(self):
         """The first `crom doctor` of a machine, and the row it must not print.
 
-        `config.load_user_scope` builds a `user` scope with no file behind it, rooted at
-        the default profiles root, so on a machine that has never written a user config
-        that root is crom's own live answer rather than an inference about a file that
-        went missing. A project config that is gone earns a caveat for exactly the reason
-        this one does not, and treating the two absences alike would put "crom could not
-        check this" on every fresh machine, about the namespace crom is surest of.
+        What keeps that row off is `cli._bootstrap_user_config`, not anything doctor
+        decides: it writes the user config from `CromGroup.command_class.invoke`, before
+        the body of every command, so the survey below finds a file and reads it. The
+        namespace crom is surest of is the one it has already made sure of.
+
+        So this guards an ordering that lives in another module, and it is the only test
+        that does. Move the bootstrap after the command body — or make an eager option
+        skip it — and a fresh machine's first doctor starts reporting that it could not
+        check where personal profiles live, on the machine least able to judge the claim.
+
+        The `assertFalse` runs before the first invocation on purpose: it records that the
+        machine really did start with no user config, which is what makes the two
+        assertions after it statements about the bootstrap rather than about a file the
+        harness happened to leave lying around.
         """
         self.assertFalse(user_config_file().exists())
 
