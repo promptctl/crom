@@ -1419,6 +1419,8 @@ class CliTest(unittest.TestCase):
                 "port": 9333,
                 "pinned": True,
                 "source": str(self.project / ".crom.toml"),
+                "standing": "declared",
+                "finding": f"{self.project / '.crom.toml'} declares it",
             },
             answer["reservations"],
         )
@@ -1444,8 +1446,142 @@ class CliTest(unittest.TestCase):
         rows = json.loads(self.crom("doctor", "--json"))["reservations"]
 
         self.assertIn(
-            {"ref": "Not A Ref!", "port": 9444, "pinned": False, "source": None}, rows
+            {
+                "ref": "Not A Ref!",
+                "port": 9444,
+                "pinned": False,
+                "source": None,
+                # Judged, not skipped and not fatal. `parse_ref` raises on this name, so a
+                # standing derived by taking the key apart would have ended the command
+                # here; the standings are decided by asking each config which keys it
+                # declares and testing membership, which answers for every string a
+                # ledger can hold.
+                "standing": "unchecked",
+                "finding": "the ledger records no config for it",
+            },
+            rows,
         )
+
+    def _standings(self) -> dict[str, str]:
+        """Every reservation's standing, keyed by the ledger key it was filed under."""
+        rows = json.loads(self.crom("doctor", "--json"))["reservations"]
+        return {row["ref"]: row["standing"] for row in rows}
+
+    def test_doctor_separates_a_reservation_nothing_declares_from_one_that_lives(self):
+        """The epic's own reproduction, and the whole of this ticket.
+
+        Listing every reservation made the leak visible; a reader still had to hold the
+        config in their head to know which of them had leaked. Both rows here are in the
+        ledger and only one is in the config, so a doctor that reported the two alike
+        would be showing the leak without saying it is one.
+
+        `alpha` is asserted as well as `beta`. Without it this passes against a doctor
+        that calls everything orphaned, which is the answer that would send a user
+        releasing a port their project is using. [LAW:verifiable-goals]
+        """
+        config_file = self.project / ".crom.toml"
+        config_file.write_text('namespace = "myapp"\n\n[profiles.alpha]\n[profiles.beta]\n')
+        self.crom("list")  # resolving both stanzas is what reserves both ports
+
+        config_file.write_text('namespace = "myapp"\n\n[profiles.alpha]\n')
+
+        standings = self._standings()
+
+        self.assertEqual("declared", standings["myapp/alpha"])
+        self.assertEqual("orphaned", standings["myapp/beta"])
+        self.assertIn(f"{config_file} no longer declares it", self.crom("doctor"))
+
+    def test_doctor_names_a_personal_profile_declared_like_any_other(self):
+        """The `user` namespace lives in a file that may not name a namespace at all.
+
+        `config.parse` refuses a `namespace` key in the user config — the name is a
+        property of the fixed path, which is why `load_user_scope` supplies it — so
+        consulting that file the way a project's is consulted fails on the one key it is
+        forbidden to have. Every personal profile then read `unchecked`, which is the
+        first row of the listing on every machine.
+        """
+        self.crom("list")
+
+        self.assertEqual("declared", self._standings()["user/default"])
+
+    def test_doctor_will_not_call_a_reservation_orphaned_on_a_config_it_could_not_read(self):
+        """The distinction the command that releases a reservation will spend.
+
+        A config that will not parse may well still declare the profile, so "orphaned"
+        here would be crom turning "I cannot tell" into "nothing declares it" and handing
+        a user a release for a port their project is using. Released ports are
+        irreversible — every checked-in `.mcp.json` pointing at the number breaks — so
+        the unreadable config gets its own standing rather than the confident one.
+        [LAW:no-silent-failure]
+        """
+        config_file = self.project / ".crom.toml"
+        config_file.write_text('namespace = "myapp"\n\n[profiles.alpha]\n')
+        self.crom("list")
+
+        config_file.write_text('namespace = "myapp"\n\n[profiles.alpha\n')
+
+        self.assertEqual("unchecked", self._standings()["myapp/alpha"])
+        self.assertIn(f"{config_file} could not be checked", self.crom("doctor"))
+
+    def test_doctor_checks_a_config_that_is_gone_rather_than_declining_to_look(self):
+        """A file that is not there declares nothing, and that is an answer, not a gap.
+
+        The line against `unchecked` is whether crom learned anything: an absent config
+        settles what it declares, where an unreadable one settles nothing. Filing this as
+        unchecked instead would leave the commonest leak of all — a project directory
+        deleted with its reservations still held — permanently unreleasable by the
+        command the epic exists to build.
+        """
+        config_file = self.project / ".crom.toml"
+        config_file.write_text('namespace = "myapp"\n\n[profiles.alpha]\n')
+        self.crom("list")
+        config_file.unlink()
+
+        self.assertEqual("orphaned", self._standings()["myapp/alpha"])
+        self.assertIn(f"{config_file} no longer exists", self.crom("doctor"))
+
+    def test_doctor_orphans_a_reservation_whose_config_renamed_its_namespace(self):
+        """A rename in place leaves reservations under a name nothing answers to.
+
+        `remember_namespace` is additive, so nothing removes the old ledger keys when a
+        config edits its own `namespace`. This needs no case of its own in the comparison
+        and gets none: the standings come from asking each config which ledger keys it
+        declares, and a renamed config simply stops producing the old ones.
+        """
+        config_file = self.project / ".crom.toml"
+        config_file.write_text('namespace = "myapp"\n\n[profiles.alpha]\n')
+        self.crom("list")
+
+        config_file.write_text('namespace = "renamed"\n\n[profiles.alpha]\n')
+
+        self.assertEqual("orphaned", self._standings()["myapp/alpha"])
+
+    def test_doctor_judges_a_ledger_key_that_is_not_a_reference_at_all(self):
+        """The trap this ticket was warned about, held open by a test.
+
+        Deciding whether a key is still declared invites `model.parse_ref`, which *raises*
+        on a name `ProfileRef` would refuse — and `registry._read` validates every entry
+        and no key, so such keys exist and doctor deliberately reports them. A comparison
+        that took keys apart would turn the command that shows the mess into the command
+        that dies on the machine that has it.
+
+        Both keys are provably declared by nothing: every key a config can produce is
+        `str(ProfileRef(...))`, which carries exactly one `/` and no capitals. So
+        `orphaned` is not leniency here — it is the true answer, and it is what will let
+        a release reclaim a port that a hand-edit stranded.
+        """
+        config_file = self.project / ".crom.toml"
+        config_file.write_text('namespace = "myapp"\n\n[profiles.alpha]\n')
+        self.crom("list")
+        ledger = json.loads(registry_file().read_text())
+        for key, port in (("a/b/c", 9444), ("MyApp/UPPER", 9445)):
+            ledger["ports"][key] = {"port": port, "pinned": False, "source": str(config_file)}
+        registry_file().write_text(json.dumps(ledger))
+
+        standings = self._standings()
+
+        self.assertEqual("orphaned", standings["a/b/c"])
+        self.assertEqual("orphaned", standings["MyApp/UPPER"])
 
     # --- removal --------------------------------------------------------------------
 
