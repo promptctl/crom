@@ -106,8 +106,8 @@ def _raise_one(profile: ResolvedProfile, pid: int) -> int:
     except OSError as e:
         # `OSError` rather than `FileNotFoundError` alone: a present-but-unexecutable
         # `osascript` raises `PermissionError`, which is no less a reason this cannot work
-        # and no more deserving of a raw traceback outside the CLI's exit-code contract.
-        # `chrome.launch` catches the same breadth around its own `Popen` for that reason.
+        # and no less in need of a message that names `osascript`. `chrome.launch`
+        # catches the same breadth around its own `Popen` for that reason.
         # One message carrying the error rather than an arm per cause: the sentence below
         # is true of every way the command can fail to run. [LAW:dataflow-not-control-flow]
         raise CromError(

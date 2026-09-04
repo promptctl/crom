@@ -160,13 +160,12 @@ def _profiles_table(doc: tomlkit.TOMLDocument, path: Path, *, create: bool = Fal
 def _writing(path: Path) -> Iterator[None]:
     """Translate a filesystem failure into a `CromError` naming the file.
 
-    [LAW:effects-at-boundaries] Every write in this module goes through here, because
-    `CromGroup.invoke` catches only `CromError`: a full disk or a read-only mount raised
-    a bare `OSError` that escaped the CLI's exit-code contract as a traceback. Putting
-    the translation at the calls that touch the disk covers every caller rather than the
-    one whose failure was traced — including `migrate.run`, which reaches `_save` through
-    `ensure_profile` before anything else in `main` and would therefore have produced
-    that traceback on *every* command.
+    [LAW:effects-at-boundaries] Every write in this module goes through here, so a full
+    disk or a read-only mount names the file the user has: `_save` writes a `.tmp` and
+    `os.replace`s it, so the raw `OSError` the CLI boundary reports names the temp file.
+    Translating at the calls that touch the disk covers every caller rather than the one
+    whose failure was traced — `migrate.run` reaches `_save` through `ensure_profile`
+    before anything else in `main`.
 
     `CromError` passes through untouched: anything nested that raises one has already
     produced the precise diagnosis — the file it names, the key, the fix — and rewording
