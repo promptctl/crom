@@ -191,8 +191,8 @@ class Reason(Enum):
     # and defaults, a command that names no profile at all. One slug rather than two
     # because the next move is the same either way — edit the file or change the request
     # — and a slug earns its place by separating next moves, not by being finer.
-    # `settings` names which of them differ — `port`, `seed`, `namespace` — in the config
-    # file's own vocabulary. The declared and asked-for values stay in the sentence: they
+    # `settings` names which of them differ, in the config file's own key names rather
+    # than any display label. The declared and asked-for values stay in the sentence: they
     # are for a human deciding which one is right, and a script that acted on them would be
     # editing the user's config from the text of a refusal.
     DECLARATION_DIFFERS = ("declaration_differs", Conflict, ("settings",))

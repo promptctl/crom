@@ -2135,7 +2135,7 @@ class CliTest(unittest.TestCase):
     def test_a_refusal_the_os_did_not_number_answers_with_no_reason_at_all(self):
         """The one failure that reaches the envelope with nothing to put in `reason`.
 
-        `_errno_reason` looks the slug up in the OS's own errno table rather than
+        `_errno_detail` looks the slug up in the OS's own errno table rather than
         inventing a parallel spelling beside it, and not every `OSError` carries a number
         to look up — `shutil.Error` aggregates per-file failures and carries none.
         Documented, and until this test never once executed.
