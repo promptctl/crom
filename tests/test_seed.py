@@ -18,7 +18,15 @@ from pathlib import Path
 from unittest import mock
 
 from crom import chrome, seed
-from crom.model import CromError, ProfileRef, ResolvedProfile, SeedChrome, SeedFresh, SeedPath
+from crom.model import (
+    CromError,
+    ProfileRef,
+    Reason,
+    ResolvedProfile,
+    SeedChrome,
+    SeedFresh,
+    SeedPath,
+)
 
 
 def profile(profile_dir: Path, spec_seed) -> ResolvedProfile:
@@ -170,9 +178,12 @@ class MaterializeTest(unittest.TestCase):
         # without ever proving that escaping is caught.
         (source / "Default" / "Preferences").symlink_to(Path("..") / ".." / "secret.txt")
 
-        with self.assertRaisesRegex(CromError, "points outside it"):
+        with self.assertRaisesRegex(CromError, "points outside it") as caught:
             seed.materialize(profile(self.dest, SeedPath(source)))
 
+        # `_link_guard`'s other raise: the absolute-link arm is pinned above, and these
+        # are two separate raises that a separate edit can retag one of.
+        self.assertIs(caught.exception.reason, Reason.SEED_UNSAFE)
         self.assertFalse(self.dest.exists())
         self.assertEqual(secret.read_text(), "private key")  # untouched
 
@@ -202,9 +213,10 @@ class MaterializeTest(unittest.TestCase):
         source = self._source()
         (source / "inner").symlink_to(source / "sub" / "a.txt")  # absolute by construction
 
-        with self.assertRaisesRegex(CromError, "absolute symlink"):
+        with self.assertRaisesRegex(CromError, "absolute symlink") as caught:
             seed.materialize(profile(self.dest, SeedPath(source)))
 
+        self.assertIs(caught.exception.reason, Reason.SEED_UNSAFE)
         self.assertFalse(self.dest.exists())
 
     def test_a_symlinked_directory_cycle_does_not_hang_the_check(self):
@@ -337,6 +349,9 @@ class LiveSeedTest(unittest.TestCase):
 
         self.assertIn("is in use", str(caught.exception))
         self.assertIn(str(self.source), str(caught.exception))
+        # The only one of the four a caller can act on and retry: quit the browser
+        # and the same command works. The other three need the seed itself changed.
+        self.assertIs(caught.exception.reason, Reason.SEED_BUSY)
 
     def test_the_refusal_names_both_ways_out(self):
         """The message is the product: this is the first thing a new user can hit.
@@ -431,6 +446,7 @@ class LiveSeedTest(unittest.TestCase):
 
         self.assertIn("does not exist", str(caught.exception))
         self.assertNotIn("Quit that browser", str(caught.exception))
+        self.assertIs(caught.exception.reason, Reason.SEED_MISSING)
 
     def test_a_seed_below_a_running_user_data_dir_is_refused(self):
         """Chrome's one lock sits at the root and governs everything under it.
@@ -469,6 +485,7 @@ class LiveSeedTest(unittest.TestCase):
         self.assertNotIn("browser", str(caught.exception))
         self.assertIn("cannot be read", str(caught.exception))
         self.assertIn(str(blocked / "seed"), str(caught.exception))
+        self.assertIs(caught.exception.reason, Reason.SEED_UNREADABLE)
 
     def test_a_seed_path_through_a_regular_file_is_reported_as_missing(self):
         """ENOTDIR says the path is not there, not that crom was refused it.

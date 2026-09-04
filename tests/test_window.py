@@ -21,7 +21,7 @@ from subprocess import CompletedProcess
 from unittest import mock
 
 from crom import window
-from crom.model import CromError, ProfileRef, ResolvedProfile, SeedFresh
+from crom.model import CromError, ProfileRef, Reason, ResolvedProfile, SeedFresh
 
 
 def temp_profile(test: unittest.TestCase) -> ResolvedProfile:
@@ -152,6 +152,9 @@ class RefusalTest(unittest.TestCase):
         # osascript's own words survive alongside crom's advice: the error number is what
         # a search engine answers, and crom's remedy is a guess about which app to grant.
         self.assertIn("(-1743)", message)
+        # The refusal macOS states outright must not answer with a vaguer slug than
+        # the timeout arm infers from an unanswered dialog.
+        self.assertIs(caught.exception.reason, Reason.AUTOMATION_DENIED)
 
     def test_a_vanished_process_is_reported_as_one(self):
         said = (
@@ -165,6 +168,7 @@ class RefusalTest(unittest.TestCase):
         message = str(caught.exception)
         self.assertIn("4242", message)
         self.assertIn("exited", message)
+        self.assertIs(caught.exception.reason, Reason.WINDOW_RAISE_FAILED)
 
     def test_an_unrecognised_refusal_still_carries_what_osascript_said(self):
         """crom knows two error numbers; macOS has many. An ending crom has no remedy for
@@ -174,6 +178,9 @@ class RefusalTest(unittest.TestCase):
                 window.raise_profile(self.profile, (4242,))
 
         self.assertIn("something new. (-42)", str(caught.exception))
+        # An ending with no row keeps the general slug rather than borrowing the
+        # remedy of whichever row it nearly matched.
+        self.assertIs(caught.exception.reason, Reason.WINDOW_RAISE_FAILED)
 
     def test_an_osascript_killed_before_it_could_complain_still_names_its_status(self):
         """The one ending that could degrade to no information at all.
@@ -199,6 +206,7 @@ class RefusalTest(unittest.TestCase):
                 window.raise_profile(self.profile, (4242,))
 
         self.assertIn("macOS", str(caught.exception))
+        self.assertIs(caught.exception.reason, Reason.PLATFORM_UNSUPPORTED)
 
     def test_a_prompt_nobody_answers_does_not_hold_the_lock_forever(self):
         """`show` calls this while holding `seed.profile_lock`, so an unbounded wait here
@@ -213,6 +221,7 @@ class RefusalTest(unittest.TestCase):
         message = str(caught.exception)
         self.assertIn("Automation", message)
         self.assertIn("System Settings", message)
+        self.assertIs(caught.exception.reason, Reason.AUTOMATION_DENIED)
 
     def test_the_call_is_bounded_rather_than_left_to_wait_forever(self):
         with answered() as run:
@@ -228,6 +237,11 @@ class RefusalTest(unittest.TestCase):
                 window.raise_profile(self.profile, (4242,))
 
         self.assertIn("denied", str(caught.exception))
+        # The other half of the same split, and the reason the message assertions
+        # above cannot stand alone: both arms print one sentence naming macOS, so a
+        # split that sent an unexecutable osascript to PLATFORM_UNSUPPORTED would
+        # read exactly as correct here.
+        self.assertIs(caught.exception.reason, Reason.WINDOW_RAISE_FAILED)
 
     def test_an_unreadable_window_count_is_reported_not_crashed_through(self):
         """osascript exited 0, so the number it printed is the only evidence of what
@@ -239,6 +253,7 @@ class RefusalTest(unittest.TestCase):
                 window.raise_profile(self.profile, (4242,))
 
         self.assertIn("'lots'", str(caught.exception))
+        self.assertIs(caught.exception.reason, Reason.WINDOW_RAISE_FAILED)
 
 
 if __name__ == "__main__":

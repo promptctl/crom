@@ -15,7 +15,7 @@ import unittest
 from pathlib import Path
 
 from crom import mcp
-from crom.model import CromError, ProfileRef, ResolvedProfile, SeedFresh
+from crom.model import CromError, ProfileRef, Reason, ResolvedProfile, SeedFresh
 
 # The alphabet a namespace or profile name is built from, plus the two characters that
 # make key derivation hard: `-`, which is legal inside a name and so cannot separate
@@ -79,6 +79,10 @@ class EntryKeyTest(unittest.TestCase):
             mcp.entry_key(long_ref)
         self.assertIn(str(long_ref), str(caught.exception))
         self.assertIn(str(mcp.KEY_LIMIT), str(caught.exception))
+        # Against its neighbour below: both refusals mean "crom did not write
+        # your .mcp.json", and they send the user to different files — this one
+        # to rename a profile, that one to repair the JSON.
+        self.assertIs(caught.exception.reason, Reason.MCP_KEY_TOO_LONG)
 
     def test_a_ref_that_exactly_fills_the_budget_is_kept(self):
         # `crom` + two `__` joins leaves KEY_LIMIT - 8 characters for the two names.
@@ -231,8 +235,9 @@ class WriteTest(unittest.TestCase):
 
     def test_rejects_invalid_json(self):
         self.path.write_text("not json")
-        with self.assertRaises(CromError):
+        with self.assertRaises(CromError) as caught:
             mcp.write(self.dev, self.path)
+        self.assertIs(caught.exception.reason, Reason.MCP_CONFIG_INVALID)
         self.assertEqual(self.path.read_text(), "not json")
 
     def test_rejects_non_object_root(self):

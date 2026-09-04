@@ -12,6 +12,8 @@ from crom.model import (
     Flag,
     Layer,
     ProfileRef,
+    Reason,
+    Resolution,
     ProfileSpec,
     ResolvedProfile,
     parse_ref,
@@ -28,16 +30,20 @@ class ParseRefTest(unittest.TestCase):
         self.assertEqual(parse_ref("other/dev", "myapp"), ProfileRef("other", "dev"))
 
     def test_a_third_segment_is_an_error_not_a_guess(self):
-        with self.assertRaisesRegex(CromError, "invalid profile reference"):
+        with self.assertRaisesRegex(CromError, "invalid profile reference") as caught:
             parse_ref("a/b/c", "myapp")
+        # `parse_ref` reuses `validate_name`'s slug for a reference typed at the CLI,
+        # which is the case the grouping comment in `Reason` used to hide.
+        self.assertIs(caught.exception.reason, Reason.INVALID_NAME)
 
     def test_the_reference_type_validates_its_own_fields(self):
         """The module docstring promises names are "checked once, where they enter, and
         never again" — which is a property of the type, not of caller discipline. A
         caller that never went through `parse_ref` gets the same guarantee, so
         `resolve_spec` can compose a path from these fields without wondering."""
-        with self.assertRaisesRegex(CromError, "invalid namespace"):
+        with self.assertRaisesRegex(CromError, "invalid namespace") as caught:
             ProfileRef("../escape", "dev")
+        self.assertIs(caught.exception.reason, Reason.INVALID_NAME)
         with self.assertRaisesRegex(CromError, "invalid profile name"):
             ProfileRef("myapp", "Not A Name")
 
@@ -128,8 +134,9 @@ class ComposeTest(unittest.TestCase):
         """The constructor is what makes `Layer`'s disjointness true, not the care of the
         one parser that happens to build them — a test or a future caller reaching the type
         directly would otherwise construct the state the docstring says cannot exist."""
-        with self.assertRaisesRegex(CromError, "both sets and drops --headless"):
+        with self.assertRaisesRegex(CromError, "both sets and drops --headless") as caught:
             Layer(sets=(Flag("--headless", "new"),), drops=frozenset({"--headless"}), origin="test")
+        self.assertIs(caught.exception.reason, Reason.FLAGS_INVALID)
 
     def test_a_later_layer_removes_a_switch_it_drops(self):
         composed = flags.compose(self.layer("--a=1", "--b"), self.layer(drops=("--a",)))
@@ -186,12 +193,25 @@ class ComposeTest(unittest.TestCase):
         """An unattributed layer would reach `crom config` as a flag whose origin renders
         blank, and the renderer has nothing to fall back on. The constructor is what makes
         that unreachable rather than the care of whichever caller builds the layer."""
-        with self.assertRaisesRegex(CromError, "must name where it was written"):
+        with self.assertRaisesRegex(CromError, "must name where it was written") as caught:
             Layer(sets=(Flag("--headless", None),))
+        # `internal` is the one slug that means "file a bug" rather than "fix your
+        # input", so it must not be reachable by anything a config file can say — and
+        # a reader who gets it has been told the right thing about whose fault it is.
+        self.assertIs(caught.exception.reason, Reason.INTERNAL)
         with self.assertRaisesRegex(CromError, "must name where it was written"):
             Layer(drops=frozenset({"--headless"}))
         # A stanza that says nothing contributes nothing to the report, so it needs no name.
         self.assertEqual(Layer().origin, "")
+
+    def test_a_resolution_that_answers_nothing_is_a_crom_bug_not_a_config_fault(self):
+        """`Resolution` exists to say where a value came from, so one holding no answers
+        has nothing to report and no honest way to render itself. Nothing a config file
+        can say reaches this — only crom building the type wrong does, which is what
+        `internal` is for and why it must stay unreachable from any input."""
+        with self.assertRaisesRegex(CromError, "nothing was resolved") as caught:
+            Resolution(question="--headless", answers=())
+        self.assertIs(caught.exception.reason, Reason.INTERNAL)
 
     def test_the_standing_answer_is_the_last_layer_to_speak(self):
         composed = flags.compose(
@@ -534,8 +554,9 @@ class ResolveTest(LedgerFixture):
 
     def test_an_unknown_variable_is_an_error_not_an_empty_string(self):
         scope = self.scope(MINIMAL + '[profiles.dev]\nflags = ["--x=${CROM_NOPE}"]\n')
-        with self.assertRaisesRegex(CromError, "unknown variable"):
+        with self.assertRaisesRegex(CromError, "unknown variable") as caught:
             resolve.resolve(ProfileRef("myapp", "dev"), scope)
+        self.assertIs(caught.exception.reason, Reason.VARIABLE_UNKNOWN)
 
     def test_a_failed_resolution_reserves_no_port(self):
         """`port_for` writes to the machine-wide ledger the moment it is called.
@@ -574,13 +595,18 @@ class ResolveTest(LedgerFixture):
 
     def test_an_undeclared_profile_names_what_is_declared(self):
         scope = self.scope(MINIMAL + "[profiles.dev]\n[profiles.ci]\n")
-        with self.assertRaisesRegex(CromError, "Declared there: ci, dev"):
+        with self.assertRaisesRegex(CromError, "Declared there: ci, dev") as caught:
             resolve.resolve(ProfileRef("myapp", "nope"), scope)
+        self.assertIs(caught.exception.reason, Reason.PROFILE_UNKNOWN)
 
     def test_an_unknown_namespace_lists_the_known_ones(self):
         scope = self.scope(MINIMAL + "[profiles.dev]\n")
-        with self.assertRaisesRegex(CromError, "unknown namespace 'ghost'"):
+        with self.assertRaisesRegex(CromError, "unknown namespace 'ghost'") as caught:
             resolve.resolve(ProfileRef("ghost", "dev"), scope)
+        # Against `PROFILE_UNKNOWN` above: both `NotFound`, both exit 3, both "crom
+        # cannot find what you named" — and they send the reader to different lines of
+        # a different file. The clearest confusable pair in the codebase.
+        self.assertIs(caught.exception.reason, Reason.NAMESPACE_UNKNOWN)
 
     def test_a_renamed_namespace_is_dropped_not_silently_resolved(self):
         """`remember_namespace` is additive, so renaming a namespace in place leaves the

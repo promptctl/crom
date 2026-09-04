@@ -19,7 +19,7 @@ done nothing. [LAW:no-silent-failure]
 
 import subprocess
 
-from .model import CromError, ResolvedProfile
+from .model import Reason, ResolvedProfile
 
 # How long crom waits for `osascript` to answer. A raise costs milliseconds once macOS has
 # granted Automation access, so this bound is not sized for the work — it is sized for the
@@ -57,18 +57,23 @@ end run"""
 #
 # A table rather than arms, so an ending crom has nothing to add to flows through as an
 # empty remedy and still carries what osascript said. [LAW:dataflow-not-control-flow]
-_REMEDIES: tuple[tuple[str, str], ...] = (
+_REMEDIES: tuple[tuple[str, str, Reason], ...] = (
     (
         "(-1743)",
         "macOS is withholding Automation access from whatever ran crom. Grant it in\n"
         "System Settings › Privacy & Security › Automation: find your terminal (or the\n"
         "agent that invoked crom) and enable 'System Events' beneath it. Nothing crom\n"
         "can do reaches a window until that box is ticked.",
+        # The same refusal the `TimeoutExpired` arm below infers from an unanswered
+        # consent dialog, except here macOS states it outright. The definite case must not
+        # answer with a vaguer slug than the inferred one.
+        Reason.AUTOMATION_DENIED,
     ),
     (
         "(-1719)",
         "No window-server process is running under that pid, so the browser most likely\n"
         "exited between crom finding it and raising it. `crom up` will start it again.",
+        Reason.WINDOW_RAISE_FAILED,
     ),
 )
 
@@ -97,7 +102,7 @@ def _raise_one(profile: ResolvedProfile, pid: int) -> int:
             timeout=RAISE_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired as e:
-        raise CromError(
+        raise Reason.AUTOMATION_DENIED.error(
             f"`osascript` did not answer within {RAISE_TIMEOUT_SECONDS:.0f}s while raising "
             f"'{profile.ref}' (pid {pid}).\nThe usual cause is macOS's Automation consent "
             f"dialog waiting on an answer — grant access in System Settings › Privacy & "
@@ -110,7 +115,18 @@ def _raise_one(profile: ResolvedProfile, pid: int) -> int:
         # catches the same breadth around its own `Popen` for that reason.
         # One message carrying the error rather than an arm per cause: the sentence below
         # is true of every way the command can fail to run. [LAW:dataflow-not-control-flow]
-        raise CromError(
+        # The slug is where they part, which is what the field is for — a macOS box whose
+        # `osascript` will not run is not a platform without one.
+        #
+        # On the class and not on `e.errno`, which is the opposite of the `EPIPE` rule at
+        # the CLI boundary and for the reason that rule gives: spell the fact the way its
+        # owner spells it. There the class was *wider* than the errno, so the errno was
+        # the precise key; `FileNotFoundError` is exactly Python's name for `ENOENT`, and
+        # it survives the errno-less construction that both real code and this file's own
+        # stubs produce — measured: `subprocess.run` on a missing binary carries errno 2,
+        # `FileNotFoundError("osascript")` carries None.
+        missing = isinstance(e, FileNotFoundError)
+        raise (Reason.PLATFORM_UNSUPPORTED if missing else Reason.WINDOW_RAISE_FAILED).error(
             f"could not run `osascript` to raise a window: {e}\n"
             "Raising one browser out of several identical ones needs macOS's own window "
             "server, so `crom show` works on macOS alone."
@@ -118,14 +134,17 @@ def _raise_one(profile: ResolvedProfile, pid: int) -> int:
 
     if result.returncode != 0:
         said = result.stderr.strip()
-        remedy = next((text for code, text in _REMEDIES if code in said), "")
+        remedy, reason = next(
+            ((text, why) for code, text, why in _REMEDIES if code in said),
+            ("", Reason.WINDOW_RAISE_FAILED),
+        )
         # The status is carried even when osascript said nothing: killed by a signal it
         # exits non-zero with empty stderr, and the sentence would otherwise stop at the
         # colon, naming a failure while withholding every fact about it.
         # [LAW:no-silent-failure]
         detail = " ".join(filter(None, (f"exit {result.returncode}.", said)))
         problem = f"could not raise '{profile.ref}' (pid {pid}): {detail}"
-        raise CromError("\n".join(filter(None, (problem, remedy))))
+        raise reason.error("\n".join(filter(None, (problem, remedy))))
 
     # osascript answered, so the number it printed is the only evidence of what was
     # raised. Parsed rather than trusted: a build that prints something else here would
@@ -135,7 +154,7 @@ def _raise_one(profile: ResolvedProfile, pid: int) -> int:
     try:
         return int(counted)
     except ValueError as e:
-        raise CromError(
+        raise Reason.WINDOW_RAISE_FAILED.error(
             f"raised '{profile.ref}' (pid {pid}), but osascript reported its window count "
             f"as {counted!r}, which is not a number."
         ) from e

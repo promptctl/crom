@@ -22,7 +22,7 @@ type that makes two layers' answers to one question visible as such.
 
 from collections.abc import Callable
 
-from .model import Answer, Composed, CromError, Emitted, Flag, Layer, Removed, Resolution
+from .model import Answer, Composed, Emitted, Flag, Layer, Reason, Removed, Resolution
 
 
 # A switch name may not interpolate a variable, in either list that can hold one — this is
@@ -68,7 +68,7 @@ def layer(texts: list[str] | tuple[str, ...], where: str) -> tuple[Flag, ...]:
         # check: an interpolated switch cannot be meaningfully compared to another switch,
         # so the duplicate remedy would be advice about a name that is not the name.
         if _interpolates(flag.switch):
-            raise CromError(
+            raise Reason.FLAGS_INVALID.error(
                 f"{where}: {text!r} {_INTERPOLATED_SWITCH}.\n"
                 f"crom resolves each switch by the name the file spells and expands "
                 f"variables only afterwards, so this names a switch no other layer can "
@@ -78,7 +78,7 @@ def layer(texts: list[str] | tuple[str, ...], where: str) -> tuple[Flag, ...]:
             )
         first = seen.get(flag.switch)
         if first is not None:
-            raise CromError(
+            raise Reason.FLAGS_INVALID.error(
                 f"{where}: {flag.switch} is set twice, as {str(first)!r} and {str(flag)!r}.\n"
                 f"crom emits each Chrome switch exactly once, so one of these would simply "
                 f"be discarded. {_remedy(first, flag)}"
@@ -141,20 +141,20 @@ def drops(texts: list[str] | tuple[str, ...], where: str) -> frozenset[str]:
         flag = Flag.parse(text)
         for is_illegal, fault in _ILLEGAL_DROPS:
             if is_illegal(flag.switch):
-                raise CromError(
+                raise Reason.FLAGS_INVALID.error(
                     f"{where}: the entry {text!r} {fault}.\n"
                     f"crom matches each entry against the switches the layers below "
                     f"supply, exactly as written — so it has to be the literal switch "
                     f"name, e.g. --disable-sync."
                 )
         if flag.value is not None:
-            raise CromError(
+            raise Reason.FLAGS_INVALID.error(
                 f"{where}: {text!r} carries a value, and an entry here is a switch name.\n"
                 f"A drop removes the switch whatever value it inherited, so the whole "
                 f"entry is {flag.switch!r}."
             )
         if flag.switch in seen:
-            raise CromError(
+            raise Reason.FLAGS_INVALID.error(
                 f"{where}: {flag.switch} is named twice. Dropping a switch once removes "
                 f"it; write the name once."
             )

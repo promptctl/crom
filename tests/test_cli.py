@@ -5,12 +5,14 @@ part apps integrate against. `chrome.scan` is stubbed because the process table 
 external system, not an implementation detail of crom.
 """
 
+import ast
 import contextlib
 import errno
 import json
 import os
 import re
 import shlex
+import shutil
 import tempfile
 import unittest
 from dataclasses import replace
@@ -21,7 +23,7 @@ from click.testing import CliRunner
 
 from crom import cli, config, configwrite, mcp
 from crom.config import load_ambient
-from crom.model import CromError, ProfileRef
+from crom.model import Conflict, CromError, ProfileRef, Reason
 from crom.paths import state_home, user_config_file
 
 
@@ -71,9 +73,7 @@ class CliTest(unittest.TestCase):
         [LAW:types-are-the-program] A runner carries no state between invocations, so
         building one per call costs nothing.
         """
-        previous = Path.cwd()
-        os.chdir(cwd or self.project)
-        try:
+        with self._standing_in(cwd):
             # `catch_exceptions=False` because the default one lies about this boundary:
             # it turns an escaping exception into a tidy `exit_code == 1` with nothing in
             # `output`, which is precisely how a real process behaves *only after*
@@ -82,12 +82,42 @@ class CliTest(unittest.TestCase):
             # [FRAMING:representation] the runner is a map of the terminal; this keeps a
             # crash looking like a crash.
             result = CliRunner().invoke(cli.main, list(args), catch_exceptions=False)
-        finally:
-            os.chdir(previous)
         self.assertEqual(
             result.exit_code, expect, f"crom {' '.join(args)} -> {result.exit_code}\n{result.output}"
         )
         return result
+
+    @contextlib.contextmanager
+    def _standing_in(self, cwd: Path | None):
+        """The directory crom runs in, restored afterwards — see `invoke` for why it is
+        an input rather than a detail. Both ways in share this one, so neither can be
+        given the discipline the other has. [LAW:one-source-of-truth]"""
+        previous = Path.cwd()
+        os.chdir(cwd or self.project)
+        try:
+            yield
+        finally:
+            os.chdir(previous)
+
+    def failure(self, *args, cwd: Path | None = None) -> CromError:
+        """The `CromError` behind a failed command, for the reasons no envelope carries.
+
+        `--json` is on `up`, `down`, `restart`, `show`, `list` and `config`; `add`, `init`
+        and `rm` answer in prose only, so their slug is unobservable from outside — click's
+        standalone mode turns `CromGroup.invoke`'s answer into a `SystemExit`, and the
+        chain goes with it. Standing that mode down keeps the link the boundary already
+        builds — `raise _answer(...) from error` — which is how a test reads these reasons
+        without calling a command's callback by hand and losing everything `main` does
+        first.
+
+        The command runs identically either way: only click's handling of what it raised
+        differs, so a test may still assert on what the run left behind.
+        """
+        with self._standing_in(cwd), self.assertRaises(cli._Failure) as caught:
+            CliRunner().invoke(
+                cli.main, list(args), catch_exceptions=False, standalone_mode=False
+            )
+        return caught.exception.__cause__
 
     def crom(self, *args, cwd: Path | None = None, expect: int = 0):
         """What a script sees: stdout and stderr as one stream, which is what a terminal
@@ -199,7 +229,9 @@ class CliTest(unittest.TestCase):
         command — including `crom init`, which `_Session` exists to keep working on a
         machine that has no Chrome yet.
         """
-        with mock.patch("crom.config.find_chrome", side_effect=CromError("no Chrome here")):
+        with mock.patch(
+            "crom.config.find_chrome", side_effect=Reason.CHROME_UNUSABLE.error("no Chrome here")
+        ):
             self.crom("init", "myapp")
 
         self.assertIn('namespace = "myapp"', (self.project / ".crom.toml").read_text())
@@ -1530,7 +1562,10 @@ class CliTest(unittest.TestCase):
             mock.patch("crom.cli.seed.materialize_under_lock"),
             mock.patch("crom.cli.chrome.kill", return_value=(999,)),
             mock.patch("crom.cli.chrome.find_pids", return_value=()),
-            mock.patch("crom.cli.chrome.launch", side_effect=CromError("Chrome exited 1")),
+            mock.patch(
+                "crom.cli.chrome.launch",
+                side_effect=Reason.CHROME_STARTUP_FAILED.error("Chrome exited 1"),
+            ),
         ):
             result = self.invoke("restart", "ci", expect=1)
 
@@ -1583,7 +1618,10 @@ class CliTest(unittest.TestCase):
             mock.patch("crom.cli.seed.materialize_under_lock"),
             mock.patch("crom.cli.chrome.find_pids", return_value=()),
             mock.patch("crom.cli.chrome.launch", return_value=(1234,)),
-            mock.patch("crom.cli.window.raise_profile", side_effect=CromError("no Automation access")),
+            mock.patch(
+                "crom.cli.window.raise_profile",
+                side_effect=Reason.AUTOMATION_DENIED.error("no Automation access"),
+            ),
         ):
             result = self.invoke("show", "ci", expect=1)
 
@@ -1679,12 +1717,37 @@ class CliTest(unittest.TestCase):
         Path(before["profile_dir"]).mkdir(parents=True)
 
         with mock.patch("crom.cli.shutil.rmtree", side_effect=OSError(66, "Directory not empty")):
-            output = self.crom("rm", "ci", "--yes", expect=1)
+            error = self.failure("rm", "ci", "--yes")
 
-        self.assertIn("still declared", output)
+        # `rm` carries no `--json`, so this slug reaches no envelope and the rendered
+        # sentence was all the suite could see. `profile_dir_undeletable` is what makes
+        # the retry the message promises a fact a script can act on rather than prose.
+        self.assertIs(error.reason, Reason.PROFILE_DIR_UNDELETABLE)
+        self.assertIn("still declared", str(error))
         self.assertIn("[profiles.ci]", (self.project / ".crom.toml").read_text())
         # Still nameable, on its original port — which is what makes the retry real.
         self.assertEqual(json.loads(self.crom("config", "ci", "--json"))["resolved"], before)
+
+    def test_a_profile_removed_mid_declaration_is_named_rather_than_left_a_key_error(self):
+        """`add_cmd` reads the file back after `ensure_profile` wrote it, so a concurrent
+        `crom rm` — or a `git checkout` over the file — landing between the two arrives
+        here. Left to the dict lookup it was a `KeyError`, which would leave this module's
+        exit-code contract as a traceback. [LAW:no-silent-failure]
+
+        The read-back is mocked because the race cannot be scheduled: what is under test
+        is what crom says when it loses it, not how narrow the window is.
+        """
+        self.crom("init")
+        real = config.load_file
+
+        def as_if_removed(target, **kwargs):
+            return replace(real(target, **kwargs), profiles={})
+
+        with mock.patch.object(config, "load_file", side_effect=as_if_removed):
+            error = self.failure("add", "ci")
+
+        self.assertIs(error.reason, Reason.PROFILE_VANISHED)
+        self.assertIn("was removed while crom was declaring it", str(error))
 
     def test_help_sections_cover_every_command(self):
         """Every command appears in exactly one curated `crom --help` section.
@@ -1858,7 +1921,10 @@ class CliTest(unittest.TestCase):
             refused = self.invoke("list", "--json", expect=1)
         self.assertEqual(
             json.loads(refused.stdout)["error"],
-            {"code": 1, "kind": "os_error", "message": "Cannot send"},
+            # `ESHUTDOWN` and not a slug of crom's own devising: the OS published this
+            # name, so the envelope repeats it rather than inventing a second spelling
+            # for a fact crom does not own. [LAW:one-source-of-truth]
+            {"code": 1, "kind": "os_error", "reason": "ESHUTDOWN", "message": "Cannot send"},
         )
 
     @contextlib.contextmanager
@@ -1938,13 +2004,152 @@ class CliTest(unittest.TestCase):
         kinds = []
         for error in (
             PermissionError(13, "Permission denied", "/bin/ps"),
-            CromError("ps is not on PATH"),
+            Reason.PROCESS_TABLE_UNREADABLE.error("ps is not on PATH"),
         ):
             with mock.patch("crom.chrome.scan", side_effect=error):
                 result = self.invoke("list", "--json", expect=1)
             kinds.append(json.loads(result.stdout)["error"]["kind"])
 
         self.assertEqual(kinds, ["os_error", "failure"])
+
+    def test_the_reason_says_what_the_kind_cannot(self):
+        """Three failures, one exit code, one kind — and three different next moves.
+
+        This is the case the epic opened on. Exit 1 and `kind: failure` cover a port held
+        by a stranger, a Chrome that will not run, and a Chrome that started and died,
+        and a script that wants to retry, or to tell its user to install a browser, or to
+        go read a log, cannot get to any of those from either field. The reason is what
+        separates them — which is also what stops it from being `kind` spelled finer:
+        derive one from the other and this test collapses to a single key.
+        """
+        self.crom("init")
+
+        seen = {}
+        for reason in (Reason.PORT_IN_USE, Reason.CHROME_UNUSABLE, Reason.CHROME_STARTUP_FAILED):
+            with mock.patch("crom.chrome.scan", side_effect=reason.error("refused")):
+                result = self.invoke("list", "--json", expect=1)
+            error = json.loads(result.stdout)["error"]
+            seen[error["reason"]] = (error["code"], error["kind"])
+
+        self.assertEqual(
+            seen,
+            {
+                "port_in_use": (1, "failure"),
+                "chrome_unusable": (1, "failure"),
+                "chrome_startup_failed": (1, "failure"),
+            },
+        )
+
+    def test_a_refusal_the_os_did_not_number_answers_with_no_reason_at_all(self):
+        """The one failure that reaches the envelope with nothing to put in `reason`.
+
+        `_errno_reason` looks the slug up in the OS's own errno table rather than
+        inventing a parallel spelling beside it, and not every `OSError` carries a number
+        to look up — `shutil.Error` aggregates per-file failures and carries none.
+        Documented, and until this test never once executed.
+
+        `null` is the honest answer and the only one that cannot be mistaken for a slug:
+        a stand-in like `"unknown"` would be an answer-shaped void, a value shaped like an
+        identification that a script could branch on as though crom had made one.
+        [LAW:parse-dont-validate]
+
+        `kind` still says `os_error`, which is the whole point of the two fields being
+        separate — crom knows the machine refused even when it cannot say how.
+        """
+        self.crom("init")
+
+        with mock.patch("crom.chrome.scan", side_effect=shutil.Error("gave up partway")):
+            result = self.invoke("list", "--json", expect=1)
+
+        error = json.loads(result.stdout)["error"]
+        # Subscripted rather than `.get`: present-and-null is the contract, so a key that
+        # went missing must fail here instead of reading as the null it should have been.
+        self.assertIsNone(error["reason"])
+        self.assertEqual(error["kind"], "os_error")
+        # An `OSError` carrying neither `filename` nor `strerror` still owes the user a
+        # sentence; the halves the boundary drops must not take the message with them.
+        # [LAW:no-silent-failure]
+        self.assertIn("gave up partway", error["message"])
+
+    def test_a_restated_declaration_answers_one_slug_for_both_of_its_callers(self):
+        """`crom add` comparing a profile's declaration and `crom init` comparing the
+        project's own namespace both raise from `_reject_restatement`, and neither
+        command carries `--json` — so this is the only seam where the reason can be read
+        at all, which is why the assertion is here rather than on an envelope.
+
+        One slug and not two. A slug earns its place by separating next moves, and both
+        callers say the same thing to whoever receives it: the file declares something
+        else, so edit it or change the request. A second name no script would branch on
+        differently would be a mode, not a distinction. [LAW:no-mode-explosion] The name
+        is `declaration_differs` rather than `profile_differs` because `crom init` names
+        no profile, and a slug that says otherwise sends a reader to the wrong stanza.
+        """
+        with self.assertRaises(Conflict) as caught:
+            cli._reject_restatement(
+                "already configures this project, and this asks to change it:",
+                (("namespace", "chosen", "other"),),
+                "Edit the file, or ask for what it already declares.",
+            )
+        self.assertIs(caught.exception.reason, Reason.DECLARATION_DIFFERS)
+
+    def test_every_reason_answers_with_the_class_its_own_row_names(self):
+        """The whole table walked: each reason raises the exception its row declares, and
+        the boundary answers for that exception under that same row.
+
+        This is what a raise site never naming a class buys. Pair a reason with a class
+        at each of a hundred raise sites and the two can disagree — silently, since both
+        halves are plausible on their own, and what a script sees is the wrong exit code.
+        Here the class is derived, so there is one place for the pairing to be wrong and
+        this walks all of it. [LAW:one-source-of-truth]
+
+        The message is asserted too, because `Exception` renders a two-argument
+        construction as its tuple: hand the reason to `super().__init__` and every
+        sentence in crom becomes `"('...', <Reason...>)"` — on stderr and in the
+        envelope's `message` both.
+        """
+        for reason in Reason:
+            with self.subTest(reason=reason.value):
+                # Lowercase and underscores, checked because the slug is a published name
+                # a script matches on: a `Chrome_Unusable` slipping into the table is a
+                # vocabulary with two spellings, and slugs cannot be renamed later.
+                self.assertRegex(reason.value, r"^[a-z][a-z0-9_]*$")
+
+                error = reason.error("a sentence")
+                self.assertIsInstance(error, reason.raises)
+                self.assertIs(error.reason, reason)
+                self.assertEqual(str(error), "a sentence")
+
+                answer = next(a for a in cli._ANSWERS if isinstance(error, a.error))
+                self.assertIs(answer.error, reason.raises)
+
+    def test_no_module_builds_a_failure_without_naming_its_reason(self):
+        """The backstop for the hundred raise sites this suite never executes.
+
+        `CromError` cannot be constructed without a reason, so a raise that forgot one is
+        a `TypeError`. But Python only says so on the line that runs, and these lines run
+        only when something has already gone wrong — a new `raise CromError(...)` in a
+        rarely-taken branch would ship, and the first person to reach it would get a
+        crash where crom meant to hand them a sentence. So the invariant is asserted over
+        the source rather than over one execution.
+
+        What it looks for is a call on the bare name: `CromError(...)`, `NotFound(...)`,
+        `Conflict(...)`. The one legitimate construction — `self.raises(message, self)`,
+        inside `Reason.error` — is a call on an attribute and so is not one, which is why
+        this needs no list of blessed exceptions to stay accurate.
+
+        Same shape as `test_help_sections_cover_every_command`: a completeness check on a
+        contract, not an assertion about how any one function is written.
+        """
+        family = {"CromError", "NotFound", "Conflict"}
+        direct = [
+            f"{path.name}:{node.lineno}: {node.func.id}(...)"
+            for path in sorted(Path(cli.__file__).parent.glob("*.py"))
+            for node in ast.walk(ast.parse(path.read_text()))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in family
+        ]
+        self.assertEqual(direct, [], "build these through Reason.<REASON>.error(...)")
 
     def test_a_reader_that_left_does_not_turn_the_envelope_into_a_traceback(self):
         """The envelope is stdout, and stdout is what gets piped — so it can meet a
@@ -1995,7 +2200,8 @@ class CliTest(unittest.TestCase):
         """
         self.crom("init")
         with mock.patch(
-            "crom.migrate.run_if_needed", side_effect=CromError("a legacy Chrome is still running")
+            "crom.migrate.run_if_needed",
+            side_effect=Reason.MIGRATION_NEEDS_QUIET.error("a legacy Chrome is still running"),
         ):
             result = self.invoke("list", "--json", expect=1)
 
@@ -2028,12 +2234,18 @@ class CliTest(unittest.TestCase):
         for name in offering:
             with self.subTest(command=name):
                 with mock.patch(
-                    "crom.cli.load_ambient", side_effect=CromError("no ambient config")
+                    "crom.cli.load_ambient",
+                    side_effect=Reason.CONFIG_INVALID.error("no ambient config"),
                 ):
                     result = self.invoke(name, "--json", expect=1)
                 self.assertEqual(
                     json.loads(result.stdout)["error"],
-                    {"code": 1, "kind": "failure", "message": "no ambient config"},
+                    {
+                        "code": 1,
+                        "kind": "failure",
+                        "reason": "config_invalid",
+                        "message": "no ambient config",
+                    },
                 )
 
 

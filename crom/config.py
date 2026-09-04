@@ -30,12 +30,11 @@ from .model import (
     MAX_PORT,
     MIN_PORT,
     USER_NAMESPACE,
-    Conflict,
     CromError,
     Flag,
     Layer,
-    NotFound,
     ProfileSpec,
+    Reason,
     Scope,
     Seed,
     SeedChrome,
@@ -153,7 +152,7 @@ def discover(start: Path | None = None) -> Path | None:
     if override:
         path = Path(override).expanduser().resolve()
         if not path.exists():
-            raise NotFound(f"CROM_CONFIG points at {path}, which does not exist")
+            raise Reason.CONFIG_MISSING.error(f"CROM_CONFIG points at {path}, which does not exist")
         return path
 
     directory = (start or Path.cwd()).resolve()
@@ -171,7 +170,7 @@ def discover(start: Path | None = None) -> Path | None:
 def _reject_unknown(table: dict, allowed: frozenset[str], where: str, source: Path) -> None:
     unknown = sorted(set(table) - allowed)
     if unknown:
-        raise CromError(
+        raise Reason.CONFIG_INVALID.error(
             f"{source}: unknown key(s) in {where}: {', '.join(unknown)} "
             f"(known: {', '.join(sorted(allowed))})"
         )
@@ -200,9 +199,9 @@ def parse_layer(raw_flags, raw_drops, where: str, source: Path) -> Layer:
     value" for the same reason: removing the value leaves the entry still refused.
     """
     if not isinstance(raw_flags, list) or not all(isinstance(f, str) for f in raw_flags):
-        raise CromError(f"{source}: {where}.flags must be a list of strings")
+        raise Reason.CONFIG_INVALID.error(f"{source}: {where}.flags must be a list of strings")
     if not isinstance(raw_drops, list) or not all(isinstance(f, str) for f in raw_drops):
-        raise CromError(
+        raise Reason.CONFIG_INVALID.error(
             f"{source}: {where}.drop_flags must be a list of switch names, "
             f'e.g. ["--disable-sync"]'
         )
@@ -222,8 +221,10 @@ def parse_layer(raw_flags, raw_drops, where: str, source: Path) -> Layer:
         # information than it caught, never less — the alternative was a second copy of
         # the check here, written only to reach the file and stanza names, and a rule
         # spelled in two places is one that eventually disagrees with itself.
-        # [LAW:one-source-of-truth]
-        raise CromError(f"{source}: {where} {fault}") from fault
+        # [LAW:one-source-of-truth] The reason travels with the fault for the same
+        # reason: `Layer` decided what went wrong, so re-tagging it here would be this
+        # deciding it a second time. Only the message gains anything.
+        raise fault.reason.error(f"{source}: {where} {fault}") from fault
 
 
 def _reject_reserved(
@@ -245,7 +246,7 @@ def _reject_reserved(
     for flag in (Flag.parse(text) for text in texts):
         reserved = RESERVED_SWITCHES.get(flag.switch)
         if reserved is not None:
-            raise CromError(
+            raise Reason.FLAGS_INVALID.error(
                 f"{source}: {where}.{key} {verb} {flag.switch} — "
                 + reason_for(reserved).replace(_STANZA, where)
             )
@@ -302,14 +303,14 @@ def parse_features(raw, where: str, source: Path) -> dict[str, bool]:
     collision that crom exists to never emit. [LAW:one-source-of-truth]
     """
     if not isinstance(raw, dict) or not all(isinstance(v, bool) for v in raw.values()):
-        raise CromError(
+        raise Reason.CONFIG_INVALID.error(
             f"{source}: {where}.features must be a table of feature name = true/false "
             f"(true turns the feature on, false turns it off; a name you omit is left alone)"
         )
     for name in raw:
         for is_illegal, fault in _ILLEGAL_FEATURE_NAMES:
             if is_illegal(name):
-                raise CromError(
+                raise Reason.CONFIG_INVALID.error(
                     f"{source}: {where}.features names a feature {name!r}, which {fault}.\n"
                     f"crom passes each name to Chrome exactly as written, so it has to be "
                     f"the literal feature name — e.g. SharedStorageAPI."
@@ -319,7 +320,7 @@ def parse_features(raw, where: str, source: Path) -> dict[str, bool]:
 
 def parse_env(raw, where: str, source: Path) -> dict[str, str]:
     if not isinstance(raw, dict) or not all(isinstance(v, str) for v in raw.values()):
-        raise CromError(f"{source}: {where}.env must be a table of string values")
+        raise Reason.CONFIG_INVALID.error(f"{source}: {where}.env must be a table of string values")
     return dict(raw)
 
 
@@ -335,7 +336,7 @@ def parse_seed(raw, where: str, source: Path, config_dir: Path) -> Seed:
     nothing about which one it meant.
     """
     if not isinstance(raw, str):
-        raise CromError(f"{source}: {where}.seed must be a string")
+        raise Reason.CONFIG_INVALID.error(f"{source}: {where}.seed must be a string")
     if raw == "fresh":
         return SeedFresh()
     if raw == "default":
@@ -343,7 +344,7 @@ def parse_seed(raw, where: str, source: Path, config_dir: Path) -> Seed:
     if raw == "chrome":
         # A tombstone, not a spelling. Configs written before the rename say `chrome`,
         # and leaving it to fall through to "not recognised" would make the fix a guess.
-        raise CromError(
+        raise Reason.CONFIG_INVALID.error(
             f"{source}: {where}.seed = 'chrome' — the seed names the Chrome profile now, "
             f'not the browser. Write seed = "default".'
         )
@@ -351,7 +352,7 @@ def parse_seed(raw, where: str, source: Path, config_dir: Path) -> Seed:
         return SeedChrome(profile=_parse_chrome_profile(raw.split(":", 1)[1], where, source))
     if raw[:1] in (".", "/", "~"):
         return SeedPath(_parse_seed_path(raw, where, source, config_dir))
-    raise CromError(
+    raise Reason.CONFIG_INVALID.error(
         f"{source}: {where}.seed = {raw!r} is not recognised. Use 'fresh', 'default', "
         f"'chrome:<Profile Name>', or a path beginning with './', '/', or '~'."
     )
@@ -378,7 +379,7 @@ def _parse_seed_path(raw: str, where: str, source: Path, config_dir: Path) -> Pa
     home = Path.home().resolve()
     forbidden = {resolved == home, resolved in home.parents, resolved == Path(resolved.anchor)}
     if any(forbidden):
-        raise CromError(
+        raise Reason.SEED_UNSAFE.error(
             f"{source}: {where}.seed = {raw!r} resolves to {resolved}, which contains "
             f"your whole home directory or filesystem.\n"
             f"crom copies a seed directory in full, so this would duplicate everything "
@@ -403,11 +404,16 @@ def _parse_chrome_profile(which: str, where: str, source: Path) -> str:
     is `Path('/a')`, so `chrome:` would silently copy the user's *entire* Chrome
     directory — every profile and every cookie — when they asked for one profile.
 
+    Both refusals are `seed_unsafe`, the slug `_parse_seed_path` gives the same threat a
+    few lines above: a well-formed value refused for what copying it would do, not a
+    malformed one. `config_invalid` is where an unparseable value goes, and a caller told
+    that would go hunting for a typo instead of reading what the seed would have copied.
+
     [LAW:parse-dont-validate] The checkpoint is here, so `seed.py` holds no guard: a
     `SeedChrome` that exists names a single directory that cannot escape.
     """
     if not which:
-        raise CromError(
+        raise Reason.SEED_UNSAFE.error(
             f"{source}: {where}.seed = 'chrome:' names no profile. Use 'chrome' for the "
             f"default profile, or 'chrome:<Profile Name>' for a specific one."
         )
@@ -419,7 +425,7 @@ def _parse_chrome_profile(which: str, where: str, source: Path) -> str:
     # the join to the filesystem root.
     parts = Path(which).parts
     if "/" in which or which.startswith("~") or len(parts) != 1 or parts[0] in (".", ".."):
-        raise CromError(
+        raise Reason.SEED_UNSAFE.error(
             f"{source}: {where}.seed = 'chrome:{which}' is not a profile name. It must "
             f"name one directory inside your Chrome user-data-dir (e.g. 'Default', "
             f"'Profile 1') — not a path."
@@ -431,7 +437,7 @@ def parse_port(raw, where: str, source: Path) -> int | None:
     if raw is None:
         return None
     if not isinstance(raw, int) or isinstance(raw, bool) or not (MIN_PORT <= raw <= MAX_PORT):
-        raise CromError(
+        raise Reason.CONFIG_INVALID.error(
             f"{source}: {where}.port must be an integer in {MIN_PORT}..{MAX_PORT}"
         )
     return raw
@@ -454,25 +460,25 @@ def _parse_chrome_binary(raw, source: Path, config_dir: Path) -> Path:
     if raw is None:
         return find_chrome()
     if not isinstance(raw, str):
-        raise CromError(f"{source}: chrome_binary must be a string path")
+        raise Reason.CONFIG_INVALID.error(f"{source}: chrome_binary must be a string path")
     if raw == "":
         # `Path("")` is `Path(".")`, so the empty string resolves to the config's own
         # directory — which exists. The `is_file()` check below still refuses it, but the
         # message it produces says a directory that is plainly there "does not exist". A
         # diagnostic that is false about the thing it names sends the reader to check the
         # wrong fact; `state_dir` refuses the empty string by name for the same reason.
-        raise CromError(
+        raise Reason.CONFIG_INVALID.error(
             f"{source}: chrome_binary is empty. Give a path to the Chrome executable, "
             f"or remove the key to let crom find one."
         )
 
     binary = (config_dir / Path(raw).expanduser()).resolve()
     if not binary.is_file():
-        raise CromError(
+        raise Reason.CHROME_UNUSABLE.error(
             f"{source}: chrome_binary {raw!r} does not exist (resolved to {binary})."
         )
     if not os.access(binary, os.X_OK):
-        raise CromError(
+        raise Reason.CHROME_UNUSABLE.error(
             f"{source}: chrome_binary {raw!r} is not executable (resolved to {binary})."
         )
     return binary
@@ -483,7 +489,7 @@ def parse(text: str, source: Path, *, namespace: str | None = None) -> Scope:
     try:
         data = tomllib.loads(text)
     except tomllib.TOMLDecodeError as e:
-        raise CromError(f"{source}: invalid TOML: {e}") from e
+        raise Reason.CONFIG_INVALID.error(f"{source}: invalid TOML: {e}") from e
 
     _reject_unknown(data, _SCOPE_KEYS, "the top level", source)
 
@@ -493,12 +499,12 @@ def parse(text: str, source: Path, *, namespace: str | None = None) -> Scope:
         # `namespace = 123` that their key is missing is the least useful thing crom
         # could say to the person actually looking at the line.
         if "namespace" not in data:
-            raise CromError(
+            raise Reason.CONFIG_INVALID.error(
                 f'{source}: missing required key `namespace`. Add e.g. namespace = "myapp" — '
                 f"it is how this project's profiles and ports stay clear of every other project's."
             )
         if not isinstance(declared, str):
-            raise CromError(
+            raise Reason.CONFIG_INVALID.error(
                 f"{source}: `namespace` must be a string, not "
                 f"{type(declared).__name__} ({declared!r})."
             )
@@ -507,12 +513,12 @@ def parse(text: str, source: Path, *, namespace: str | None = None) -> Scope:
             # `Conflict` (exit 4), matching `crom init` and `registry.forget_namespace`,
             # which refuse the same reserved name. A script branching on exit 4 to detect
             # "that name is taken" must see it from every path that decides it.
-            raise Conflict(
+            raise Reason.NAMESPACE_RESERVED.error(
                 f'{source}: namespace "{USER_NAMESPACE}" is reserved for your personal '
                 f"profiles in {user_config_file()}. Choose another name."
             )
     elif "namespace" in data:
-        raise CromError(
+        raise Reason.CONFIG_INVALID.error(
             f"{source}: this file always defines the `{namespace}` namespace; "
             f"remove the `namespace` key."
         )
@@ -521,7 +527,7 @@ def parse(text: str, source: Path, *, namespace: str | None = None) -> Scope:
 
     state_dir = data.get("state_dir")
     if state_dir is not None and not isinstance(state_dir, str):
-        raise CromError(f"{source}: state_dir must be a string path")
+        raise Reason.CONFIG_INVALID.error(f"{source}: state_dir must be a string path")
     if state_dir == "":
         # Refused rather than interpreted. A truthy test silently treated this as absent
         # and fell back to the default, so someone debugging why their explicit
@@ -530,7 +536,7 @@ def parse(text: str, source: Path, *, namespace: str | None = None) -> Scope:
         # directories next to the config file. An empty path is not a location under any
         # reading, so the parser should not admit one — the same stance the seed
         # vocabulary already takes toward "".
-        raise CromError(
+        raise Reason.CONFIG_INVALID.error(
             f"{source}: state_dir is empty. Give a path, or remove the key to use "
             f"{default_profiles_root()}."
         )
@@ -544,7 +550,7 @@ def parse(text: str, source: Path, *, namespace: str | None = None) -> Scope:
 
     defaults = data.get("defaults", {})
     if not isinstance(defaults, dict):
-        raise CromError(f"{source}: {DEFAULTS_STANZA} must be a table")
+        raise Reason.CONFIG_INVALID.error(f"{source}: {DEFAULTS_STANZA} must be a table")
     _reject_unknown(defaults, _DEFAULTS_KEYS, DEFAULTS_STANZA, source)
 
     default_seed = (
@@ -555,13 +561,13 @@ def parse(text: str, source: Path, *, namespace: str | None = None) -> Scope:
 
     raw_profiles = data.get("profiles", {})
     if not isinstance(raw_profiles, dict):
-        raise CromError(f"{source}: [profiles] must be a table of tables")
+        raise Reason.CONFIG_INVALID.error(f"{source}: [profiles] must be a table of tables")
 
     profiles: dict[str, ProfileSpec] = {}
     for name, raw in raw_profiles.items():
         where = profile_stanza(name)
         if not isinstance(raw, dict):
-            raise CromError(f"{source}: {where} must be a table")
+            raise Reason.CONFIG_INVALID.error(f"{source}: {where} must be a table")
         _reject_unknown(raw, _PROFILE_KEYS, where, source)
         validate_name("profile name", name)
         profiles[name] = ProfileSpec(
@@ -606,7 +612,7 @@ def reject_duplicate_ports(profiles: dict[str, ProfileSpec], source: Path) -> No
             # Conflict, not a bare CromError: two profiles claiming one port is the
             # exit-4 case the CLI contract promises, whether it reaches us from a file
             # on load or from `crom add` checking a declaration before it writes it.
-            raise Conflict(
+            raise Reason.PORT_CONFLICT.error(
                 f"{source}: profiles '{claimed[spec.port]}' and '{spec.name}' both "
                 f"pin port {spec.port}"
             )
@@ -618,7 +624,7 @@ def reject_duplicate_ports(profiles: dict[str, ProfileSpec], source: Path) -> No
 
 def load_file(source: Path, *, namespace: str | None = None) -> Scope:
     if not source.is_file():
-        raise NotFound(f"config file not found: {source}")
+        raise Reason.CONFIG_MISSING.error(f"config file not found: {source}")
     return parse(source.read_text(), source, namespace=namespace)
 
 

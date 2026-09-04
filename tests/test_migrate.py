@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 from crom import config, migrate, registry
-from crom.model import CromError, ProfileRef
+from crom.model import CromError, ProfileRef, Reason
 from crom.paths import state_home
 
 LEGACY = {"profiles": {"default": {"port": 4222}, "worker1": {"port": 4223}}}
@@ -100,8 +100,13 @@ class MigrateTest(unittest.TestCase):
     def test_it_refuses_to_move_a_directory_out_from_under_a_running_chrome(self):
         live = {str(migrate._legacy_state_dir() / "worker1"): (4242,)}
         with mock.patch("crom.chrome.scan", return_value=live):
-            with self.assertRaisesRegex(CromError, "worker1 .pid 4242."):
+            with self.assertRaisesRegex(CromError, "worker1 .pid 4242.") as caught:
                 migrate.run(log=lambda _: None)
+        # The retryable half of the pair: quit the browsers and the same command
+        # goes through. Both halves are exit 1 and `kind: failure`, and both read as
+        # "migration refused", so nothing but the slug tells a caller whether trying
+        # again is worth anything.
+        self.assertIs(caught.exception.reason, Reason.MIGRATION_NEEDS_QUIET)
         # Nothing moved, so the running browser is still exactly where crom left it.
         self.assertTrue((migrate._legacy_state_dir() / "worker1").is_dir())
         self.assertTrue(migrate.legacy_registry_file().exists())
@@ -177,8 +182,12 @@ class MigrateTest(unittest.TestCase):
         self._rewrite_legacy({"default": {"port": 4222}, "QA env": {"port": 4223}})
 
         with mock.patch("crom.chrome.scan", return_value={}):
-            with self.assertRaisesRegex(CromError, "QA env"):
+            with self.assertRaisesRegex(CromError, "QA env") as caught:
                 migrate.run(log=lambda _: None)
+
+        # The other half: nothing changes until a human edits the legacy file, so a
+        # caller that retries on this one loops forever.
+        self.assertIs(caught.exception.reason, Reason.MIGRATION_BLOCKED)
 
         # Refused before the first write: the legacy file is intact, so the user can
         # rename and try again.
@@ -246,8 +255,9 @@ class MigrateTest(unittest.TestCase):
         would be the only thing crom could do."""
         migrate.legacy_registry_file().write_text("{ truncated")
         with mock.patch("crom.chrome.scan", return_value={}):
-            with self.assertRaisesRegex(CromError, "not valid JSON"):
+            with self.assertRaisesRegex(CromError, "not valid JSON") as caught:
                 migrate.run(log=lambda _: None)
+        self.assertIs(caught.exception.reason, Reason.REGISTRY_INVALID)
 
     def test_a_move_that_dies_partway_leaves_the_retry_a_clean_destination(self):
         """Across filesystems `shutil.move` degrades to copy-then-delete, so a failure

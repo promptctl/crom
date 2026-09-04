@@ -8,7 +8,7 @@ other module asks here rather than composing `~/.config` itself.
 import os
 from pathlib import Path
 
-from .model import CromError
+from .model import Reason
 
 CONFIG_FILENAME = "config.toml"
 REGISTRY_FILENAME = "registry.json"
@@ -28,7 +28,7 @@ def _home(env: str) -> Path:
     try:
         return Path.home()
     except RuntimeError as e:
-        raise CromError(
+        raise Reason.HOME_UNKNOWN.error(
             f"cannot determine your home directory ({e}), and {env} is not set to an "
             f"absolute path. Set {env} (or HOME) and run crom again."
         ) from e
@@ -43,7 +43,7 @@ def _expanduser(raw: str, env: str) -> Path:
     try:
         return Path(raw).expanduser()
     except RuntimeError as e:
-        raise CromError(
+        raise Reason.HOME_UNKNOWN.error(
             f"{env} is set to {raw!r}, but your home directory cannot be determined "
             f"({e}). Set {env} to an absolute path, or set HOME."
         ) from e
