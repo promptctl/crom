@@ -19,12 +19,10 @@ carries a reason slug — one word naming what actually went wrong, enumerated i
 
 import errno
 import json
-import os
 import shlex
 import shutil
 from collections.abc import Callable
 from pathlib import Path
-from stat import S_ISREG
 from typing import NamedTuple
 
 import click
@@ -1087,14 +1085,14 @@ def rm_cmd(session: _Session, ref: str, yes: bool, keep_data: bool):
     running = chrome.is_running(profile)
     deletes_data = not keep_data and profile.profile_dir.exists()
 
-    # Assembled rather than templated because `_human_size` walks the whole profile
+    # Assembled rather than templated because `doctor.measure` walks the whole profile
     # directory: folding it into a comprehension over both consequences would measure a
     # gigabyte of Chrome data on the `--keep-data` path that is not going to delete it.
     consequences = []
     if running:
         consequences.append(f"stop the browser running on port {profile.port}")
     if deletes_data:
-        size = _human_size(profile.profile_dir)
+        size = _human_size(doctor.measure(profile.profile_dir))
         consequences.append(
             f"delete {profile.profile_dir} ({size}) — its logins, cookies, and history"
         )
@@ -1585,25 +1583,33 @@ def forget_cmd(namespace: str):
 @main.command("doctor")
 @_json_option
 def doctor_cmd(as_json: bool):
-    """Show the port ledger — including reservations no config declares.
+    """Show the state crom owns on this machine, and where it has leaked.
 
-    `crom list` reads the config files and reports what they declare; this reads the
-    ledger and reports what crom is actually holding. A profile deleted from a
-    `.crom.toml` keeps its reservation, so the two answers differ exactly where
-    something has leaked — which is the only reason to run this.
+    `crom list` reads the config files and reports what they declare; this reports what
+    crom is actually holding. The two answers differ exactly where something has leaked,
+    which is the only reason to run this.
 
-    Each row says where it stands against the config the ledger names as its source:
-    `declared`, `orphaned` — nothing declares it any more — or `unchecked`, which is
-    crom refusing to guess about a config it could not read.
+    Every reservation in the port ledger comes first, each with where it stands against
+    the config the ledger names as its source: `declared`, `orphaned` — nothing declares
+    it any more — or `unchecked`, which is crom refusing to guess about a config it could
+    not read.
+
+    Then every staging directory under a profile root. Seeding builds a profile beside its
+    final path and moves it in only once it is whole, so a `crom up` killed mid-copy
+    leaves the half-built copy behind — dot-prefixed, so `ls` hides it, and the retry
+    succeeds, so nothing looks wrong. Each is reported with its size, and so is every
+    namespace crom could not look under.
     """
     found = doctor.survey()
     _emit(
         as_json,
         found.describe(),
         [
-            # Unconditional, so an empty ledger reads as an answer rather than as output
-            # that got cut off. `reservation(s)` is how `crom forget` already counts the
-            # same noun. [LAW:dataflow-not-control-flow]
+            # All three counts are unconditional, so a clean machine reads as an answer
+            # rather than as output that got cut off — and the last of them is what keeps
+            # "nothing is leaking" apart from "I could not check".
+            # [LAW:dataflow-not-control-flow] `reservation(s)` is how `crom forget`
+            # already counts the same noun.
             f"{len(found.rows)} reservation(s) in {found.registry}",
             *(
                 f"  {row.held.port:<6}{row.ref:30s}"
@@ -1615,6 +1621,12 @@ def doctor_cmd(as_json: bool):
                 f"{row.standing.finding}"
                 for row in found.rows
             ),
+            f"{len(found.staged)} staging directory(s) left behind by an interrupted seed",
+            # The size leads: it is what decides whether this is worth acting on, and the
+            # paths are long enough to push it off the end of a line if it followed.
+            *(f"  {_human_size(item.bytes):>8}  {item.path}" for item in found.staged),
+            f"{len(found.unscanned)} namespace(s) crom could not check for them",
+            *(f"  {item.namespace + '/':30s}{item.error}" for item in found.unscanned),
         ],
     )
 
@@ -1640,30 +1652,15 @@ def _delete_profile_data(profile: ResolvedProfile) -> None:
         ) from e
 
 
-def _human_size(directory: Path) -> str:
-    """What deleting this directory would reclaim, for the confirmation prompt.
+def _human_size(total: int) -> str:
+    """A byte count as a person reads it.
 
-    `lstat` rather than `stat`: a symlink's target is not deleted with the profile, so
-    counting the target's size would overstate what is about to be lost — and a dangling
-    link would raise rather than measure. Only the profile's own regular files count.
-
-    A file that vanishes mid-walk is skipped, rather than failing a prompt whose only job
-    is to be helpful before a destructive act.
-
-    `os.walk(followlinks=False)` states the no-following guarantee at the call site.
-    `rglob` happens to behave the same way on 3.12, but that is a property of pathlib's
-    recursive selector rather than something this code asks for.
+    A number in, a string out: the walk that produces the number belongs to
+    `doctor.measure`, which every command that quotes a size now shares, and what is left
+    here is the rendering — which is the presenter's whole job. [LAW:effects-at-boundaries]
     """
-    total = 0
-    for dirpath, _dirnames, filenames in os.walk(directory, followlinks=False):
-        for name in filenames:
-            try:
-                info = os.lstat(os.path.join(dirpath, name))
-            except OSError:
-                continue
-            if S_ISREG(info.st_mode):
-                total += info.st_size
+    size = float(total)
     for unit in ("B", "KB", "MB", "GB"):
-        if total < 1024 or unit == "GB":
-            return f"{total:.0f}{unit}"
-        total /= 1024
+        if size < 1024 or unit == "GB":
+            return f"{size:.0f}{unit}"
+        size /= 1024

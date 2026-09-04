@@ -23,7 +23,7 @@ from unittest import mock
 
 from click.testing import CliRunner
 
-from crom import cli, config, configwrite, mcp
+from crom import cli, config, configwrite, doctor, mcp
 from crom.config import load_ambient
 from crom.model import Conflict, CromError, ProfileRef, Reason
 from crom.paths import registry_file, state_home, user_config_file
@@ -1583,6 +1583,158 @@ class CliTest(unittest.TestCase):
         self.assertEqual("orphaned", standings["a/b/c"])
         self.assertEqual("orphaned", standings["MyApp/UPPER"])
 
+    # --- what an interrupted seed left behind ---------------------------------------
+
+    def _interrupted_seed(self, config: str) -> None:
+        """Run `crom up` against a seed and kill it between the copy and the commit.
+
+        SIGKILL is precisely "the `except BaseException` arm never ran", and no in-process
+        test can produce that — the interpreter that would run the assertions is the one
+        being killed. So it is expressed as the state that arm leaves untouched: a copy
+        that fails after writing part of the profile, with `_staged`'s cleanup neutered.
+        Everything that decides where the residue lands and what it is called —
+        `mkdtemp(prefix=f".{destination.name}.")`, the profile root, the commit that never
+        happens — is production code, which is the part detection has to agree with.
+        [LAW:behavior-not-structure]
+        """
+        def half_copied(source, dest, **_kwargs):
+            (Path(dest) / "Cookies").write_bytes(b"x" * 4096)
+            raise Reason.SEED_UNREADABLE.error(f"seed {source} was interrupted")
+
+        (self.root / "seed").mkdir(exist_ok=True)
+        (self.project / ".crom.toml").write_text(config)
+        with (
+            mock.patch("crom.seed.shutil.copytree", side_effect=half_copied),
+            mock.patch("crom.seed.shutil.rmtree"),
+        ):
+            # 1 is the bucket `CromError` sorts into; the exit code is not what this is
+            # about, only that the run ended before the commit.
+            self.crom("up", "dev", expect=1)
+
+    def _staging(self) -> list[dict]:
+        return json.loads(self.crom("doctor", "--json"))["staging"]
+
+    def test_doctor_reports_the_staging_directory_an_interrupted_seed_left(self):
+        """The leak this ticket exists for, and why nothing else can see it.
+
+        `seed._staged` builds the profile beside its final path and moves it in only once
+        it is whole, so a `crom up` that dies mid-copy leaves the half-built copy behind.
+        Nothing reports it: the directory is dot-prefixed so `ls` hides it, the retry
+        succeeds so no command fails, and the bytes are a whole seed's worth — two
+        interrupted runs against a 234 MB seed cost 350 MB on the machine that prompted
+        this epic.
+
+        The size is asserted as the exact byte count rather than merely as truthy. A leak
+        a user is deciding whether to delete is a decision about the number, so a doctor
+        that reported the directory with a plausible-looking wrong size would be worse
+        than one that reported no size at all.
+        """
+        self._interrupted_seed(
+            f'namespace = "myapp"\n\n[profiles.dev]\nseed = "{self.root / "seed"}"\n'
+        )
+
+        found = self._staging()
+
+        self.assertEqual(1, len(found), found)
+        self.assertEqual("myapp", found[0]["namespace"])
+        self.assertEqual(4096, found[0]["bytes"])
+        self.assertTrue(Path(found[0]["path"]).name.startswith(".dev."))
+        self.assertIn(Path(found[0]["path"]).name, self.crom("doctor"))
+
+    def test_doctor_does_not_call_a_profile_lock_a_leak(self):
+        """The other dot-prefixed resident of a profile root, and it is not residue.
+
+        `locking.exclusive` keys its lock on a companion `.<name>.lock` beside the thing
+        it guards, so every command that touches a profile leaves one in the very
+        directory this scan reads. Detection turns on `is_dir` for exactly this reason:
+        without it `crom doctor` would report a leak on every machine, on every run, for
+        a file crom is supposed to leave there. [LAW:verifiable-goals]
+
+        The committed profile directory is asserted absent from the answer too, which is
+        what the leading dot is for — `model.validate_name` refuses a profile name that
+        does not start alphanumeric, so no directory crom commits can be confused for one
+        it abandoned.
+        """
+        self._interrupted_seed(
+            f'namespace = "myapp"\n\n[profiles.dev]\nseed = "{self.root / "seed"}"\n'
+        )
+        root = Path(json.loads(self.crom("config", "dev", "--json"))["resolved"]["profile_dir"]).parent
+        (root / "dev").mkdir(exist_ok=True)
+        self.assertTrue((root / ".dev.lock").is_file())
+
+        reported = {Path(item["path"]).name for item in self._staging()}
+
+        self.assertNotIn(".dev.lock", reported)
+        self.assertNotIn("dev", reported)
+
+    def test_doctor_looks_under_the_profile_root_the_config_names(self):
+        """A namespace that moves its profiles elsewhere moves the leak with them.
+
+        `state_dir` relocates a namespace's user-data-dirs, so a scan rooted at crom's
+        default would report a clean machine for the projects that set it — the silent
+        half-answer this command must never give. The root is composed the way
+        `resolve.resolve_spec` composes it, from the config the ledger names, so there is
+        one rule about where a namespace's profiles live rather than two that can drift.
+        [LAW:one-source-of-truth]
+        """
+        elsewhere = self.root / "elsewhere"
+        self._interrupted_seed(
+            f'namespace = "myapp"\nstate_dir = "{elsewhere}"\n\n'
+            f'[profiles.dev]\nseed = "{self.root / "seed"}"\n'
+        )
+
+        found = self._staging()
+
+        self.assertEqual(1, len(found), found)
+        self.assertEqual(elsewhere / "myapp", Path(found[0]["path"]).parent)
+
+    def test_doctor_still_finds_the_leak_of_a_project_whose_config_is_gone(self):
+        """A deleted project is the case with the most left behind, not the least.
+
+        The config is what says where a namespace keeps its profiles, so losing it could
+        have meant losing the ability to look — and this is the leak that matters most,
+        since nothing will ever come back to clean it up. A config that is not there
+        declared no `state_dir`, which is an answer: crom's default root is where those
+        profiles are, the same conclusion `config.parse` reaches for a config that simply
+        omits the key. It is reported as a finding rather than as a namespace crom could
+        not check, which is the line `unchecked` draws for reservations.
+        """
+        self._interrupted_seed(
+            f'namespace = "myapp"\n\n[profiles.dev]\nseed = "{self.root / "seed"}"\n'
+        )
+        (self.project / ".crom.toml").unlink()
+
+        found = self._staging()
+
+        self.assertEqual(1, len(found), found)
+        self.assertEqual(state_home() / "profiles" / "myapp", Path(found[0]["path"]).parent)
+        self.assertEqual(4096, found[0]["bytes"])
+
+    def test_doctor_will_not_report_a_clean_root_for_a_config_it_could_not_read(self):
+        """"Nothing is leaking" and "I could not check" are different answers.
+
+        An unloadable config may name a `state_dir` crom never read, so there is no root
+        to look under — and a scan that quietly skipped it would publish an empty
+        `staging` array, which is the shape of a clean bill of health. The namespace is
+        reported instead, under the `error` key `crom list` already gives a namespace it
+        could not load. [LAW:no-silent-failure]
+
+        The `user` namespace is asserted absent from that list, because it is the case a
+        blanket rule gets wrong: a machine with no user config file at all has not failed
+        to check anything — an absent config sets no `state_dir`, so crom's default root
+        is where its profiles are, exactly as `load_user_scope` already answers.
+        """
+        config_file = self.project / ".crom.toml"
+        config_file.write_text('namespace = "myapp"\n\n[profiles.alpha]\n')
+        self.crom("list")
+        config_file.write_text('namespace = "myapp"\n\n[profiles.alpha\n')
+
+        errors = {item["namespace"]: item.get("error") for item in self._staging()}
+
+        self.assertIn(f"{config_file} could not be checked", errors["myapp"])
+        self.assertNotIn("user", errors)
+        self.assertIn("1 namespace(s) crom could not check", self.crom("doctor"))
+
     # --- removal --------------------------------------------------------------------
 
     def test_rm_undeclares_the_profile_and_deletes_its_data(self):
@@ -1956,11 +2108,15 @@ class CliTest(unittest.TestCase):
 
         self.assertEqual(events, ["lock", "kill", "rmtree", "unlock"])
 
-    def test_the_size_prompt_counts_only_what_the_delete_reclaims(self):
-        """`_human_size` measures what removing the directory frees, so a symlink's
-        target — which is not deleted — must not be counted, and a dangling link must
-        not raise — this helper's only job is to be informative before a destructive
-        act, and a failure to measure is not a reason to refuse the delete."""
+    def test_a_size_counts_only_what_deleting_the_directory_reclaims(self):
+        """`doctor.measure` answers what removing a directory frees, so a symlink's
+        target — which is not deleted — must not be counted, and a dangling link must not
+        raise: the two callers are a prompt shown before a destructive act and a leak
+        report, and neither is improved by refusing to say a number.
+
+        Asserted through both halves of the answer, because they are used together and
+        separately: `rm`'s prompt renders this count, and `crom doctor` publishes it raw
+        as `bytes` for a script deciding what a leak is costing."""
         directory = self.root / "profile"
         (directory / "sub").mkdir(parents=True)
         (directory / "sub" / "real.bin").write_bytes(b"x" * 2048)
@@ -1970,8 +2126,10 @@ class CliTest(unittest.TestCase):
         (directory / "link-to-huge").symlink_to(outside)
         (directory / "dangling").symlink_to(self.root / "gone")
 
-        size = cli._human_size(directory)
-        self.assertEqual(size, "2KB")  # 2048 bytes, and neither link counted
+        total = doctor.measure(directory)
+
+        self.assertEqual(total, 2048)  # neither link counted
+        self.assertEqual(cli._human_size(total), "2KB")
 
     def test_a_failed_delete_leaves_the_profile_declared_and_retryable(self):
         """`rm` deletes data *before* it undeclares, so a failure is recoverable.

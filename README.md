@@ -155,12 +155,13 @@ since `crom list` is what you run *because* something is wrong. Check for `error
 reading `port` and friends.
 
 `crom doctor --json` is neither shape. It answers with an object: `registry`, the path of
-crom's port ledger, and `reservations`, the rows in it. The path is in the answer because
-editing that file by hand is the only way to release a single reservation no config
-declares any more. A row carries `ref` whole — `"myapp/beta"` — rather than split into
-`namespace` and `profile` the way the record does. Nothing rejects a ledger key a
-hand-edit invented, so a row may name something that is not a legal `namespace/name` at
-all, and `crom doctor` reports it rather than refusing it.
+crom's port ledger, `reservations`, the rows in it, and `staging`, the half-built profile
+copies an interrupted seed left behind. The path is in the answer because editing that
+file by hand is the only way to release a single reservation no config declares any more.
+A row carries `ref` whole — `"myapp/beta"` — rather than split into `namespace` and
+`profile` the way the record does. Nothing rejects a ledger key a hand-edit invented, so a
+row may name something that is not a legal `namespace/name` at all, and `crom doctor`
+reports it rather than refusing it.
 
 A row also carries `standing`, where the reservation stands against the config the ledger
 names as its source, and `finding`, the sentence behind that verdict — it names the
@@ -177,6 +178,33 @@ every checked-in `.mcp.json` and `CDP_URL` pointing at the number breaks with it
 will not call a reservation orphaned on evidence it could not read: an absent config
 declares nothing, which is an answer, while a config that will not parse might still
 declare the profile, which is not.
+
+`staging` is the other leak crom looks for, and it costs disk rather than ports. Seeding
+builds the copy beside the profile's final path and moves it into place only once the copy
+is whole, so a `crom up` killed mid-copy — SIGKILL, a machine losing power — leaves the
+half-built copy sitting there. Nothing afterwards looks wrong: the directory is
+dot-prefixed, so `ls` hides it, and the next `crom up` seeds again and succeeds. Two
+interrupted runs against a 234 MB seed left 350 MB behind on one machine before anything
+reported it.
+
+An element is either a directory crom found — `namespace`, `path` and `bytes` — or a
+namespace it could not look under, `namespace` and `error`. That is the same split
+`crom list` gives, and it is read the same way: check for `error` first. `bytes` counts
+the regular files under the directory, which is what deleting it would reclaim; a symlink
+counts as the link rather than as its target, since deleting the directory leaves the
+target where it is.
+
+A namespace goes unscanned when crom does not know where it keeps its profile directories.
+That address comes from the namespace's own config, which may set `state_dir` to move them
+somewhere else, so a config that will not load takes the address with it — and reporting
+nothing found would be a guess dressed as a clean bill of health. A config that is simply
+gone is not one of those cases: a file that is not there sets no `state_dir`, so crom
+checks its default profile root and answers for real.
+
+A seed running right now has a staging directory too, and `crom doctor` reports that one
+as well. The evidence on disk is identical, and crom does not try to tell them apart; the
+copy still in flight moves into place the moment it is whole, and the row for it goes with
+it.
 
 `crom --version` prints the version alone on one line, so a script reads it without
 splitting a sentence. It reports the crom you have installed rather than any checkout you
@@ -285,6 +313,7 @@ crom port [REF]               print the port
 crom env [REF]                print shell exports
 crom mcp [REF]                write .mcp.json
 crom doctor                   every reservation in the ledger, and which ones are orphaned
+                              — and the half-built copies an interrupted seed left behind
 crom forget NAMESPACE         drop a namespace deliberately, releasing its ports
 ```
 
