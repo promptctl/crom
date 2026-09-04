@@ -1691,24 +1691,101 @@ class CliTest(unittest.TestCase):
     def test_doctor_still_finds_the_leak_of_a_project_whose_config_is_gone(self):
         """A deleted project is the case with the most left behind, not the least.
 
-        The config is what says where a namespace keeps its profiles, so losing it could
-        have meant losing the ability to look — and this is the leak that matters most,
-        since nothing will ever come back to clean it up. A config that is not there
-        declared no `state_dir`, which is an answer: crom's default root is where those
-        profiles are, the same conclusion `config.parse` reaches for a config that simply
-        omits the key. It is reported as a finding rather than as a namespace crom could
-        not check, which is the line `unchecked` draws for reservations.
+        Nothing will ever come back to clean this one up, so declining to look would be
+        the worst place to decline. The config is what names a namespace's profile root,
+        and losing it does not move the bytes: they are under crom's default root unless
+        that config said otherwise, so the scan runs and reports what is genuinely there.
+
+        Both halves are asserted because either alone is a lie. Without the finding, a
+        real leak goes unnamed; without the caveat, finding none would read as proof there
+        are none — see the sibling test for the arrangement that makes that difference
+        observable. [LAW:no-silent-failure]
         """
         self._interrupted_seed(
             f'namespace = "myapp"\n\n[profiles.dev]\nseed = "{self.root / "seed"}"\n'
         )
-        (self.project / ".crom.toml").unlink()
+        config_file = self.project / ".crom.toml"
+        config_file.unlink()
 
         found = self._staging()
 
-        self.assertEqual(1, len(found), found)
-        self.assertEqual(state_home() / "profiles" / "myapp", Path(found[0]["path"]).parent)
-        self.assertEqual(4096, found[0]["bytes"])
+        leaked = [item for item in found if "path" in item]
+        self.assertEqual(1, len(leaked), found)
+        self.assertEqual(state_home() / "profiles" / "myapp", Path(leaked[0]["path"]).parent)
+        self.assertEqual(4096, leaked[0]["bytes"])
+        self.assertIn(f"{config_file} is gone", [item.get("error") for item in found][-1])
+
+    def test_doctor_will_not_call_a_deleted_config_proof_of_where_its_profiles_were(self):
+        """`state_dir` was a fact when the directories were made, and deleting the config
+        does not move them.
+
+        The reservation half may treat an absent config as a checked answer, because "does
+        anything declare this?" is a question about the present and absence settles it.
+        This question is about the past. A project that put its profiles on another volume
+        and was then deleted leaves the leak exactly where it was, and crom's default root
+        — the only one it can still name — has nothing in it. Reporting that empty scan
+        without saying what it did not cover would be a clean bill of health issued for a
+        directory nobody looked at.
+
+        The default root is asserted empty as well as the caveat present. Without it this
+        passes against a doctor that reports the caveat and also, wrongly, a finding.
+        [LAW:verifiable-goals]
+        """
+        elsewhere = self.root / "volume"
+        self._interrupted_seed(
+            f'namespace = "myapp"\nstate_dir = "{elsewhere}"\n\n'
+            f'[profiles.dev]\nseed = "{self.root / "seed"}"\n'
+        )
+        config_file = self.project / ".crom.toml"
+        config_file.unlink()
+
+        found = self._staging()
+
+        self.assertTrue(any((elsewhere / "myapp").iterdir()))  # the leak is still there
+        self.assertEqual([], [item for item in found if "path" in item])
+        self.assertIn(f"{config_file} is gone", found[0]["error"])
+        self.assertIn("state_dir", found[0]["error"])
+
+    def test_doctor_will_not_read_a_profile_root_it_cannot_list_as_empty(self):
+        """The one arm that turns a filesystem refusal into an answer, held open.
+
+        A root crom cannot list yields no directories, and so does a root with nothing in
+        it — the same value for two facts, if the failure is allowed to pass. This is the
+        distinction the whole module is built to keep, and it is the arm a later refactor
+        would collapse into the `FileNotFoundError` case without any test noticing.
+
+        A regular file where the root belongs rather than `chmod 0`, which does not stop a
+        suite running as root, or a patched `iterdir`, which would make this a statement
+        about the mock. `NotADirectoryError` is an `OSError` that is not
+        `FileNotFoundError`, which is exactly the branch under test, and `locking.exclusive`
+        already names this state as one that occurs.
+        """
+        (self.project / ".crom.toml").write_text('namespace = "myapp"\n\n[profiles.dev]\n')
+        self.crom("list")
+        root = state_home() / "profiles"
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "myapp").write_text("not a directory")
+
+        found = self._staging()
+
+        self.assertEqual([], [item for item in found if "path" in item])
+        self.assertIn(f"{root / 'myapp'} could not be read", found[0]["error"])
+        self.assertIn("1 namespace(s) crom could not check", self.crom("doctor"))
+
+    def test_doctor_claims_no_uncertainty_about_where_personal_profiles_live(self):
+        """The first `crom doctor` of a machine, and the row it must not print.
+
+        `config.load_user_scope` builds a `user` scope with no file behind it, rooted at
+        the default profiles root, so on a machine that has never written a user config
+        that root is crom's own live answer rather than an inference about a file that
+        went missing. A project config that is gone earns a caveat for exactly the reason
+        this one does not, and treating the two absences alike would put "crom could not
+        check this" on every fresh machine, about the namespace crom is surest of.
+        """
+        self.assertFalse(user_config_file().exists())
+
+        self.assertEqual([], self._staging())
+        self.assertIn("0 namespace(s) crom could not check", self.crom("doctor"))
 
     def test_doctor_will_not_report_a_clean_root_for_a_config_it_could_not_read(self):
         """"Nothing is leaking" and "I could not check" are different answers.

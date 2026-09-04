@@ -260,12 +260,42 @@ class _Read:
 
 @dataclass(frozen=True)
 class _Gone:
-    """A config that is not there — which is an answer, not a gap."""
+    """A project config that is not there.
+
+    What it declares is settled — a file that is not there declares nothing — and where
+    it kept its profiles is not. `state_dir` was a fact when the directories were made,
+    and deleting the file does not move the bytes; the two questions are settled by
+    absence to different degrees, which is why this is a separate outcome from `_Read`
+    and not a `_Read` with an assumed root.
+    """
 
     config: Path
 
     def standing(self, ref: str) -> Standing:
         return Orphaned(f"{self.config} no longer exists")
+
+
+@dataclass(frozen=True)
+class _Fileless:
+    """The user config, on a machine that has never written one.
+
+    `config.load_user_scope` builds a `user` scope with no file behind it, rooted at
+    `default_profiles_root()`, so where personal profiles live is crom's own live answer
+    rather than a guess about a config that went missing. Distinct from `_Gone` for that
+    reason alone: treating the two alike would put a "crom could not check this" row on
+    the first `crom doctor` of every machine, about the one namespace crom is surest of.
+
+    The residue is a user config that *was* written, set a `state_dir`, and was then
+    deleted — indistinguishable from one never written, and scanned here at the default
+    root without the caveat a project in that position gets. It is narrow, and it is not
+    silent: every reservation that file sourced reports `orphaned` naming it, so the
+    reader is already looking at the file that went missing.
+    """
+
+    config: Path
+
+    def standing(self, ref: str) -> Standing:
+        return Orphaned(f"{self.config} does not exist")
 
 
 @dataclass(frozen=True)
@@ -278,7 +308,7 @@ class _Unread:
         return Unchecked(self.why)
 
 
-def _consult(source: str | None) -> _Read | _Gone | _Unread:
+def _consult(source: str | None) -> _Read | _Gone | _Fileless | _Unread:
     """Read one recorded config, or say why crom could not.
 
     Keys are *composed* through `ProfileRef` rather than ledger keys being taken apart.
@@ -290,9 +320,10 @@ def _consult(source: str | None) -> _Read | _Gone | _Unread:
     it costs nothing extra: a config that has renamed its own namespace stops producing
     the old key, which is exactly the orphan it now is. [LAW:types-are-the-program]
 
-    A config that is not there has been checked, and its answers follow from its absence:
-    it declares nothing, and it overrides nothing. A config crom cannot load has not been
-    checked at all — see `Unchecked` for why the two must never collapse.
+    A config that is not there declares nothing, which is an answer — see `Unchecked` for
+    why that must never collapse into the unloadable case, which answers nothing at all.
+    Absence divides once more here than it does for declarations, because the `user`
+    scope exists without a file and a project scope does not: see `_Fileless`.
 
     `OSError` beside `CromError` because `load_file` guards `is_file` and then reads: a
     config whose permissions were changed, or which turned into a directory between the
@@ -302,15 +333,16 @@ def _consult(source: str | None) -> _Read | _Gone | _Unread:
     if source is None:
         return _Unread("the ledger records no config for it")
     config = Path(source)
-    if not config.is_file():
-        return _Gone(config)
     # The `user` namespace is a property of the path crom fixed, never of the file's
-    # contents — `parse` refuses a user config that names one — so it is supplied here
+    # contents — `parse` refuses a user config that names one — so it is supplied below
     # exactly as `load_user_scope` supplies it. Without it every personal profile read
     # `unchecked`, on a config that was missing the one key it may not have. The split is
     # a value the same call takes either way, not a second way of loading a config.
-    # [LAW:dataflow-not-control-flow]
+    # [LAW:dataflow-not-control-flow] The same test decides which absence this is, because
+    # it is the same fact: this path is one crom composes, not one it was told.
     namespace = USER_NAMESPACE if config == user_config_file() else None
+    if not config.is_file():
+        return _Fileless(config) if namespace else _Gone(config)
     try:
         scope = load_file(config, namespace=namespace)
     except (CromError, OSError) as e:
@@ -327,8 +359,10 @@ def _consult(source: str | None) -> _Read | _Gone | _Unread:
     )
 
 
-def _staging(namespace: str, consulted: _Read | _Gone | _Unread) -> tuple[Staged | Unscanned, ...]:
-    """Look under one namespace's profile root, or say why crom could not.
+def _staging(
+    namespace: str, consulted: _Read | _Gone | _Fileless | _Unread
+) -> tuple[Staged | Unscanned, ...]:
+    """Look under one namespace's profile root, and say what the looking did not cover.
 
     The root is `profiles_root / namespace` — the same composition `resolve.resolve_spec`
     makes, so this looks exactly where crom would have put the profile rather than
@@ -336,19 +370,35 @@ def _staging(namespace: str, consulted: _Read | _Gone | _Unread) -> tuple[Staged
     from the config that index names, which is what settles a config that renamed itself:
     its old namespace's directories are still under the root that config uses today.
 
-    A config that is gone declared no `state_dir`, so the default root is where its
-    profiles are — the same answer `config.parse` gives for a config that simply omits the
-    key, and the same one `load_user_scope` gives a machine with no user config at all, so
-    the personal namespace needs no case of its own here. An unloadable config may name a
-    `state_dir` crom never read, and guessing the default would turn "somewhere I could
-    not look" into a clean bill of health for a directory nobody checked.
-    [LAW:no-silent-failure]
+    The four outcomes are three states of knowledge, and the middle one is why finding and
+    saying-so are not alternatives here. A config crom read names the root outright. A
+    config crom could not load names nothing, so there is no root and no scan. A *deleted*
+    project config sits between them: `state_dir` was a fact when the directories were
+    made and deleting the file did not move the bytes, so the default root is where they
+    are unless that config said otherwise — and crom can no longer ask. Scanning it
+    reports every leak genuinely there; the caveat beside it is what stops finding none
+    from reading as proof there are none. Answering only one of those two discards a true
+    finding or claims a completeness crom does not have. [LAW:no-silent-failure]
+
+    The fileless user config takes the scan without the caveat, because the root there is
+    not an inference about a lost file — `load_user_scope` roots a `user` scope at the
+    default with no file in the picture at all.
     """
     match consulted:
         case _Read(profiles_root=root):
             return _leaks(namespace, root / namespace)
-        case _Gone():
+        case _Fileless():
             return _leaks(namespace, default_profiles_root() / namespace)
+        case _Gone(config=config):
+            root = default_profiles_root() / namespace
+            return (
+                *_leaks(namespace, root),
+                Unscanned(
+                    namespace,
+                    f"{config} is gone, so crom checked {root} — a state_dir that config "
+                    f"declared would have put them somewhere crom can no longer name",
+                ),
+            )
         case _Unread(why=why):
             return (Unscanned(namespace, why),)
 
