@@ -139,6 +139,13 @@ in a config and in your shell, and `CROM_REF` is the joined `namespace/name`.
 }
 ```
 
+Two commands add a key to that record. `crom restart --json` adds `stopped`, the pids it
+killed, which is empty when the profile was not running — that is the one distinction the
+command exists to report, and the record alone cannot carry it because the record
+describes the profile rather than the act. `crom show --json` adds `started`, whether it
+had to launch the browser first, and `windows`, how many came forward — zero for a
+headless profile, which is raised successfully and simply has no window to show for it.
+
 `crom list --json` gives an array, but not every element has that shape. A profile that
 could not be resolved appears as `{"namespace", "profile", "ref", "error"}`, and with
 `--all` a namespace whose config file is gone appears as `{"namespace", "error"}`. That
