@@ -17,6 +17,7 @@ import shutil
 import tempfile
 import unittest
 from dataclasses import replace
+from itertools import takewhile
 from pathlib import Path
 from unittest import mock
 
@@ -26,6 +27,26 @@ from crom import cli, config, configwrite, mcp
 from crom.config import load_ambient
 from crom.model import Conflict, CromError, ProfileRef, Reason
 from crom.paths import state_home, user_config_file
+
+# README.md is the only place a reader learns the failure envelope's vocabulary, so it
+# holds two enumerations the code owns. Located from this file rather than from the
+# working directory, so the suite reads the same README wherever it is run from.
+_README = Path(__file__).resolve().parent.parent / "README.md"
+
+
+def _readme_names(fragment: str) -> tuple[str, ...]:
+    """The names in one README fragment — a table cell, or one side of a sentence.
+
+    Backticks are required rather than merely stripped, which is what makes this a parse
+    and not a scrape: the prose around these fragments is full of backticked words that
+    are not names — `null`, `CROM_CONFIG`, `crom init`, `user/default` — so a fragment
+    that has drifted into prose fails here instead of yielding a name with punctuation
+    stuck to it. [LAW:parse-dont-validate]
+    """
+    ticked = tuple(re.split(r",\s*|\s+and\s+", fragment.strip()))
+    names = tuple(name.strip("`") for name in ticked)
+    assert ticked == tuple(f"`{name}`" for name in names), f"not a list of names: {fragment!r}"
+    return names
 
 
 class CliTest(unittest.TestCase):
@@ -2439,6 +2460,77 @@ class CliTest(unittest.TestCase):
                         "message": "no ambient config",
                     },
                 )
+
+    def test_the_readme_table_of_fields_matches_what_each_reason_carries(self):
+        """The `fields` schema is published twice — once in `Reason`, once in a table a
+        reader has no other way to discover — so the copy is held to the original.
+
+        A duplicated enumeration that nothing checks drifts on a schedule, and this repo
+        has already paid for one: a comment listing the config keys quietly stopped
+        naming `flags`, and stayed plausible for as long as nobody compared it. This
+        table cannot be deleted the way that comment could, so it is guarded instead.
+        [LAW:one-source-of-truth]
+
+        One equality carries the contract in both directions. A reason that gains fields
+        and never reaches the README fails here; so does a row for a reason that lost
+        them, a field renamed on one side only, and a row naming the right fields in the
+        wrong order — `Reason.error` builds the envelope's key order out of `carries`, so
+        the order printed in the table is the order a caller will actually receive.
+        """
+        readme = _README.read_text().splitlines()
+        # `index` rather than a search that can come back empty: a table renamed, moved
+        # or deleted has to fail here, not leave the loop below with nothing to walk and
+        # a passing test to show for it. [LAW:no-silent-failure]
+        start = readme.index("| reason | carries | what those hold |") + 2
+
+        tabled = {}
+        for row in takewhile(lambda line: line.startswith("|"), readme[start:]):
+            # Split into cells first and read only the second. Column three is prose
+            # carrying backticks of its own, so a sweep for backticks across the whole
+            # row would come back with `null` and `CROM_CONFIG` as field names.
+            reason, carries, _prose = row.strip().strip("|").split("|")
+            (slug,) = _readme_names(reason)
+            tabled[slug] = _readme_names(carries)
+
+        # A parse that found no rows would compare empty against empty on the day the
+        # last reason stops carrying anything — an answer-shaped void wearing a green
+        # test as a costume. [LAW:parse-dont-validate]
+        self.assertTrue(tabled, "the fields table is gone from README.md")
+        self.assertEqual(tabled, {reason.value: reason.carries for reason in Reason if reason.carries})
+
+    def test_the_readme_names_exactly_the_commands_that_take_json(self):
+        """The other enumeration a reader cannot get anywhere else: which commands answer
+        `--json` at all, and which never will.
+
+        Both halves are asserted because each goes stale in its own way. A new command
+        carrying the flag and missing from the first list leaves a caller not knowing it
+        may parse that command's answer; a new command *without* the flag and missing
+        from the second leaves the sentence claiming to be exhaustive when it is not. The
+        second list is derived by subtracting the first from the same group, so what the
+        commands are is read once. [LAW:one-source-of-truth]
+
+        Both come from click and never from a literal here. Names written into this file
+        would be a third copy of the fact the test exists to keep at two, green for
+        exactly as long as nobody touched the CLI. [LAW:behavior-not-structure]
+        """
+        commands = set(cli.main.list_commands(None))
+        offering = {
+            name
+            for name in commands
+            if any("--json" in option.opts for option in cli.main.get_command(None, name).params)
+        }
+        # The sentence is wrapped across lines in the file, so whitespace is normalised
+        # before it is matched. Either side admits only a backticked list, so the search
+        # cannot begin early at some unrelated backtick and swallow the prose between.
+        sentence = re.search(
+            r"(`\w+`(?:(?:, | and )`\w+`)*) take the flag; "
+            r"(`\w+`(?:(?:, | and )`\w+`)*) answer in prose only\.",
+            " ".join(_README.read_text().split()),
+        )
+        self.assertIsNotNone(sentence, "README.md no longer says which commands take --json")
+
+        self.assertEqual(set(_readme_names(sentence[1])), offering)
+        self.assertEqual(set(_readme_names(sentence[2])), commands - offering)
 
     # --- crom's own version ----------------------------------------------------------
 
