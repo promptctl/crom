@@ -333,10 +333,10 @@ class MalformedConfigTest(unittest.TestCase):
 class WriteFailureTest(unittest.TestCase):
     """A filesystem that refuses the write is a `CromError`, not a traceback.
 
-    `CromGroup.invoke` catches only `CromError`, so a full disk or a read-only mount used
-    to escape the CLI's exit-code contract entirely. `migrate.run` reaches `_save` through
-    `ensure_profile` before anything else in `main`, which made that traceback every
-    command rather than one.
+    `_save` writes a `.tmp` and `os.replace`s it, so the raw failure names the temp file
+    and `_writing` reports the one the user has. `migrate.run` reaches `_save` through
+    `ensure_profile` before anything else in `main`, which made a full disk or a read-only
+    mount a failure of every command rather than of one.
     """
 
     def setUp(self):

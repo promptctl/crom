@@ -240,8 +240,8 @@ def _bootstrap_user_config() -> None:
     # `ensure_profile`, not `add_profile`: the goal is that the declaration *exist*, not
     # that this process be the one to write it. On a fresh machine two crom invocations
     # both find no user config and both try; `add_profile` raises FileExistsError at the
-    # loser, which is not a CromError and so escapes the CLI's exit-code contract as a
-    # traceback. Converging makes the race a no-op instead of an error to catch.
+    # loser — a reported failure for a race that harmed nothing. Converging makes it a
+    # no-op instead of an error to catch.
     configwrite.ensure_profile(
         user_config_file(),
         ProfileSpec(name="default", seed=DEFAULT_SEED),
@@ -1358,8 +1358,8 @@ def _delete_profile_data(profile: ResolvedProfile) -> None:
     """Remove a profile's user-data-dir, as a `CromError` rather than a traceback.
 
     `shutil.rmtree` raises a bare `OSError` — `FileNotFoundError` for an entry that
-    vanishes mid-walk, `ENOTEMPTY` for one that appears — and `CromGroup.invoke` catches
-    only `CromError`, so those escaped the CLI's exit-code contract entirely. That became
+    vanishes mid-walk, `ENOTEMPTY` for one that appears — and the path alone does not say
+    that the profile is still declared. That became
     reachable when `rm` started stopping the browser itself instead of refusing: a Chrome
     helper outliving `chrome.kill` can still be writing here for a moment.
 
@@ -1382,9 +1382,8 @@ def _human_size(directory: Path) -> str:
     counting the target's size would overstate what is about to be lost — and a dangling
     link would raise rather than measure. Only the profile's own regular files count.
 
-    A file that vanishes mid-walk is skipped. A raw `OSError` here is not a `CromError`,
-    so it would escape the CLI's exit-code contract as a traceback — thrown by a prompt
-    whose only job is to be helpful before a destructive act.
+    A file that vanishes mid-walk is skipped, rather than failing a prompt whose only job
+    is to be helpful before a destructive act.
 
     `os.walk(followlinks=False)` states the no-following guarantee at the call site.
     `rglob` happens to behave the same way on 3.12, but that is a property of pathlib's

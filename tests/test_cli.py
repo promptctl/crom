@@ -1650,9 +1650,8 @@ class CliTest(unittest.TestCase):
     def test_the_size_prompt_counts_only_what_the_delete_reclaims(self):
         """`_human_size` measures what removing the directory frees, so a symlink's
         target — which is not deleted — must not be counted, and a dangling link must
-        not raise. A raw OSError from a mid-walk `stat` is not a CromError either, so it
-        would escape the exit-code contract as a traceback from a helper whose only job
-        is to be informative before a destructive act."""
+        not raise — this helper's only job is to be informative before a destructive
+        act, and a failure to measure is not a reason to refuse the delete."""
         directory = self.root / "profile"
         (directory / "sub").mkdir(parents=True)
         (directory / "sub" / "real.bin").write_bytes(b"x" * 2048)
@@ -1672,8 +1671,7 @@ class CliTest(unittest.TestCase):
         `chrome.kill` — so `rmtree` can raise on a directory still being written. When
         the delete ran last, that failure left a half-removed directory belonging to a
         profile no command could name: `rm` resolves by name first, so the retry it
-        suggests was impossible. It also escaped as a traceback, since a bare `OSError`
-        is not a `CromError`.
+        suggests was impossible.
         """
         self.crom("init")
         self.crom("add", "ci")

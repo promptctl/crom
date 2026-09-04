@@ -151,8 +151,9 @@ def scan() -> dict[str, tuple[int, ...]]:
     # main browser from helper processes.
     # This became the single process-table reader in this design, which concentrates the
     # benefit and the failure alike: `list`, `up`, `down`, `rm`, `config` and migration
-    # all arrive here, so a raw `CalledProcessError` or a missing `ps` would escape the
-    # exit-code contract from every one of them. [LAW:no-silent-failure]
+    # all arrive here, so a raw `CalledProcessError` would escape the exit-code contract
+    # from every one of them, and a missing `ps` would name the file and not the reason.
+    # [LAW:no-silent-failure]
     try:
         result = subprocess.run(
             ["ps", "-Ao", "pid=,command="],
@@ -561,8 +562,8 @@ def _port_is_free(port: int) -> bool:
             except OSError:
                 return False
     except OSError as e:
-        # [LAW:no-silent-failure] `kill` reaches here too, so a raw OSError would leave
-        # `down` and `rm` outside the CLI's exit-code contract as a traceback.
+        # [LAW:no-silent-failure] `kill` reaches here too, so `down` and `rm` inherit this
+        # sentence rather than a bare errno naming no port.
         raise CromError(f"could not check whether port {port} is free: {e}") from e
     return True
 
@@ -752,9 +753,8 @@ def launch(profile: ResolvedProfile) -> tuple[int, ...]:
             )
         except OSError as e:
             # `config` checks an explicit `chrome_binary` at parse time, so reaching here
-            # means the binary moved or lost its permissions between then and now. Raised
-            # as a CromError so it lands inside the CLI's exit-code contract rather than
-            # escaping as a raw traceback. [LAW:no-silent-failure]
+            # means the binary moved or lost its permissions between then and now — which
+            # the command below says and a bare errno does not. [LAW:no-silent-failure]
             raise CromError(
                 f"could not start Chrome for '{profile.ref}': {e}\nCommand was: {command}"
             ) from e
@@ -946,9 +946,9 @@ def kill(profile: ResolvedProfile) -> tuple[int, ...]:
     delete a directory on: `os.kill` returns before the kernel has finished tearing the
     process down, and this used to return inside that window. `shutil.rmtree` walking a
     directory Chrome is still writing raises `FileNotFoundError` when an entry vanishes
-    mid-walk or `ENOTEMPTY` when one appears — neither a `CromError`, so it escaped the
-    CLI's exit-code contract as a traceback, after `rm` had already undeclared the
-    profile. [LAW:no-ambient-temporal-coupling] a transition `rm` depends on is owned
+    mid-walk or `ENOTEMPTY` when one appears — reported after `rm` had already undeclared
+    the profile, so the retry it named was impossible. [LAW:no-ambient-temporal-coupling]
+    a transition `rm` depends on is owned
     here rather than assumed to have completed by the time the caller looks.
 
     The port is half of that postcondition, and the half nobody owned. `up` after a `down`

@@ -448,8 +448,8 @@ def _parse_chrome_binary(raw, source: Path, config_dir: Path) -> Path:
     Checked for existence and executability here rather than discovered at `Popen`:
     `browser.py` promises crom names the paths it tried "rather than failing later inside
     Popen with a bare ENOENT", and that promise held only for the auto-detected path. A
-    typo'd `chrome_binary` used to surface as a raw `FileNotFoundError` traceback,
-    outside the CLI's exit-code contract entirely.
+    typo'd `chrome_binary` used to surface as a bare ENOENT out of `Popen`, naming
+    nothing the user had written.
     """
     if raw is None:
         return find_chrome()
