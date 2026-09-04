@@ -1,15 +1,18 @@
 """Read the state crom owns on this machine, and say where it has leaked.
 
-Two leaks, two questions, one command. A port reservation is judged against the config
-the ledger records as its source — `registry` owns the ledger, `config` owns the
-declarations, and they are two maps of one territory. A staging directory is a second
+Three questions, one command. A port reservation is judged against the config the ledger
+records as its source — `registry` owns the ledger, `config` owns the declarations, and
+they are two maps of one territory. It is judged again, independently, against the
+machine: crom promises a port that never moves, but only `crom up` checks that the port
+is still crom's, so a reservation whose number a stranger now holds is a promise `crom
+port`, `crom env` and `crom mcp` keep handing out. And a staging directory is a third
 kind of leak entirely: `seed._staged` builds a profile beside its final path and moves it
 in only once it is whole, so a process killed between those two moments leaves the
 half-built copy behind under the namespace's profile root, dot-prefixed and therefore
 hidden from `ls`.
 
-This module sits above `registry`, `config` and `seed` rather than inside any of them, so
-none has to learn about the others to answer a question only `crom doctor` asks.
+This module sits above `registry`, `config`, `chrome` and `seed` rather than inside any of
+them, so none has to learn about the others to answer a question only `crom doctor` asks.
 [LAW:decomposition]
 
 Nothing here writes, and nothing here raises for a config it dislikes or a directory it
@@ -26,9 +29,9 @@ from pathlib import Path
 from stat import S_ISREG
 from typing import ClassVar
 
-from . import migrate, registry
+from . import chrome, migrate, registry
 from .config import load_file
-from .model import USER_NAMESPACE, CromError, ProfileRef, namespace_of
+from .model import USER_NAMESPACE, CromError, ProfileRef, namespace_of, ref_of
 from .paths import default_profiles_root, registry_file, user_config_file
 from .registry import Reservation
 
@@ -82,25 +85,107 @@ class Unchecked:
 Standing = Declared | Orphaned | Unchecked
 
 
+# --- the four livenesses ------------------------------------------------------------
+# A second axis on the same row, and deliberately not a fourth `Standing`. A standing
+# answers whether some config still *declares* a ledger key; this answers who holds its
+# *port* right now. They are independent — a perfectly declared reservation can have a
+# stranger on its port, and one nothing declares can have nothing on it — so folding them
+# into one enum would make "declared but stolen" unrepresentable, which is the only state
+# here anyone has to act on. [LAW:types-are-the-program]
+#
+# Same shape as the standings for the same reasons: a class per verdict, so the slug and
+# the sentence cannot be paired wrongly, and `finding` on all four, so a caller renders a
+# row without asking which it holds. [LAW:dataflow-not-control-flow]
+
+
+@dataclass(frozen=True)
+class Idle:
+    """Nothing holds the port, which is the ordinary state of a profile that is not up."""
+
+    slug: ClassVar[str] = "idle"
+    finding: str
+
+
+@dataclass(frozen=True)
+class OwnBrowser:
+    """The port is held, and this profile's own Chrome is running against its directory.
+
+    Evidence rather than proof, and worded as such: crom knows something holds the port
+    and knows its browser is up, and infers the one is the other. A listening socket
+    belongs to a file description rather than to a process, so the pairing is an inference
+    — but it is the same one `chrome._still_held` makes in reverse when it waits for both
+    halves to end, and a machine where it is wrong has a stranger *and* the browser, which
+    no single row could describe anyway.
+    """
+
+    slug: ClassVar[str] = "own"
+    finding: str
+
+
+@dataclass(frozen=True)
+class Foreign:
+    """The port is held, and nothing crom launched for this profile is running.
+
+    The one verdict here anyone has to act on. Crom promises a port that never moves, but
+    `crom port`, `crom env` and `crom mcp` hand the number out with no liveness check —
+    only `crom up` verifies, through `chrome._require_port_available` — so a tool wired by
+    `crom mcp` connects to whatever is on the port, and a stranger there is a stranger it
+    drives.
+    """
+
+    slug: ClassVar[str] = "foreign"
+    finding: str
+
+
+@dataclass(frozen=True)
+class Unprobed:
+    """Crom could not tell who holds the port, and why.
+
+    Doubles as the *evidence* gap, not just the verdict: `_liveness` takes each probe as
+    the answer or as one of these, and hands the reason straight back out unchanged. That
+    is the whole of it — a probe crom could not put has already written the row it
+    produces, so there is no second type to translate into. [LAW:polishing-by-subtraction]
+
+    Never a quieter `Idle`, for the reason `Unchecked` is never a quieter `Orphaned`: a
+    reader acts on `idle` by taking the port for something else, and doing that on the
+    strength of a probe crom never got an answer from is how two processes end up on one
+    number. [LAW:no-silent-failure]
+    """
+
+    slug: ClassVar[str] = "unprobed"
+    finding: str
+
+
+Liveness = Idle | OwnBrowser | Foreign | Unprobed
+
+
 @dataclass(frozen=True)
 class Row:
-    """One ledger reservation, and what crom found when it checked the config for it."""
+    """One ledger reservation, what the config says about it, and who holds its port."""
 
     ref: str
     held: Reservation
     standing: Standing
+    liveness: Liveness
 
     def describe(self) -> dict:
-        """The published row: the ledger's own fields, then crom's finding about them.
+        """The published row: the ledger's own fields, then crom's findings about them.
 
         Built on `Reservation.describe` rather than beside it, so the fields the ledger
         publishes keep one owner and cannot drift from what it actually holds.
         [LAW:one-source-of-truth]
+
+        The second verdict's sentence is prefixed where the first one's is not, because
+        `finding` was already published as the standing's and a key means one thing
+        forever. A row carries two verdicts now, and only one of them can be the unnamed
+        one.
         """
         return {
             **self.held.describe(ref=self.ref),
             "standing": self.standing.slug,
             "finding": self.standing.finding,
+            "liveness": self.liveness.slug,
+            "liveness_finding": self.liveness.finding,
         }
 
 
@@ -215,6 +300,13 @@ def survey() -> Survey:
     namespace has no root to look under and reports as one crom could not check, which is
     an answer; a `Path` could not have held the case at all.
 
+    Every row carries a second, independent verdict: who holds its port right now. The
+    process table is read once for the whole survey and the port probed once per row, and
+    both answers are decided against the same configs the standings are — a profile
+    directory crom can only name from a config it actually read. The two axes never fold
+    into one another: a reservation a config still declares can have a stranger on its
+    port, and one nothing declares can be sitting idle. [LAW:types-are-the-program]
+
     The same hand repair can leave a key that names no namespace, which `model.namespace_of`
     answers with `None` rather than a segment that would send the scan out of the profile
     root. Those keys leave the scan set and stay in `rows` — `consulted` covers every
@@ -240,10 +332,16 @@ def survey() -> Survey:
         for namespace, source in sorted(namespaces.items())
         for item in _staging(namespace, consulted[source])
     )
+    running = _running()
     return Survey(
         registry=registry_file(),
         rows=tuple(
-            Row(ref, held, consulted[held.source].standing(ref))
+            Row(
+                ref,
+                held,
+                consulted[held.source].standing(ref),
+                _liveness(held.port, consulted[held.source].profile_dir(ref), running),
+            )
             for ref, held in sorted(ledger.items(), key=lambda entry: (entry[1].port, entry[0]))
         ),
         # Split here and nowhere else. The scan produces the two kinds interleaved by
@@ -284,6 +382,30 @@ class _Read:
             return Declared(f"{self.config} declares it")
         return Orphaned(f"{self.config} no longer declares it")
 
+    def profile_dir(self, ref: str) -> Path | Unprobed:
+        """Where this key's browser would be running, or why crom cannot name it.
+
+        Composed from the *ledger key* rather than from `declares`, because a reservation
+        nothing declares any more can still have a live browser on its directory — that is
+        precisely a profile dropped from the config while its Chrome kept running, and
+        answering from the declarations would report the user's own browser as a stranger.
+        The root is still this config's, which is what settles a config that renamed its
+        namespace: the old namespace's directories are under the root that config uses
+        today, exactly as `_staging` reads them. [LAW:one-source-of-truth]
+
+        The key is not taken apart here. `ref_of` is the parser and a `ProfileRef` is its
+        stamp — `directory` joins two `validate_name`d components and provably lands on a
+        child of the root — so the one shape it cannot stamp is unwrapped into the row it
+        produces rather than into a guess. [LAW:parse-dont-validate]
+        """
+        parsed = ref_of(ref)
+        if parsed is None:
+            return Unprobed(
+                f"{ref!r} is not a legal namespace/name, so crom cannot name the profile "
+                f"directory a browser holding this port would be running against"
+            )
+        return parsed.directory(self.profiles_root)
+
 
 @dataclass(frozen=True)
 class _Gone:
@@ -310,6 +432,22 @@ class _Gone:
     def standing(self, ref: str) -> Standing:
         return Orphaned(f"{self.config} no longer exists")
 
+    def profile_dir(self, ref: str) -> Path | Unprobed:
+        """No answer, where `_staging` scans crom's default root and caveats the scan.
+
+        The two halves diverge here because the evidence runs opposite ways. `_leaks`
+        reports what it *found*: a staging directory under the default root really is
+        there, whatever `state_dir` this config used to set, so a guessed root can only
+        make the finding incomplete. Liveness reports what it did *not* find — no browser
+        on the directory — and a negative drawn from a directory the profile may never
+        have used is not a weaker finding but a false one, and the verdict it would print
+        is `foreign`, the loudest thing this command says. [LAW:no-silent-failure]
+        """
+        return Unprobed(
+            f"{self.config} is gone, so crom cannot name where it kept its profiles — a "
+            f"state_dir it declared would have put them somewhere crom can no longer name"
+        )
+
 
 @dataclass(frozen=True)
 class _Unread:
@@ -319,6 +457,9 @@ class _Unread:
 
     def standing(self, ref: str) -> Standing:
         return Unchecked(self.why)
+
+    def profile_dir(self, ref: str) -> Path | Unprobed:
+        return Unprobed(self.why)
 
 
 def _consult(source: str | None) -> _Read | _Gone | _Unread:
@@ -367,6 +508,98 @@ def _consult(source: str | None) -> _Read | _Gone | _Unread:
         declares=frozenset(str(ProfileRef(scope.namespace, name)) for name in scope.profiles),
         profiles_root=scope.profiles_root,
     )
+
+
+# --- asking who holds a port --------------------------------------------------------
+# Two probes, and each answers with the fact or with the row it already knows crom will
+# have to print. `Unprobed` is the return type of a probe that could not run *and* the
+# verdict for a row it could not decide, because those are one thing: the reason a probe
+# went unanswered is exactly the sentence the row wants. [LAW:polishing-by-subtraction]
+
+
+def _held(port: int) -> bool | Unprobed:
+    """Whether anything currently holds this port.
+
+    `chrome.port_is_free` and not a connect: binding is the question a launch puts to the
+    kernel, and the two part company whenever a socket outlives whoever was serving
+    through it. Asking the other one would let this call a port free that `crom up` then
+    refuses. [LAW:one-source-of-truth]
+
+    A probe socket that cannot be made at all is not a fact about the port, and `crom
+    doctor` is exactly the command that must not raise for a machine it dislikes.
+    """
+    try:
+        return not chrome.port_is_free(port)
+    except CromError as e:
+        return Unprobed(str(e).split("\n", 1)[0])
+
+
+def _own(
+    directory: Path | Unprobed, running: dict[str, tuple[int, ...]] | Unprobed
+) -> bool | Unprobed:
+    """Whether a Chrome crom can see is running against this profile's own directory.
+
+    The user-data-dir is the identity `chrome.scan` groups by, which is why this is asked
+    by directory rather than by port: the process table records what a browser was
+    launched *with*, and crom knows what it would have launched this profile with.
+
+    Either half can be missing, and the reason travels rather than the absence: a ledger
+    key crom cannot resolve to a directory and a `ps` that would not run are different
+    things to tell a reader, and both are things this cannot answer.
+    """
+    match directory, running:
+        case Unprobed() as unprobed, _:
+            return unprobed
+        case _, Unprobed() as unprobed:
+            return unprobed
+        case _:
+            return bool(running.get(str(directory)))
+
+
+def _running() -> dict[str, tuple[int, ...]] | Unprobed:
+    """Every Chrome crom can see, by the directory it was launched with — or why not.
+
+    One `ps` for the whole survey rather than one per reservation, the same bargain
+    `chrome.scan` was written for: a ledger of twenty rows costs one process scan.
+    [LAW:effects-at-boundaries] the reading happens once, at the edge, and every row below
+    is decided from the value.
+    """
+    try:
+        return chrome.scan()
+    except (CromError, OSError) as e:
+        return Unprobed(str(e).split("\n", 1)[0])
+
+
+def _liveness(
+    port: int, directory: Path | Unprobed, running: dict[str, tuple[int, ...]] | Unprobed
+) -> Liveness:
+    """Who holds one reservation's port, from two probes that both always run.
+
+    Nine pairs, five arms, and every pair lands on one: a port crom could not probe is
+    unprobed whatever else is known; a port nothing holds is idle whoever the profile is,
+    which is why that arm stands above the directory questions and answers for a ledger
+    key crom could not resolve at all; and a port something holds is named by the second
+    probe, or by the reason the second probe went unanswered.
+
+    Both probes run for every row, including the rows where one of them cannot change the
+    answer. That keeps the set of operations the same on every reservation and puts the
+    whole of the variability in the values flowing through — and it costs a dict lookup,
+    because `running` was read once for the survey. [LAW:dataflow-not-control-flow]
+    """
+    match _held(port), _own(directory, running):
+        case Unprobed() as unprobed, _:
+            return unprobed
+        case False, _:
+            return Idle(f"nothing holds port {port}")
+        case _, Unprobed() as unprobed:
+            return unprobed
+        case _, True:
+            return OwnBrowser(f"port {port} is held by this profile's own browser")
+        case _, False:
+            return Foreign(
+                f"port {port} is held by something that is not this profile's browser. "
+                f"{chrome.lsof_hint(port)}"
+            )
 
 
 def _staging(

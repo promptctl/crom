@@ -624,6 +624,17 @@ class ProfileRef:
     def __str__(self) -> str:
         return f"{self.namespace}/{self.name}"
 
+    def directory(self, profiles_root: Path) -> Path:
+        """This profile's user-data-dir under a profiles root.
+
+        A method on the ref rather than a join spelled at each site, because the ref is
+        what makes the join safe — both components are `validate_name`d above, so neither
+        can carry a separator or a `..` — and a second site spelling it could come to
+        disagree about where a profile lives while both still looked right.
+        [LAW:one-source-of-truth]
+        """
+        return profiles_root / self.namespace / self.name
+
 
 @dataclass(frozen=True)
 class ProfileSpec:
@@ -831,6 +842,36 @@ def namespace_of(ref: str) -> str | None:
     """
     namespace = ref.split("/", 1)[0]
     return namespace if _NAME_RE.fullmatch(namespace) else None
+
+
+def ref_of(key: str) -> ProfileRef | None:
+    """The reference a ledger key names, or `None` where the key is not one.
+
+    The total inverse of `ProfileRef.__str__`, and its companion is `namespace_of`, which
+    answers a deliberately weaker question: `a/b/c` names the namespace `a` — a real child
+    of the profiles root, worth scanning — while naming no profile crom could have written
+    there. Two answers because they are two questions, not because the format has two
+    readers: both are decided by `_NAME_RE`, one through `validate_name` and one through
+    the constructor below. [LAW:single-enforcer]
+
+    What comes back is the stamp `ProfileRef` exists to be: whatever `ref_of` answers,
+    `str(...)` of it is the key that went in, and `directory` will join it to a profiles
+    root and land on a child of that root. That is what lets `doctor` name where a ledger
+    key's profile lives without taking the key apart itself. [LAW:parse-dont-validate]
+
+    Total because a hand-edited ledger is the only way to release an orphaned reservation
+    today, so keys `parse_ref` raises on really do reach the commands that read the ledger
+    — and `crom doctor` is the one run *because* the ledger is a mess.
+
+    `partition` rather than `split` is what makes the constructor the whole check: a key
+    with a second `/` keeps it in the name, which `_NAME_RE` refuses, and a key with none
+    leaves the name empty, which it refuses too. Neither needs a count of the parts.
+    """
+    namespace, _, name = key.partition("/")
+    try:
+        return ProfileRef(namespace, name)
+    except CromError:
+        return None
 
 
 def parse_ref(text: str, ambient: str) -> ProfileRef:

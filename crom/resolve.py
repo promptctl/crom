@@ -277,7 +277,7 @@ def resolve_spec(scope: Scope, spec: ProfileSpec) -> ResolvedProfile:
     guarantee a type should be making instead.
     """
     ref = ProfileRef(scope.namespace, spec.name)
-    profile_dir = scope.profiles_root / ref.namespace / ref.name
+    profile_dir = ref.directory(scope.profiles_root)
     where = str(scope.source or "user config")
     # The one place the launch list is decided. Composition is by switch name, so a
     # profile's `--disable-blink-features` replaces `[defaults]`'s and `[defaults]`'s

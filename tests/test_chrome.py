@@ -258,7 +258,7 @@ class KillTest(unittest.TestCase):
         # one fact it is about. Left real, every test in this class would bind port 9300
         # on the machine running it and start failing the day something else wants it.
         # `PortIsPartOfBeingStoppedTest` covers the same wait against a genuine socket.
-        port = mock.patch.object(chrome, "_port_is_free", lambda _port: True)
+        port = mock.patch.object(chrome, "port_is_free", lambda _port: True)
         port.start()
         self.addCleanup(port.stop)
 
@@ -325,7 +325,7 @@ class KillTest(unittest.TestCase):
         freed = chain([False, False], repeat(True))
         with (
             mock.patch.object(chrome, "find_pids", side_effect=lambda p: (11,) if not self.signals else ()),
-            mock.patch.object(chrome, "_port_is_free", lambda _port: next(freed)),
+            mock.patch.object(chrome, "port_is_free", lambda _port: next(freed)),
         ):
             killed = chrome.kill(self.profile)
 
@@ -341,7 +341,7 @@ class KillTest(unittest.TestCase):
         """
         with (
             mock.patch.object(chrome, "find_pids", return_value=()),
-            mock.patch.object(chrome, "_port_is_free", lambda _port: False),
+            mock.patch.object(chrome, "port_is_free", lambda _port: False),
             self.assertRaises(CromError) as caught,
         ):
             chrome.kill(self.profile)
@@ -365,7 +365,7 @@ class PortCheckBoundaryTest(unittest.TestCase):
             mock.patch.object(chrome.socket, "socket", side_effect=OSError("too many open files")),
             self.assertRaises(CromError) as caught,
         ):
-            chrome._port_is_free(9300)
+            chrome.port_is_free(9300)
 
         # Not `PORT_IN_USE`: crom failed to *ask* whether the port was free, which is a
         # different fact from an answer of "no" and a different thing to do about it.
@@ -385,7 +385,7 @@ class PortCheckBoundaryTest(unittest.TestCase):
 class PortIsPartOfBeingStoppedTest(unittest.TestCase):
     """The same wait, against a real socket rather than a stubbed predicate.
 
-    `KillTest` stubs `_port_is_free` so its scenarios stay about the escalation. That
+    `KillTest` stubs `port_is_free` so its scenarios stay about the escalation. That
     stub is only worth anything if the real predicate is wired to a real kernel, and the
     wiring is exactly what a refactor can quietly cut without any mocked test noticing.
     """
@@ -487,7 +487,7 @@ class LaunchReadinessTest(unittest.TestCase):
             # Stubbed free for the same reason `KillTest` stubs it: left real, every
             # failing launch here would bind this port on the machine running the suite.
             # The tests about a port that will *not* come free override it.
-            mock.patch.object(chrome, "_port_is_free", lambda _port: True),
+            mock.patch.object(chrome, "port_is_free", lambda _port: True),
         ):
             patch.start()
             self.addCleanup(patch.stop)
@@ -658,7 +658,7 @@ class LaunchReadinessTest(unittest.TestCase):
             mock.patch.object(chrome, "SHUTDOWN_TIMEOUT_SECONDS", 0.2),
             mock.patch.object(chrome, "_probe_port", return_value=chrome._Answered()),
             mock.patch.object(chrome, "find_pids", lambda _profile: ()),
-            mock.patch.object(chrome, "_port_is_free", lambda _port: False),
+            mock.patch.object(chrome, "port_is_free", lambda _port: False),
             self.assertRaises(CromError) as caught,
         ):
             chrome.launch(self.profile)
@@ -703,7 +703,7 @@ class LaunchReadinessTest(unittest.TestCase):
         """A port bound but never served is still crom's to wait out.
 
         `_NeverAnswered` is reachable only while the probe keeps returning `_Silent`, so
-        nothing ever answered — but `_port_is_free` tests bindability, not answerability,
+        nothing ever answered — but `port_is_free` tests bindability, not answerability,
         and a Chrome that bound the socket and was too slow to serve `/json/version` reads
         as silence the whole way. Killing it leaves the socket in teardown, and the retry
         that follows meets `_require_port_available` blaming "another process" for residue
@@ -719,7 +719,7 @@ class LaunchReadinessTest(unittest.TestCase):
 
         with (
             mock.patch.object(chrome, "SHUTDOWN_TIMEOUT_SECONDS", 5.0),
-            mock.patch.object(chrome, "_port_is_free", port_is_free),
+            mock.patch.object(chrome, "port_is_free", port_is_free),
             mock.patch.object(chrome, "LAUNCH_TIMEOUT_SECONDS", 0.3),
             mock.patch.object(chrome, "_probe_port", return_value=chrome._Silent()),
             self.assertRaises(CromError) as caught,
@@ -745,7 +745,7 @@ class LaunchReadinessTest(unittest.TestCase):
         """
         with (
             mock.patch.object(chrome, "SHUTDOWN_TIMEOUT_SECONDS", 0.2),
-            mock.patch.object(chrome, "_port_is_free", lambda _port: False),
+            mock.patch.object(chrome, "port_is_free", lambda _port: False),
             mock.patch.object(chrome, "LAUNCH_TIMEOUT_SECONDS", 0.3),
             mock.patch.object(chrome, "_probe_port", return_value=chrome._Silent()),
             self.assertRaises(CromError) as caught,
@@ -812,7 +812,7 @@ class LaunchReadinessTest(unittest.TestCase):
         started = time.monotonic()
         with (
             mock.patch.object(chrome, "SHUTDOWN_TIMEOUT_SECONDS", 30.0),
-            mock.patch.object(chrome, "_port_is_free", lambda _port: False),
+            mock.patch.object(chrome, "port_is_free", lambda _port: False),
             mock.patch.object(
                 chrome, "_probe_port", return_value=chrome._AnsweredByStranger("HTTP 404")
             ),
