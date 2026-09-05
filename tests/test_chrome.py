@@ -1888,5 +1888,200 @@ class SingletonHolderTest(unittest.TestCase):
         self.assertIn("names host 'my-mac.local'", held)
 
 
+def health_profile(port: int, name: str = "dev", directory: str | None = None) -> ResolvedProfile:
+    """A profile identified by the two things a health reading is keyed on: dir and port."""
+    return ResolvedProfile(
+        ref=ProfileRef("myapp", name),
+        port=port,
+        profile_dir=Path(directory or f"/state/profiles/myapp/{name}"),
+        chrome_binary=Path("/chrome"),
+        argv=(),
+        env={},
+        seed=SeedFresh(),
+        source=None,
+    )
+
+
+class ReachabilityTest(unittest.TestCase):
+    """Two readings, six combinations, folded into the state a consumer acts on.
+
+    Written as the whole table rather than as the interesting rows, because the fold's
+    only job is to be total: a combination it answers nowhere returns `None` and surfaces
+    as an attribute error somewhere else entirely.
+    """
+
+    def test_nothing_running_is_stopped_whatever_the_port_says(self):
+        """A port is a fact about a port. Only pids make it a fact about this browser.
+
+        All three answers, because a browser answering on a port no process of this
+        profile's holds is somebody else's browser — reporting it as this profile's
+        `ready` would send a consumer to drive a Chrome crom does not manage.
+        """
+        for heard in (chrome._Silent(), chrome._Answered(), chrome._AnsweredByStranger("nginx")):
+            with self.subTest(heard=heard):
+                state = chrome._reachability((), heard)
+
+                self.assertEqual(state, chrome.Stopped())
+                # Spelled out rather than left to the equality above, which compares no
+                # class attributes at all: a `Stopped` that answered `running` would print
+                # `running :9226` for a profile with no process and put `"running": true`
+                # in the JSON, and every test that noticed would be a CLI test.
+                self.assertFalse(state.running)
+                self.assertEqual(state.pids, ())
+
+    def test_a_process_and_a_devtools_answer_is_ready(self):
+        state = chrome._reachability((4242,), chrome._Answered())
+
+        self.assertEqual(state, chrome.Ready((4242,)))
+        self.assertTrue(state.running)
+        self.assertEqual(state.pids, (4242,))
+
+    def test_a_process_whose_port_says_nothing_is_running_but_unreachable(self):
+        """The whole point of the epic: this used to be indistinguishable from healthy."""
+        state = chrome._reachability((4242,), chrome._Silent())
+
+        self.assertIsInstance(state, chrome.Unreachable)
+        self.assertTrue(state.running)  # the process is real; the browser is not drivable
+        self.assertEqual(state.pids, (4242,))
+
+    def test_a_stranger_on_the_port_is_unreachable_and_names_what_answered(self):
+        """One state, two sentences. Nothing acts on the difference; an operator reads it.
+
+        The stranger's own line is carried through rather than reduced to "unreachable",
+        because it is the only thing in the reading that says where to go and look.
+        """
+        state = chrome._reachability((4242,), chrome._AnsweredByStranger("nginx/1.25 welcome page"))
+
+        self.assertIsInstance(state, chrome.Unreachable)
+        self.assertIn("nginx/1.25 welcome page", state.heard)
+
+    def test_silence_and_a_stranger_do_not_read_the_same(self):
+        """Folding them into one state must not fold them into one sentence."""
+        silent = chrome._reachability((4242,), chrome._Silent())
+        stranger = chrome._reachability((4242,), chrome._AnsweredByStranger("nginx"))
+
+        self.assertNotEqual(silent.heard, stranger.heard)
+        # Neither sentence is pinned word for word — this is text a person reads and it
+        # has to stay free to be rewritten. What is pinned is that it stays a sentence:
+        # the answers are dataclasses, so a sentence built by interpolating one carries
+        # `_Silent()` to a terminal and reads as a crash.
+        for state in (silent, stranger):
+            with self.subTest(state=state):
+                self.assertNotIn("_Silent", state.heard)
+                self.assertNotIn("_AnsweredByStranger", state.heard)
+
+
+class HealthTest(unittest.TestCase):
+    """One process-table reading, one round of port probes, one state per profile."""
+
+    def test_the_three_states_are_told_apart_in_one_listing(self):
+        """The epic's done-when: a wedged browser and a healthy one read differently.
+
+        Three profiles in one call, because that is how `crom list` asks and because a
+        fold that shared state between rows would show up here and nowhere else.
+        """
+        ready, wedged, stopped = health_profile(9300, "ready"), health_profile(9301, "wedged"), health_profile(9302, "off")
+        answers = {9300: chrome._Answered(), 9301: chrome._Silent(), 9302: chrome._Silent()}
+        live = {str(ready.profile_dir): (11,), str(wedged.profile_dir): (22,)}
+
+        with mock.patch.object(chrome, "_probe_port", side_effect=lambda port: answers[port]):
+            standing = chrome.health([ready, wedged, stopped], live)
+
+        self.assertEqual(standing[ready.ref], chrome.Ready((11,)))
+        self.assertIsInstance(standing[wedged.ref], chrome.Unreachable)
+        self.assertEqual(standing[stopped.ref], chrome.Stopped())
+
+    def test_every_profile_asked_about_is_answered(self):
+        """Total over its input, so `crom list` indexes it instead of defaulting a lookup.
+
+        A profile that fell out of the result would render as a missing row or a `None`
+        state, and the caller has no honest default to put there.
+        """
+        profiles = [health_profile(9300 + n, f"p{n}") for n in range(5)]
+
+        with mock.patch.object(chrome, "_probe_port", return_value=chrome._Silent()):
+            standing = chrome.health(profiles, {})
+
+        self.assertEqual(set(standing), {p.ref for p in profiles})
+
+    def test_the_probe_is_addressed_by_port_and_never_by_a_pid(self):
+        """From PR #47: a browser re-execs on `chrome://restart` and comes back as a
+        different pid on the same directory and the same port.
+
+        The scan and the probe read the world a moment apart, so a probe handed a pid can
+        describe a process that no longer exists while the browser answers perfectly. The
+        pids here are deliberately nothing like the ports, so a probe called with either
+        one is visible in the recorded calls.
+        """
+        profile = health_profile(9300)
+        asked = []
+
+        def record(port):
+            asked.append(port)
+            return chrome._Answered()
+
+        with mock.patch.object(chrome, "_probe_port", side_effect=record):
+            standing = chrome.health([profile], {str(profile.profile_dir): (97805,)})
+
+        self.assertEqual(asked, [9300])
+        # The pid from the scan travels on as evidence, and never into the question.
+        self.assertEqual(standing[profile.ref], chrome.Ready((97805,)))
+
+    def test_a_browser_that_changed_pid_under_the_scan_is_still_ready(self):
+        """The same hazard from the other side: stale pids must not downgrade the state.
+
+        The reading crom holds says 97805; the process answering on the port is 819. The
+        port answers, so the profile is ready — a fold keyed on the pid would have had to
+        go and check a process that is gone, and reported a healthy browser as dead.
+        """
+        profile = health_profile(9300)
+
+        with mock.patch.object(chrome, "_probe_port", return_value=chrome._Answered()):
+            standing = chrome.health([profile], {str(profile.profile_dir): (97805,)})
+
+        self.assertIsInstance(standing[profile.ref], chrome.Ready)
+
+    def test_twenty_profiles_are_probed_in_one_round_not_twenty(self):
+        """The ticket's promise, asserted by rendezvous rather than by a clock.
+
+        Every probe waits on a barrier that only opens once all twenty have arrived, so a
+        sequential implementation cannot reach the second one and the barrier breaks —
+        which `_probe_all` re-raises. No sleeps, and nothing that passes because the
+        machine happened to be fast. [LAW:no-ambient-temporal-coupling]
+        """
+        profiles = [health_profile(9300 + n, f"p{n}") for n in range(20)]
+        together = threading.Barrier(len(profiles), timeout=10)
+
+        def rendezvous(port):
+            together.wait()
+            return chrome._Answered()
+
+        with mock.patch.object(chrome, "_probe_port", side_effect=rendezvous):
+            standing = chrome.health(profiles, {})
+
+        self.assertEqual(len(standing), len(profiles))
+
+    def test_a_probe_that_raises_is_reported_not_swallowed(self):
+        """A pool that returned what it could get would report a browser as stopped
+        because a thread died. [LAW:no-silent-failure]
+        """
+        with mock.patch.object(chrome, "_probe_port", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                chrome.health([health_profile(9300)], {})
+
+    def test_two_profiles_sharing_a_port_ask_it_once(self):
+        """Keyed by port from the start, so a duplicated port cannot pair an answer with
+        the wrong profile — the failure a zip against the input list would allow.
+        """
+        first, second = health_profile(9300, "a"), health_profile(9300, "b")
+        asked = []
+
+        with mock.patch.object(chrome, "_probe_port", side_effect=lambda port: asked.append(port) or chrome._Answered()):
+            standing = chrome.health([first, second], {str(first.profile_dir): (11,)})
+
+        self.assertEqual(asked, [9300])
+        self.assertIsInstance(standing[first.ref], chrome.Ready)
+
+
 if __name__ == "__main__":
     unittest.main()
