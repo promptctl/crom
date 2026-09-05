@@ -32,10 +32,19 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import IO, ClassVar
+from typing import IO
 
 from . import launched
-from .model import CromError, ProfileRef, Reason, ResolvedProfile
+from .model import (
+    CromError,
+    Health,
+    ProfileRef,
+    Reason,
+    Ready,
+    ResolvedProfile,
+    Stopped,
+    Unreachable,
+)
 
 LAUNCH_TIMEOUT_SECONDS = 30.0
 SHUTDOWN_TIMEOUT_SECONDS = 5.0
@@ -552,57 +561,10 @@ def _probe_port(port: int) -> _PortAnswer:
 
 
 # --- what a profile's browser is actually doing --------------------------------------
-# Two facts crom used to report as one. `scan` says a process holds the user-data-dir;
-# `_probe_port` says something drivable answers on the port. A browser that is wedged,
-# still shutting down, or whose debugging port has died passes the first and fails the
-# second, and while "running" was derived from the process table alone it read exactly
-# like a healthy one — so a consumer read `running :9240`, connected, and hung.
-# [FRAMING:representation] a process holding a directory is not a map of "I can drive
-# this browser"; only the port is, so only the port is asked.
-#
-# `running` and `pids` are on all three states, so a caller renders one without first
-# asking which it holds — the same reason `drift`'s four verdicts all carry `changes`.
-# [LAW:dataflow-not-control-flow] Only `Unreachable` has anything to say about why, so
-# on the other two `pids` is a class attribute rather than a field where it is fixed: a
-# `Stopped` carrying pids is unrepresentable rather than merely never built.
-
-
-@dataclass(frozen=True)
-class Stopped:
-    """No process holds this profile's user-data-dir."""
-
-    slug: ClassVar[str] = "stopped"
-    running: ClassVar[bool] = False
-    pids: ClassVar[tuple[int, ...]] = ()
-
-
-@dataclass(frozen=True)
-class Unreachable:
-    """A process holds the directory, and nothing crom can drive answers on the port.
-
-    `heard` is what the port did, kept because it is the only thing that tells an
-    operator where to go: a silent port is a browser to restart, and a port answered by
-    something else is a port to go and reclaim. Nothing *acts* on the difference, which
-    is why it is one state and not two — for the reason `_advertises_devtools` folds
-    every way of not being a DevTools document into one answer.
-    """
-
-    slug: ClassVar[str] = "unreachable"
-    running: ClassVar[bool] = True
-    pids: tuple[int, ...]
-    heard: str
-
-
-@dataclass(frozen=True)
-class Ready:
-    """A process holds the directory and a DevTools endpoint answered on the port."""
-
-    slug: ClassVar[str] = "ready"
-    running: ClassVar[bool] = True
-    pids: tuple[int, ...]
-
-
-Health = Stopped | Unreachable | Ready
+# `Stopped`, `Unreachable` and `Ready` are `model`'s, beside the other stage-output types
+# every command reports; what lives here is the pair of readings that decide which one a
+# profile is in. [LAW:effects-at-boundaries] the world is read at this end and the states
+# it produces are named at the end nothing imports.
 
 # Enough that the profiles one person lists are asked in a single round. The cap is for
 # the ports that *answer*, not the ones that do not: measured on loopback, a refused
@@ -670,6 +632,23 @@ def health(
     standing = [(p.ref, p.port, live.get(str(p.profile_dir), ())) for p in profiles]
     heard = _probe_all(port for _, port, _ in standing)
     return {ref: _reachability(pids, heard[port]) for ref, port, pids in standing}
+
+
+def health_of(profile: ResolvedProfile, pids: tuple[int, ...]) -> Health:
+    """One profile's state, for a caller that has already read the process table.
+
+    The `pids` a command is holding — what `operations.up` launched, what `find_pids`
+    just returned — rather than a reading taken here, so the record a command emits and
+    the sentence it prints beside it describe one moment. `crom restart` names the pid it
+    started in its human line; a second scan behind its JSON could answer differently, and
+    the two halves of one command's output would disagree about what that command did.
+    [LAW:one-source-of-truth]
+
+    That the `live` mapping is keyed by the profile directory is `health`'s business, and
+    keeping it there is the whole of what this adds: a command spelling the key for itself
+    is a copy of that rule, and there would be one per command. [LAW:single-enforcer]
+    """
+    return health([profile], {str(profile.profile_dir): pids})[profile.ref]
 
 
 def _reachability(pids: tuple[int, ...], heard: _PortAnswer) -> Health:
