@@ -67,6 +67,18 @@ def _commands_offering_json() -> set[str]:
     }
 
 
+def _commands_offering_no_probe() -> set[str]:
+    """Read from click for the reason the `--json` set is: a list of names written into
+    this file is a second copy of a fact the CLI already holds, green for exactly as long
+    as nobody adds a command. [LAW:one-source-of-truth]
+    """
+    return {
+        name
+        for name in cli.main.list_commands(None)
+        if any("--no-probe" in option.opts for option in cli.main.get_command(None, name).params)
+    }
+
+
 class CliTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -1617,15 +1629,23 @@ class CliTest(unittest.TestCase):
         `launch` refuses to be called rather than being allowed to succeed quietly. These
         profiles are already running, so a launch here would mean the command took the
         wrong path entirely — and it would reach the network legitimately, through
-        `wait_for_cdp`, which would read as the flag leaking rather than as the fixture
+        `_await_startup`, which would read as the flag leaking rather than as the fixture
         being wrong.
+
+        Which commands those are comes from click, and so does whether each takes a REF;
+        where the record sits comes from the payload's own shape. Nothing here is keyed on
+        a command's name, so a sixth command gaining `@_probe_option` is covered the day it
+        is written rather than the day someone remembers this list. [LAW:one-source-of-truth]
         """
         self.crom("init")
         self.crom("add", "ci")
         directory = json.loads(self.crom("config", "ci", "--json"))["resolved"]["profile_dir"]
 
-        for command in (("up",), ("restart",), ("show",), ("list",), ("config", "ci")):
-            with self.subTest(command=command[0]):
+        self.assertTrue(_commands_offering_no_probe(), "no command declares --no-probe")
+        for name in sorted(_commands_offering_no_probe()):
+            takes_ref = any(param.name == "ref" for param in cli.main.get_command(None, name).params)
+            command = (name, "ci") if takes_ref else (name,)
+            with self.subTest(command=name):
                 with (
                     mock.patch("crom.cli.seed.materialize_under_lock"),
                     mock.patch("crom.chrome.scan", return_value={directory: (4242,)}),
@@ -1641,9 +1661,12 @@ class CliTest(unittest.TestCase):
                     # stderr and the merged stream `crom()` returns is not a document.
                     payload = json.loads(self.invoke(*command, "--no-probe", "--json").stdout)
 
-                record = payload["resolved"] if command[0] == "config" else payload
-                if isinstance(record, list):
-                    (record,) = [row for row in record if row.get("ref") == "myproj/ci"]
+                # By shape, not by name: a listing is an array of records, `crom config`
+                # nests its one under `resolved`, and the rest publish it at the top level.
+                if isinstance(payload, list):
+                    (record,) = [row for row in payload if row.get("ref") == "myproj/ci"]
+                else:
+                    record = payload.get("resolved", payload)
                 self.assertEqual(record["state"], "unprobed")
                 # The process table's half of the answer, unchanged. This is what
                 # "process-level facts only" means: not less information about the

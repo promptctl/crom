@@ -366,8 +366,10 @@ class _Unasked:
     `_reachability` reads it off the type rather than re-deriving it from which flag was
     passed.
 
-    In `_PortAnswer` only: a launch that never asked its own port is not an ending
-    `_LaunchOutcome` has, because `wait_for_cdp` puts the question unconditionally.
+    In `_PortKnowledge` only, and deliberately not in `_PortAnswer`: nothing crom asks a
+    port can come back this way, and a launch that never asked its own port is not an
+    ending `_LaunchOutcome` has either, because `_await_startup` puts the question
+    unconditionally.
     """
 
 
@@ -395,7 +397,14 @@ class _NeverAnswered:
 # endings, and the endings with nowhere to go were the common ones: a Chrome that died in
 # 20ms got reported 30 seconds later as a port that had not opened, and a foreign server
 # on the port got reported as a successful launch.
-_PortAnswer = _Silent | _Answered | _AnsweredByStranger | _Unasked
+_PortAnswer = _Silent | _Answered | _AnsweredByStranger
+# What crom holds for a port, which is the answer it got or the fact that it did not ask.
+# Separate from `_PortAnswer` because `_probe_port` and `_classify` can only ever produce
+# an answer, and folding `_Unasked` into their return type would overstate them and cost
+# `_await_startup`'s three-arm match its provable totality. [LAW:types-are-the-program]
+# each signature says exactly what that function can return; this wider one is named only
+# where something genuinely holds both, which is `_reachability` and the readings feeding it.
+_PortKnowledge = _PortAnswer | _Unasked
 _LaunchOutcome = _Answered | _AnsweredByStranger | _Exited | _NeverAnswered
 
 
@@ -601,7 +610,11 @@ _PROBE_WORKERS = 32
 # differs. The practical difference is visible in the two bodies below — one contains the
 # network and the other cannot — which is a claim a caller can check by reading rather than
 # one a flag asks it to believe.
-PortReading = Callable[[Iterable[int]], dict[int, _PortAnswer]]
+# `Mapping` rather than `dict` in the result, because it is covariant in its value type:
+# each reading below can then be annotated with exactly what it produces — answers from one
+# and `_Unasked` from the other — and both still satisfy this one contract. An invariant
+# `dict` here would force both to claim they might return either.
+PortReading = Callable[[Iterable[int]], Mapping[int, _PortKnowledge]]
 
 
 def probe_ports(ports: Iterable[int]) -> dict[int, _PortAnswer]:
@@ -629,7 +642,7 @@ def probe_ports(ports: Iterable[int]) -> dict[int, _PortAnswer]:
     return {port: answer.result() for port, answer in answers.items()}
 
 
-def unasked_ports(ports: Iterable[int]) -> dict[int, _PortAnswer]:
+def unasked_ports(ports: Iterable[int]) -> dict[int, _Unasked]:
     """The same reading, taken by not asking — the `PortReading` `--no-probe` supplies.
 
     Total over `ports` exactly as `probe_ports` is, because that totality is what `health`
@@ -705,7 +718,7 @@ def health_of(
     return health([profile], {str(profile.profile_dir): pids}, read)[profile.ref]
 
 
-def _reachability(pids: tuple[int, ...], heard: _PortAnswer) -> Health:
+def _reachability(pids: tuple[int, ...], heard: _PortKnowledge) -> Health:
     """The two readings folded into the one state a consumer acts on.
 
     [LAW:types-are-the-program] one match over both facts, so every combination is
