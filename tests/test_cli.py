@@ -387,6 +387,23 @@ class CliTest(unittest.TestCase):
 
         self.crom("init", cwd=here, expect=4)
 
+    def test_init_refuses_an_unrecognised_seed(self):
+        output = self.crom("init", "--seed", "chorme", expect=1)
+
+        self.assertIn("'chorme' is not recognised", output)
+        self.assertFalse((self.project / ".crom.toml").exists())
+
+    def test_init_names_the_reserved_namespace_before_an_unrecognised_seed(self):
+        """Both arguments are wrong, and which one crom answers with is what a script
+        branching on the exit code sees: a reserved namespace is a conflict (4), an
+        unrecognised seed a failure (1). Parsing the seed in the command — before the
+        namespace was settled — once put the seed's refusal first, and only this pairing
+        can tell the two orders apart, which is why neither test alone is the test."""
+        output = self.crom("init", "user", "--seed", "chorme", expect=4)
+
+        self.assertIn("reserved", output)
+        self.assertNotIn("chorme", output)
+
     def test_init_converges_in_a_directory_named_after_the_reserved_namespace(self):
         """The reserved name is refused for a namespace the command claims, not for one it
         is about to throw away. A project that chose `myproj` is named `myproj` whatever
@@ -3785,7 +3802,7 @@ class CliTest(unittest.TestCase):
         profile_dir.mkdir(parents=True)
 
         events: list[str] = []
-        real_lock = cli.seed.profile_lock
+        real_lock = operations.seed.profile_lock
 
         @contextlib.contextmanager
         def tracking_lock(profile):
@@ -3794,10 +3811,14 @@ class CliTest(unittest.TestCase):
                 yield
             events.append("unlock")
 
+        # Patched on `operations`, which is where the removal now performs all three
+        # steps. Reaching through `cli` still worked for two of them — the module objects
+        # are shared — and would have gone on passing while naming a module that no longer
+        # takes the lock. [FRAMING:representation]
         with (
-            mock.patch("crom.cli.seed.profile_lock", tracking_lock),
-            mock.patch("crom.cli.chrome.kill", lambda _p: events.append("kill") or ()),
-            mock.patch("crom.cli.shutil.rmtree", lambda _p: events.append("rmtree")),
+            mock.patch("crom.operations.seed.profile_lock", tracking_lock),
+            mock.patch("crom.operations.chrome.kill", lambda _p: events.append("kill") or ()),
+            mock.patch("crom.operations.shutil.rmtree", lambda _p: events.append("rmtree")),
         ):
             self.crom("rm", "ci", "--yes")
 
@@ -3840,7 +3861,9 @@ class CliTest(unittest.TestCase):
         before = json.loads(self.crom("config", "ci", "--json"))["resolved"]
         Path(before["profile_dir"]).mkdir(parents=True)
 
-        with mock.patch("crom.cli.shutil.rmtree", side_effect=OSError(66, "Directory not empty")):
+        with mock.patch(
+            "crom.operations.shutil.rmtree", side_effect=OSError(66, "Directory not empty")
+        ):
             error = self.failure("rm", "ci", "--yes")
 
         # `rm` carries no `--json`, so this slug reaches no envelope and the rendered

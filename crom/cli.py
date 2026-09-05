@@ -20,7 +20,6 @@ carries a reason slug — one word naming what actually went wrong, enumerated i
 import errno
 import json
 import shlex
-import shutil
 from collections.abc import Callable
 from pathlib import Path
 from typing import NamedTuple
@@ -44,9 +43,6 @@ from . import (
 )
 from .config import discover, load_user_scope, parse_layer, parse_port, parse_seed
 from .model import (
-    DEFAULT_SEED,
-    DEFAULTS_STANZA,
-    USER_NAMESPACE,
     Conflict,
     CromError,
     Emitted,
@@ -56,15 +52,12 @@ from .model import (
     NotFound,
     ProfileRef,
     ProfileSpec,
-    Reason,
     ResolvedProfile,
     Resolution,
     Scope,
     profile_stanza,
-    slug_for,
     validate_name,
 )
-from .paths import PROJECT_CONFIG_CANDIDATES
 from .session import Session
 
 EXIT_FAILURE = 1
@@ -311,7 +304,7 @@ class CromGroup(click.Group):
 
         Catching `CromError` alone left the second half escaping as a raw traceback, and
         the codebase had begun closing that one call site at a time —
-        `_delete_directory` wraps `rmtree`, `configwrite._writing` wraps the config
+        `operations.delete_directory` wraps `rmtree`, `configwrite._writing` wraps the config
         save, `seed._copy` wraps the seed stat — while `crom mcp --path <a-directory>`
         still printed a stack trace out of `read_text`. [LAW:single-enforcer] a rule kept
         per command is a rule the next command is written without; kept here, a new
@@ -928,16 +921,13 @@ def rm_cmd(session: Session, ref: str, yes: bool, keep_data: bool):
     """Stop a profile if it is running, undeclare it, release its port, delete its data."""
     profile = session.profile(ref)
 
-    # `rm` used to refuse a running profile and tell the user to run `crom down` first,
-    # which made the caller responsible for establishing a state `rm` needs and `rm` can
-    # reach on its own — under the very lock it already takes to make stopping safe.
-    # [LAW:no-ambient-temporal-coupling] the phase transition is this command's to own;
-    # exporting it as a two-command ritual left an orphan-shaped hole in the other
-    # direction too, since `--keep-data` was the one path that refused without ever
-    # explaining that the browser it left running was about to lose its declaration.
-    #
-    # Read here only to compose the prompt. The authoritative act is `chrome.kill` under
-    # the lock below, which converges a profile to stopped whether or not this saw it run.
+    # Read only to compose the prompt, which is why these two reads stay in the command
+    # rather than moving with the removal: they are the wording of a question crom asks a
+    # human, and a caller that is not a terminal has nobody to ask. Exported as a record
+    # for `operations.rm` to hand back, they would be a shape whose only consumer is
+    # `click.confirm`. [LAW:composability] The authoritative act is `chrome.kill` under
+    # `operations.rm`'s lock, which converges a profile to stopped whether or not this saw
+    # it run — so this read is stale by construction and says so.
     running = chrome.is_running(profile)
     deletes_data = not keep_data and profile.profile_dir.exists()
 
@@ -961,44 +951,11 @@ def rm_cmd(session: Session, ref: str, yes: bool, keep_data: bool):
             abort=True,
         )
 
-    scope = resolver.scope_for(profile.ref.namespace, session.scope)
-    # Stopping and deleting are one critical section, for the same reason `up_cmd` holds
-    # this lock across its own check-and-launch: a concurrent `crom up` can seed and
-    # launch Chrome in the window between them, and `rm` would otherwise delete a live
-    # browser's user-data-dir out from under it — a process crom can no longer find or
-    # stop, writing into a directory that no longer exists.
-    #
-    # The confirmation deliberately sits *outside* the lock: holding it across an
-    # interactive prompt would block every other crom process for as long as the human
-    # takes to answer. Which is why `kill` runs unconditionally here rather than under
-    # the `running` read taken before the prompt — that read is stale by construction,
-    # and a Chrome started while the question was on screen must not survive the answer.
-    # [LAW:dataflow-not-control-flow] `chrome.kill` returns an empty tuple when there was
-    # nothing to stop, so the same operation runs every time and only its result varies.
-    with seed.profile_lock(profile):
-        stopped = chrome.kill(profile)
-        # Data first, while the profile is still fully declared. `rm` resolves by name
-        # before it does anything, so a delete that failed partway after the declaration
-        # was gone left a half-removed directory belonging to a profile no command could
-        # name — unreachable by the `crom rm` that would have retried it. Deleting first
-        # inverts that: a failure here leaves everything nameable and the command
-        # repeatable, and a failure *after* a successful delete leaves a declared profile
-        # whose directory the next `crom up` simply re-seeds. Same principle the comment
-        # below applies to the other two steps — between interruptible steps, take the
-        # one whose failure is recoverable.
-        if not keep_data and profile.profile_dir.exists():
-            _delete_directory(
-                profile.profile_dir,
-                f"'{profile.ref}' is still declared — run `crom rm {profile.ref}` again.",
-            )
-        # Release the reservation before removing the declaration, not after. Both
-        # orderings can be interrupted, but they strand different things: undeclaring
-        # first leaves a port held by a profile no longer nameable, so no command can
-        # reach it to retry. Releasing first leaves a declared profile without a
-        # reservation, which the next resolve heals by assigning one. Between two
-        # interruptible steps, take the one whose failure is recoverable.
-        registry.forget(str(profile.ref))
-        configwrite.remove_profile(config.write_target(scope), profile.ref.name)
+    # The prompt above is deliberately the last thing before the call: `operations.rm`
+    # takes the profile lock for the whole removal, and holding it across an interactive
+    # question would block every other crom process for as long as the human takes to
+    # answer.
+    stopped = operations.rm(profile, session.scope, keep_data=keep_data)
     # The stop is reported rather than performed quietly: killing someone's browser is
     # the most surprising thing this command does, and `--yes` skips the prompt that
     # would otherwise have been its only mention. [LAW:no-silent-failure]
@@ -1019,120 +976,23 @@ def rm_cmd(session: Session, ref: str, yes: bool, keep_data: bool):
 )
 def init_cmd(namespace: str | None, seed_text: str | None):
     """Give this project its own namespace by writing a .crom.toml here. Idempotent."""
-    here = Path.cwd()
-    # The config this project already has, else the name a new one takes. Running `crom
-    # init` twice is not an error to report but a state to converge on, so the second run
-    # aims at the file the first one wrote — including under the `.crom/config.toml`
-    # spelling, which is a config crom must not shadow with a second one beside it.
-    existing = next((here / c for c in PROJECT_CONFIG_CANDIDATES if (here / c).is_file()), None)
-    target = existing or here / PROJECT_CONFIG_CANDIDATES[0]
+    project = operations.init(Path.cwd(), namespace, seed_text)
 
-    # `namespace` stays as the user typed it — None when they typed nothing — because
-    # that absence is what makes a bare `crom init` in an initialised project a no-op
-    # instead of a rename: a namespace derived from the directory name is crom's guess,
-    # and a guess must not be able to contradict a name the project chose. Only the
-    # written value falls back. [LAW:no-silent-failure]
-    chosen_namespace = validate_name("namespace", namespace or slug_for(here.name))
-
-    # The namespace this command *claims*: what the user typed, else crom's guess — and
-    # nothing at all when a config already exists, because then the namespace is the
-    # file's and the guess is discarded a few lines below without ever reaching disk
-    # (`write_default` creates with `O_CREAT | O_EXCL`, so it cannot overwrite the name
-    # the project chose). Refusing on the discarded guess is precisely the guess
-    # contradicting that name: in a directory named `user`, `crom init myproj` wrote
-    # `namespace = "myproj"` and a bare `crom init` afterwards exited 4 saying `"user"` is
-    # reserved — about a value the user never typed and the file never held.
-    # [LAW:dataflow-not-control-flow] the refusal always runs; only the value it reads
-    # differs. A reserved namespace *in the file* is not re-litigated here either —
-    # `config.parse` refuses that at the read boundary for every command.
-    # [LAW:single-enforcer]
-    claimed_namespace = namespace or (None if existing else chosen_namespace)
-    if claimed_namespace == USER_NAMESPACE:
-        raise Reason.NAMESPACE_RESERVED.error(
-            f'"{USER_NAMESPACE}" is reserved; pass a different namespace'
-        )
-
-    # Parsed here, before the file exists, through the same checkpoint that reads the
-    # value back on the next command — so `crom init --seed chorme` fails naming the
-    # vocabulary rather than writing a config that every later command rejects.
-    # [LAW:parse-dont-validate]
-    #
-    # Named `chosen_seed` rather than `seed` because this module imports the `seed`
-    # module, and a local of that name shadows it for the rest of the function — working
-    # today only because `init_cmd` happens not to need it, and failing with an
-    # AttributeError the first time someone adds a line that does.
-    #
-    # Anchored on `target.parent`, not on `here`: a relative seed path is parsed against
-    # the config's own directory everywhere else, and `write_default` renders it back with
-    # `render_seed(seed, path.parent)`. Those agree today only because
-    # `PROJECT_CONFIG_CANDIDATES[0]` is the bare `.crom.toml`, so its parent *is* `here`.
-    # Under the `.crom/config.toml` candidate they diverge, and `--seed ./fixtures` would
-    # parse to `here/fixtures`, fail `relative_to(here/'.crom')`, and be written as this
-    # machine's absolute path into a file meant to be committed — the exact outcome
-    # `render_seed`'s docstring exists to prevent. [LAW:one-source-of-truth]
-    base = target.parent
-    stated_seed = None if seed_text is None else parse_seed(seed_text, DEFAULTS_STANZA, target, base)
-
-    # The refusal here is the kernel's `O_CREAT | O_EXCL`, not a check of ours, so two
-    # `crom init` calls racing in one directory produce one file rather than one clobbering
-    # the other. What changes is only what the loser does with the answer: it reads the
-    # winner's file back below and reports it, since a project that has the config it was
-    # asked for has had the request met.
-    wrote = configwrite.write_default(
-        target,
-        namespace=chosen_namespace,
-        seed=DEFAULT_SEED if stated_seed is None else stated_seed,
-    )
-
-    # Read back rather than echoed from the variables above, because on the converging
-    # path those variables are what crom *would* have written and the file is what the
-    # project actually declares — and reporting a guessed namespace as though it were the
-    # project's would be the same lie the comment above refuses to write. On the path that
-    # just created the file the two are identical, so one read serves both and doubles as
-    # a check on the write. [FRAMING:representation]
-    declared_namespace = configwrite.value_at(target, "namespace")
-    # Reading a fact obliges this command to handle every shape the file can hold it in.
-    # A hand-written `.crom.toml` with no `namespace`, or one holding a number, is a file
-    # that exists without configuring anything — so converging on it would print
-    # "namespace 'None'" and tell the user to run a `crom up` that `config.parse` is about
-    # to refuse. Said here instead, naming the fix. [LAW:parse-dont-validate] the full
-    # diagnosis stays `config.parse`'s; this is only the checkpoint for the value the
-    # three lines below are about to state as fact.
-    if not isinstance(declared_namespace, str):
-        raise Reason.CONFIG_INVALID.error(
-            f"{target} exists but declares no usable `namespace` "
-            f"({declared_namespace!r}), so it does not configure this project.\n"
-            f'Add namespace = "{chosen_namespace}" to it, or delete it and run '
-            f"`crom init` again."
-        )
-    # An absent `[defaults].seed` is not a missing fact: `config.parse` reads that absence
-    # as `DEFAULT_SEED`, so this renders the same answer the next command will act on.
-    declared_seed = configwrite.value_at(target, "defaults", "seed")
-    if declared_seed is None:
-        declared_seed = configwrite.render_seed(DEFAULT_SEED, base)
-
-    operations.reject_restatement(
-        f"{target} already configures this project, and this asks to change it:",
-        (
-            ("namespace", declared_namespace, namespace),
-            (
-                "seed",
-                str(declared_seed),
-                None if stated_seed is None else configwrite.render_seed(stated_seed, base),
-            ),
-        ),
-        f"Edit {target} directly — crom writes a project config once and leaves it "
-        f"yours after that. Changing the namespace also moves this project's ports and "
-        f"profile directories, which is why crom will not do it for you.",
-    )
-
-    click.echo(
-        f"Wrote {target} (namespace '{declared_namespace}')"
-        if wrote
-        else f"{target} already configures this project (namespace '{declared_namespace}')"
-    )
-    click.echo(f"  profiles here start from seed '{declared_seed}' — change it in [defaults]")
-    click.echo(f"Run: crom up  # brings up {declared_namespace}/default")
+    # The arm `operations.init` reached, worded rather than re-derived. The other way to
+    # reach it from here is to ask whether the file existed before the call — a question
+    # only answerable by a second stat, taken after the write, which cannot tell this
+    # process's creation from a concurrent one's. [LAW:one-source-of-truth]
+    match project.outcome:
+        case operations.Declaration.CREATED:
+            headline = f"Wrote {project.target} (namespace '{project.namespace}')"
+        case operations.Declaration.ALREADY_PRESENT:
+            headline = (
+                f"{project.target} already configures this project "
+                f"(namespace '{project.namespace}')"
+            )
+    click.echo(headline)
+    click.echo(f"  profiles here start from seed '{project.seed}' — change it in [defaults]")
+    click.echo(f"Run: crom up  # brings up {project.namespace}/default")
 
 
 @main.command("config")
@@ -1586,36 +1446,10 @@ def clean_cmd(path: str, yes: bool):
                 click.confirm(
                     f"Deleting {staged.path} ({size}) cannot be undone.\nContinue?", abort=True
                 )
-            _delete_directory(
+            operations.delete_directory(
                 staged.path, f"Run `crom clean {staged.path}` again once that is fixed."
             )
             click.echo(f"Deleted {staged.path} ({size} reclaimed)")
-
-
-def _delete_directory(directory: Path, retry: str) -> None:
-    """Remove one directory crom owns, as a `CromError` rather than a traceback.
-
-    `shutil.rmtree` raises a bare `OSError` — `FileNotFoundError` for an entry that
-    vanishes mid-walk, `ENOTEMPTY` for one that appears — and the path alone does not say
-    what is left to try. Both callers meet that same race for the same reason: `crom rm`
-    deletes a directory a Chrome helper outliving `chrome.kill` can still be writing to,
-    and `crom clean` deletes one a seed that is still running may still be filling.
-
-    The retry sentence is the caller's, because only the caller knows what it left
-    reachable. `rm` deletes before it undeclares precisely so that a retry exists;
-    `clean` names a path that stays exactly as `crom doctor` prints it.
-
-    One reason for both, and it keeps `profile_dir_undeletable` as its published spelling:
-    a staging directory is a profile directory that never finished being built, the failure
-    is the same one, and the next move — fix what the sentence names, run the command
-    again — does not divide. A slug earns its place by separating next moves.
-    """
-    try:
-        shutil.rmtree(directory)
-    except OSError as e:
-        raise Reason.PROFILE_DIR_UNDELETABLE.error(
-            f"could not delete {directory}: {e}\n{retry}"
-        ) from e
 
 
 def _human_size(total: int) -> str:

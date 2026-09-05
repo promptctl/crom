@@ -642,6 +642,36 @@ def write_target(scope: Scope) -> Path:
     return scope.source or user_config_file()
 
 
+def init_target(here: Path) -> Path:
+    """The config file `crom init` in `here` writes — the one it already has, else the
+    one it would get.
+
+    Not `discover`, which walks *up*: `crom init` gives a directory its own config and
+    must never adopt an ancestor's. A project nested inside another would otherwise
+    converge on its parent's file and report the parent's namespace as its own.
+
+    Existing-first, because running `crom init` twice is a state to converge on rather
+    than an error to report, and the second run has to aim at the file the first one
+    wrote. That matters only for the `.crom/config.toml` spelling — writing the bare
+    `.crom.toml` beside it would leave the directory holding two configs, one of which
+    `discover` would never reach again. [LAW:one-source-of-truth]
+
+    So `here` alone decides both the path and whether the project is already
+    initialised: the returned path `is_file()` exactly when a config was found, and
+    `crom init`'s two endings are that one question. A separately-carried "did it
+    exist" would be a second answer to it, taken at a different instant.
+
+    One caller — `operations.init` — and it lives here rather than there because
+    `PROJECT_CONFIG_CANDIDATES` precedence is a rule about where a project's config
+    *is*, which is what `discover` and `write_target` beside it also answer. Its home is
+    the question it answers, not the number of readers it has. [LAW:decomposition]
+    """
+    return next(
+        (here / relative for relative in PROJECT_CONFIG_CANDIDATES if (here / relative).is_file()),
+        here / PROJECT_CONFIG_CANDIDATES[0],
+    )
+
+
 def load_file(source: Path, *, namespace: str | None = None) -> Scope:
     if not source.is_file():
         raise Reason.CONFIG_MISSING.error(f"config file not found: {source}", path=str(source))
