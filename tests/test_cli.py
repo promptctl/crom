@@ -105,6 +105,15 @@ class CliTest(unittest.TestCase):
         self.probe = mock.patch("crom.chrome._probe_port", return_value=chrome._Silent())
         self.probe.start()
 
+    @staticmethod
+    def _a_browser_that_answers():
+        """The CDP probe hearing a DevTools endpoint — for a test about a browser that works.
+
+        `setUp` stubs the probe silent, so a row reading `ready` is a claim no test inherits:
+        it is about the port, and the test making it says so here.
+        """
+        return mock.patch("crom.chrome._probe_port", return_value=chrome._Answered())
+
     def tearDown(self):
         self.probe.stop()
         self.ports.stop()
@@ -1320,12 +1329,15 @@ class CliTest(unittest.TestCase):
         self.crom("add", "ci", "--flag", "--window-size=800,600")
         directory = self._record_the_launch_of("ci")
 
-        with mock.patch("crom.chrome.scan", return_value={directory: (4242,)}):
+        with (
+            mock.patch("crom.chrome.scan", return_value={directory: (4242,)}),
+            self._a_browser_that_answers(),
+        ):
             before = self._ci_row(self.crom("list"))
             self._resize_ci()
             after = self._ci_row(self.crom("list"))
 
-        self.assertIn("running :", before)
+        self.assertIn("ready :", before)
         self.assertIn("running with what this configuration resolves to", before)
         self.assertIn("drifted — --window-size", after)
 
@@ -1425,6 +1437,186 @@ class CliTest(unittest.TestCase):
 
     def _ci_row(self, listing: str) -> str:
         return self._row(listing, "myproj/ci")
+
+    # --- the three states, rendered -----------------------------------------------------
+
+    def test_list_tells_a_wedged_browser_apart_from_a_working_one(self):
+        """The epic's complaint at the surface a user reads, asserted in one listing.
+
+        A process holding the user-data-dir and a browser answering on the port are two
+        facts, and this row printed one word for both. Both profiles below have a process
+        in the table and only one answers, in the same run: a check that fired on every row
+        could otherwise pass by being pointed at one. Without the difference an agent reads
+        `running`, connects to the wedged one, and hangs.
+        """
+        self.crom("init")
+        self.crom("add", "works", "--port", "9401")
+        self.crom("add", "wedged", "--port", "9402")
+        working = json.loads(self.crom("config", "works", "--json"))["resolved"]["profile_dir"]
+        wedged = json.loads(self.crom("config", "wedged", "--json"))["resolved"]["profile_dir"]
+
+        with (
+            mock.patch("crom.chrome.scan", return_value={working: (4242,), wedged: (4243,)}),
+            # Keyed on the port, because the port is what the probe is addressed by and the
+            # whole of what differs between these two rows.
+            mock.patch(
+                "crom.chrome._probe_port",
+                side_effect=lambda port: chrome._Answered() if port == 9401 else chrome._Silent(),
+            ),
+        ):
+            listing = self.crom("list")
+
+        works = self._row(listing, "myproj/works")
+        wedged = self._row(listing, "myproj/wedged")
+
+        self.assertIn("ready :9401", works)
+        self.assertIn("unreachable :9402", wedged)
+
+        # A listing is a table, and `unreachable` is six characters wider than `ready`.
+        # The state column is what absorbs that; a column too narrow for its widest word
+        # spends the difference on the next column instead, pushing one row's finding out
+        # of line with every other row's. Measured rather than compared to a literal, so
+        # the claim is the alignment and not the number that currently achieves it.
+        def finding_column(row: str, state: str) -> int:
+            after = row[row.index(state) + len(state) :]
+            return len(row) - len(after.lstrip())
+
+        self.assertEqual(
+            finding_column(works, "ready :9401"),
+            finding_column(wedged, "unreachable :9402"),
+        )
+
+    def test_list_says_stopped_for_a_profile_no_process_holds(self):
+        """The third word, and the one an answering port must not be able to reach.
+
+        Something may well be listening on a port crom has assigned; that is a fact about
+        the port, not about this profile's browser. A row reading `ready` with no process
+        behind it would send a consumer to drive a Chrome crom does not manage.
+        """
+        self.crom("init")
+        self.crom("add", "ci")
+
+        with self._a_browser_that_answers():
+            row = self._ci_row(self.crom("list"))
+
+        self.assertIn("stopped :", row)
+        self.assertNotIn("ready :", row)
+
+    def test_list_json_carries_the_state_beside_the_running_it_refines(self):
+        """What `running` alone cannot tell a machine, which is the consumer that acts.
+
+        This profile is running — that is the point. A caller deciding whether to connect
+        needs the state, and one that only knows `running` is exactly where this epic
+        started. `running` stays because it is still the short answer, and it is read off
+        the state, so the two cannot disagree.
+        """
+        self.crom("init")
+        self.crom("add", "wedged", "--port", "9402")
+        directory = json.loads(self.crom("config", "wedged", "--json"))["resolved"]["profile_dir"]
+
+        with mock.patch("crom.chrome.scan", return_value={directory: (4243,)}):
+            records = json.loads(self.crom("list", "--json"))
+        (record,) = [row for row in records if row["ref"] == "myproj/wedged"]
+
+        self.assertEqual(record["state"], "unreachable")
+        self.assertTrue(record["running"])
+        self.assertEqual(record["pids"], [4243])
+
+    def test_down_json_publishes_what_it_stopped_apart_from_what_is_running(self):
+        """`pids` means processes a caller can attach to, in every record that carries one.
+
+        `down` used to fill it with the processes it had just killed — one key, the
+        opposite meaning, chosen by which command happened to write it. They move to
+        `stopped`, the key `up` and `restart` already publish for what a run took down, and
+        the record reports the profile as what `chrome.kill` has just guaranteed it is.
+        """
+        self.crom("init")
+        self.crom("add", "ci")
+
+        with mock.patch("crom.chrome.kill", return_value=(4242,)):
+            record = json.loads(self.crom("down", "ci", "--json"))
+
+        self.assertEqual(record["stopped"], [4242])
+        self.assertEqual(record["state"], "stopped")
+        self.assertFalse(record["running"])
+        self.assertEqual(record["pids"], [])
+
+    def test_every_command_emitting_a_profile_record_carries_its_state(self):
+        """One JSON shape, which is the whole reason `describe` exists.
+
+        A consumer that learned `state` from `crom list` and did not find it on `crom up`
+        would be holding two shapes and a per-command rule for which keys exist. These
+        commands differ in what they *add* to the record — `up` the verdict it found,
+        `restart` what it stopped, `show` whether a window came forward — never in what the
+        record itself carries. [LAW:one-source-of-truth]
+
+        `running` is asserted against `state` rather than against a literal, because that
+        equivalence is the claim: `running` is the short answer read off the state, so a
+        record where the two disagree is one where something rebuilt it by hand.
+        """
+        self.crom("init")
+        self.crom("add", "ci")
+        directory = self._record_the_launch_of("ci")
+
+        with (
+            self._process_table_that({directory: (4242,)}),
+            mock.patch("crom.cli.window.raise_profile", return_value=1),
+        ):
+            # `invoke().stdout` rather than `crom()`, which folds in the stderr these
+            # commands narrate their progress on; only stdout is the record.
+            def emitted(*args):
+                return json.loads(self.invoke(*args, "--json").stdout)
+
+            records = {
+                "up": emitted("up", "ci"),
+                "config": emitted("config", "ci")["resolved"],
+                "show": emitted("show", "ci"),
+                "list": next(row for row in emitted("list") if row["ref"] == "myproj/ci"),
+                "restart": emitted("restart", "ci"),
+                # Last, because it empties the table every command above reads.
+                "down": emitted("down", "ci"),
+            }
+
+        for command, record in records.items():
+            with self.subTest(command=command):
+                self.assertIn(record["state"], {"stopped", "unreachable", "ready"})
+                self.assertEqual(record["running"], record["state"] != "stopped")
+
+    def test_every_command_hears_the_port_rather_than_assuming_a_browser_it_has_pids_for(self):
+        """A wedged browser reads as wedged from whichever command last touched it.
+
+        `crom list` is not the only surface a consumer acts on: a script that runs `crom
+        up` and connects to what it reports needs the same distinction, and `up` on an
+        already-running browser holds a process-table reading and nothing else. `restart`
+        and `show` are the other half of the trap — they have just launched, so inferring
+        `ready` from "I launched it" looks safe and is not: it reports the browser crom
+        started rather than the browser that is there now.
+
+        Every one of these was free to infer the state from the pids it was holding and
+        pass the whole suite, which is what the mutation run that prompted this test found.
+        Asserting both answers on one profile is the point: a command that hardcoded either
+        word would satisfy half of this.
+        """
+        self.crom("init")
+        self.crom("add", "ci")
+        directory = self._record_the_launch_of("ci")
+
+        def state_of(command: tuple[str, ...], *, answering: bool) -> str:
+            # `setUp` already stubs every port silent, so the wedged case names nothing and
+            # the working one names the answer inline — the convention the probe stub sets.
+            heard = self._a_browser_that_answers() if answering else contextlib.nullcontext()
+            with (
+                self._process_table_that({directory: (4242,)}),
+                mock.patch("crom.cli.window.raise_profile", return_value=1),
+                heard,
+            ):
+                record = json.loads(self.invoke(*command, "--json").stdout)
+            return (record["resolved"] if command[0] == "config" else record)["state"]
+
+        for command in (("up", "ci"), ("config", "ci"), ("restart", "ci"), ("show", "ci")):
+            with self.subTest(command=command[0]):
+                self.assertEqual(state_of(command, answering=False), "unreachable")
+                self.assertEqual(state_of(command, answering=True), "ready")
 
     # --- every source a drift can come from, and one thing that is not one -------------
 
@@ -1623,7 +1815,10 @@ class CliTest(unittest.TestCase):
             '[profiles.edited]\nflags = ["--window-size=1280,800"]\n'
         )
 
-        with self._a_process_table_reading((4242, steady), (4243, edited)):
+        with (
+            self._a_process_table_reading((4242, steady), (4243, edited)),
+            self._a_browser_that_answers(),
+        ):
             listing = self.crom("list")
 
         self.assertIn("--restart", steady)
@@ -1634,7 +1829,7 @@ class CliTest(unittest.TestCase):
             with self.subTest(ref=ref):
                 row = self._row(listing, ref)
                 # Found at all, which is the half a verdict cannot report on its own.
-                self.assertIn("running :", row)
+                self.assertIn("ready :", row)
                 self.assertIn(finding, row)
 
     # --- converging on drift ------------------------------------------------------------

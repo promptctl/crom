@@ -18,13 +18,14 @@ uv tool install --force .     # or, to hack on it: uv sync && .venv/bin/crom
 ```
 
 macOS and Linux. crom answers "is this profile running" by reading the process table
-with `ps` and serializes its ledger with `flock`, so Windows is not supported.
+with `ps`, asks the CDP port itself whether a browser answers, and serializes its ledger
+with `flock`, so Windows is not supported.
 
 ## Quick start
 
 ```bash
 crom              # launch your default profile
-crom list         # what exists, what's running, and what has drifted from its config
+crom list         # what exists, whether each browser answers, and what has drifted
 crom down         # stop it
 ```
 
@@ -141,20 +142,29 @@ in a config and in your shell, and `CROM_REF` is the joined `namespace/name`.
   "profile_dir": "/Users/you/.local/state/crom/profiles/myapp/dev",
   "chrome_binary": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
   "source": "/Users/you/code/myapp/.crom.toml",
+  "state": "ready",
   "running": true,
   "pids": [13550]
 }
 ```
 
-Three commands add keys to that record. `crom restart --json` adds `stopped`, the pids it
-killed, which is empty when the profile was not running — that is the one distinction the
-command exists to report, and the record alone cannot carry it because the record
-describes the profile rather than the act. `crom show --json` adds `started`, whether it
-had to launch the browser first, and `windows`, how many came forward — zero for a
-headless profile, which is raised successfully and simply has no window to show for it.
-`crom up --json` adds two: `found`, the drift verdict it reached, and `stopped`, the pids
-its relaunch replaced — the same key `crom restart` publishes, with the same meaning, and
-empty unless this run actually relaunched.
+`state` is `stopped`, `unreachable` or `ready`, and it is the key to read before you
+connect. `stopped` means no process holds the profile's directory. `ready` means one does
+*and* a browser crom can drive answered on the port. `unreachable` means the process is
+there and the port is not — a browser still starting up, one shutting down, one wedged, or
+a port some other program has taken. `running` is the short answer, true for the last two,
+and it is read off `state`, so the two can never disagree. It is what crom used to publish
+alone, and alone it cannot tell you the one thing you need: an agent that connects to an
+`unreachable` profile hangs.
+
+Four commands add keys to that record. `crom restart --json` and `crom down --json` add
+`stopped`, the pids they killed, empty when the profile was not running — what a run took
+down is a fact about the act, and the record describes the profile. `crom show --json`
+adds `started`, whether it had to launch the browser first, and `windows`, how many came
+forward — zero for a headless profile, which is raised successfully and simply has no
+window to show for it. `crom up --json` adds two: `found`, the drift verdict it reached,
+and `stopped`, the pids its relaunch replaced — the same key the two above publish, with
+the same meaning, and empty unless this run actually relaunched.
 
 `found` carries the `{"verdict", "finding", "changes"}` object described below, the one
 `crom list` and `crom config` publish under the key `drift`, and it is spelled differently

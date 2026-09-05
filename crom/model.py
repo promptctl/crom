@@ -15,6 +15,7 @@ import re
 from dataclasses import dataclass, field
 from enum import Enum, unique
 from pathlib import Path
+from typing import ClassVar
 
 
 # Namespaces and profile names become both directory components and CLI tokens, so the
@@ -749,6 +750,66 @@ class Scope:
         return self.namespace == USER_NAMESPACE
 
 
+# --- what a profile's browser is actually doing --------------------------------------
+# Two facts crom used to report as one. `chrome.scan` says a process holds the
+# user-data-dir; the port probe says something drivable answers on the port. A browser
+# that is wedged, still shutting down, or whose debugging port has died passes the first
+# and fails the second, and while "running" was derived from the process table alone it
+# read exactly like a healthy one — so a consumer read `running :9240`, connected, and
+# hung. [FRAMING:representation] a process holding a directory is not a map of "I can
+# drive this browser"; only the port is, so only the port is asked.
+#
+# Here rather than beside the socket that measures it, because these three are a stage's
+# output type the way `ResolvedProfile` below is resolution's, and `describe` publishes
+# one. `model` imports nothing from crom and everything imports `model`, so a state
+# defined upstream of that could not be named in the record that carries it.
+# [LAW:one-way-deps] the vocabulary sits downhill of every module that speaks it.
+#
+# `running` and `pids` are on all three states, so a caller renders one without first
+# asking which it holds — the same reason `drift`'s four verdicts all carry `changes`.
+# [LAW:dataflow-not-control-flow] Only `Unreachable` has anything to say about why, so
+# on the other two `pids` is a class attribute rather than a field where it is fixed: a
+# `Stopped` carrying pids is unrepresentable rather than merely never built.
+
+
+@dataclass(frozen=True)
+class Stopped:
+    """No process holds this profile's user-data-dir."""
+
+    slug: ClassVar[str] = "stopped"
+    running: ClassVar[bool] = False
+    pids: ClassVar[tuple[int, ...]] = ()
+
+
+@dataclass(frozen=True)
+class Unreachable:
+    """A process holds the directory, and nothing crom can drive answers on the port.
+
+    `heard` is what the port did, kept because it is the only thing that tells an
+    operator where to go: a silent port is a browser to restart, and a port answered by
+    something else is a port to go and reclaim. Nothing *acts* on the difference, which
+    is why it is one state and not two — the difference survives as a sentence for the
+    reader rather than as a variant for the code to match on.
+    """
+
+    slug: ClassVar[str] = "unreachable"
+    running: ClassVar[bool] = True
+    pids: tuple[int, ...]
+    heard: str
+
+
+@dataclass(frozen=True)
+class Ready:
+    """A process holds the directory and a DevTools endpoint answered on the port."""
+
+    slug: ClassVar[str] = "ready"
+    running: ClassVar[bool] = True
+    pids: tuple[int, ...]
+
+
+Health = Stopped | Unreachable | Ready
+
+
 # --- the stamped type --------------------------------------------------------------
 
 
@@ -793,11 +854,24 @@ class ResolvedProfile:
         """
         return _config_dir(self.source)
 
-    def describe(self, *, running: bool, pids: tuple[int, ...]) -> dict:
+    def describe(self, state: Health) -> dict:
         """The machine-readable view — the contract `--json` output promises.
 
         [LAW:one-source-of-truth] every command that emits JSON emits *this*, so the
         shape a consuming app parses is defined in exactly one place.
+
+        One `Health` rather than the `running`/`pids` pair it replaces. The pair had four
+        combinations for three states, and the illegal ones were not hypothetical: `crom
+        down` passed `running=False` beside the pids it had just killed, publishing dead
+        processes under the key every other command uses for the ones a caller can attach
+        to. Read off one value, the three keys below cannot disagree, and no caller is
+        left with a pairing to get right. [LAW:types-are-the-program]
+
+        `running` stays beside `state` rather than being left for a consumer to derive:
+        it is the question most callers actually have, it is what this record has always
+        published, and deriving it would copy crom's slug-to-boolean rule into every
+        consumer that wanted the short answer. [LAW:one-source-of-truth] it is read from
+        the state here, so the two can only ever agree.
         """
         return {
             "namespace": self.ref.namespace,
@@ -808,8 +882,9 @@ class ResolvedProfile:
             "profile_dir": str(self.profile_dir),
             "chrome_binary": str(self.chrome_binary),
             "source": str(self.source) if self.source else None,
-            "running": running,
-            "pids": list(pids),
+            "state": state.slug,
+            "running": state.running,
+            "pids": list(state.pids),
         }
 
 
