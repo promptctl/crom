@@ -108,7 +108,9 @@ overrides discovery entirely.
 ## Using crom from an app
 
 `crom up` is idempotent: it launches if nothing is running and reports the live port
-either way, so a script can call it unconditionally.
+either way, so a script can call it unconditionally. Calling it after editing `.crom.toml`
+applies the edit — a browser running something other than what the config now resolves to
+is stopped and started again on the current command line, port included.
 
 ```bash
 eval "$(crom env dev)"        # see below for what it exports
@@ -140,12 +142,21 @@ in a config and in your shell, and `CROM_REF` is the joined `namespace/name`.
 }
 ```
 
-Two commands add a key to that record. `crom restart --json` adds `stopped`, the pids it
+Three commands add keys to that record. `crom restart --json` adds `stopped`, the pids it
 killed, which is empty when the profile was not running — that is the one distinction the
 command exists to report, and the record alone cannot carry it because the record
 describes the profile rather than the act. `crom show --json` adds `started`, whether it
 had to launch the browser first, and `windows`, how many came forward — zero for a
 headless profile, which is raised successfully and simply has no window to show for it.
+`crom up --json` adds two: `found`, the drift verdict it acted on, and `stopped`, the pids
+its relaunch replaced — the same key `crom restart` publishes, with the same meaning, and
+empty unless `found.verdict` was `drifted`.
+
+`found` carries the `{"verdict", "finding", "changes"}` object described below, the one
+`crom list` and `crom config` publish under the key `drift`, and it is spelled differently
+on purpose. `drift` there is how a profile stands right now; `found` here is how it stood
+before this command put it right. One key meaning both is how a caller ends up alerting on
+a browser crom had already fixed.
 
 `crom list --json` gives an array, but not every element has that shape. A profile that
 could not be resolved appears as `{"namespace", "profile", "ref", "error"}`, and with
@@ -395,7 +406,7 @@ is only English.
 
 ```
 crom                          launch the default profile
-crom up [REF]                 launch, or report the running browser
+crom up [REF]                 launch it, or bring a running browser onto its current config
 crom down [REF]               stop it
 crom restart [REF]            stop it and start it again on its current config
 crom show [REF]               bring its window to the front, launching it if needed
@@ -471,8 +482,12 @@ Asking for a state you are already in is the simplest case of that. `crom init` 
 project that already has a `.crom.toml` reports the namespace and seed that file
 declares and exits 0 without touching it; `crom add ci` for an already-declared `ci`
 reports the seed, port, and directory `ci` resolves to and exits 0 the same way.
-`crom up` on a running browser and `crom down` on a stopped one always behaved like
-this, and now every command does.
+`crom up` on a browser already running what its config resolves to, and `crom down` on a
+stopped one, always behaved like this, and now every command does. A browser running
+something else is not a state you are already in, so `crom up` stops it and starts it
+again on the current config, naming what moved as it goes. Reporting it as already
+running would leave the edit unapplied and leave you to work out that `crom down` was the
+missing step.
 
 But converging is not ignoring. crom compares the facts you actually state — so a bare
 `crom add ci` states only the name and always converges — and any stated fact that
@@ -618,6 +633,18 @@ when there is no record or none crom can read, and `stopped` when nothing is run
 compare — a stopped profile is never drifted, since its next launch takes the current
 configuration anyway. Edit a flag under a running browser and `crom list` says so from
 that moment on.
+
+`crom up` acts on the same four verdicts, and relaunches on exactly one of them.
+`stopped` launches, `matches` reports the browser that is already there, and `drifted`
+stops it and starts it again on the current config, naming what moved before anything
+stops — including the case where the flags moved only in order, which is a real drifted
+state with no individual switch to name. `unmeasured` is the verdict `crom up` will not
+act on: crom cannot tell what that browser was launched with, which is neither agreement
+nor drift, and killing it would take the tabs of a browser that may already match. So it
+is left running, with the reason crom could not check printed beside it. A browser started
+by a crom older than the launch record reads `unmeasured` until its next launch writes
+one, which is why the first `crom up` after upgrading says crom has no record of how
+that browser was launched, once.
 
 `XDG_CONFIG_HOME` and `XDG_STATE_HOME` are honored.
 

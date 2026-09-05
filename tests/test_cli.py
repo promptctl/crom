@@ -1366,6 +1366,270 @@ class CliTest(unittest.TestCase):
         (row,) = [line for line in listing.splitlines() if "myproj/ci" in line]
         return row
 
+    # --- converging on drift ------------------------------------------------------------
+
+    # What a stubbed launch reports, distinct from the 4242 a browser is found on above, so
+    # a message naming both pids is read for the sequence it describes and not merely for
+    # containing a number.
+    RELAUNCHED = (5150,)
+
+    @contextlib.contextmanager
+    def _process_table_that(self, running: dict[str, tuple[int, ...]]):
+        """A stubbed process table that a stubbed `kill` empties and a stubbed `launch` refills.
+
+        `crom up` on a drifted browser reads the table, stops what it finds, and reads it
+        again. Answering both reads from one fixed dict would have the second find the
+        browser crom had just killed, so no relaunch would happen and the test would be
+        asserting against a sequence that cannot occur live. Modelling the table as state
+        the two effects move is what makes the ordering observable rather than assumed.
+        [LAW:no-ambient-temporal-coupling]
+
+        The stubbed launch writes the record a real one writes, and only that: the record
+        is what the *next* verdict is computed from, so a stub that skipped it would leave
+        every browser crom relaunched reading back as `unmeasured`.
+        """
+
+        def kill(profile):
+            return running.pop(str(profile.profile_dir), ())
+
+        def launch(profile):
+            launched.record(profile.profile_dir, launched.Launch.of(profile))
+            running[str(profile.profile_dir)] = self.RELAUNCHED
+            return self.RELAUNCHED
+
+        with (
+            mock.patch("crom.chrome.scan", side_effect=lambda: dict(running)),
+            mock.patch("crom.chrome.kill", side_effect=kill),
+            mock.patch("crom.chrome.launch", side_effect=launch),
+            mock.patch("crom.seed.materialize_under_lock"),
+        ):
+            yield
+
+    def test_up_relaunches_a_browser_its_config_has_moved_past(self):
+        """The epic's whole complaint, answered at the command that caused it.
+
+        `crom up` here used to print "Already running" and leave the browser on the old
+        command line, so applying an edit meant knowing, unprompted, to run `crom down`
+        first — the one thing README's convergence promise says crom never asks of you.
+        """
+        self.crom("init")
+        self.crom("add", "ci", "--flag", "--window-size=800,600")
+        directory = self._record_the_launch_of("ci")
+        self._resize_ci()
+
+        with self._process_table_that({directory: (4242,)}):
+            output = self.crom("up", "ci")
+            settled = self._ci_row(self.crom("list"))
+
+        self.assertIn("Relaunched myproj/ci", output)
+        self.assertIn("was pid 4242, now pid 5150", output)
+        self.assertIn(
+            "--window-size: launched --window-size=800,600, now --window-size=1280,800", output
+        )
+        # Which layer supplied the value the browser now carries. `drift` cannot say — it
+        # holds two argvs and no config — so this is the one assertion that the clause is
+        # actually joined on rather than merely printed near.
+        self.assertIn("(from [profiles.ci])", output)
+        # And the half a message cannot make good on: the browser crom left running is the
+        # one this configuration describes.
+        self.assertIn("running with what this configuration resolves to", settled)
+
+    def test_up_relaunches_on_a_drift_that_names_no_switch(self):
+        """Flags that moved only in order are drifted, and `Drifted.changes` is empty.
+
+        A converge written against `len(changes)` reads this as agreement and leaves the
+        browser standing on an order Chrome was not given — so this is the case that says
+        the decision is made on the verdict's type and never on the count.
+        """
+        self.crom("init")
+        self.crom("add", "ci", "--flag", "--window-size=800,600", "--flag", "--no-pings")
+        resolved = json.loads(self.crom("config", "ci", "--json"))["resolved"]
+        directory = Path(resolved["profile_dir"])
+        directory.mkdir(parents=True, exist_ok=True)
+        # The same switches, recorded in an order no current resolution produces. `argv[0]`
+        # stays put: it is the executable, not a switch, and reversing it in would be a
+        # second change on top of the one this test is about.
+        argv = resolved["argv"]
+        launched.record(directory, launched.Launch((argv[0], *reversed(argv[1:])), {}))
+
+        with self._process_table_that({str(directory): (4242,)}):
+            output = self.crom("up", "ci")
+
+        self.assertIn("Relaunched myproj/ci", output)
+        self.assertIn("its flags are in a different order", output)
+
+    def test_up_will_not_relaunch_a_browser_it_cannot_measure(self):
+        """"crom cannot tell" is neither "nothing changed" nor "something changed".
+
+        Every browser a crom older than the launch record started arrives here, so
+        relaunching would make the upgrade itself kill a running browser — and take the
+        user's tabs with it — on no evidence at all. Reporting a bare "Already running" is
+        the other way to be wrong: crom would be claiming a check it never made.
+        """
+        self.crom("init")
+        self.crom("add", "ci", "--flag", "--window-size=800,600")
+        directory = json.loads(self.crom("config", "ci", "--json"))["resolved"]["profile_dir"]
+        Path(directory).mkdir(parents=True, exist_ok=True)
+
+        with self._process_table_that({directory: (4242,)}):
+            record = json.loads(self.crom("up", "ci", "--json"))
+            spoken = self.crom("up", "ci")
+
+        self.assertEqual(record["found"]["verdict"], "unmeasured")
+        self.assertEqual(record["stopped"], [])
+        self.assertEqual(record["pids"], [4242])
+        self.assertIn("Already running myproj/ci", spoken)
+        self.assertIn("crom has no record of how the browser in", spoken)
+
+    def test_up_leaves_a_browser_that_already_matches_alone(self):
+        """Idempotence, which converging must not cost. README promises `crom up` on a
+        running browser behaves like the end state it names, and a relaunch here would
+        make the command that reports agreement the one that destroys it."""
+        self.crom("init")
+        self.crom("add", "ci", "--flag", "--window-size=800,600")
+        directory = self._record_the_launch_of("ci")
+
+        with self._process_table_that({directory: (4242,)}):
+            record = json.loads(self.crom("up", "ci", "--json"))
+
+        self.assertEqual(record["found"]["verdict"], "matches")
+        self.assertEqual(record["stopped"], [])
+        self.assertEqual(record["pids"], [4242])
+
+    def test_up_json_carries_the_verdict_it_acted_on_and_the_pids_it_replaced(self):
+        """What a script that ran `crom up` to apply an edit needs: whether anything was
+        actually replaced, and why.
+
+        Spelled `found` rather than `drift` deliberately. `crom list` and `crom config`
+        publish `drift` for how a profile stands *now*; this is how it stood before this
+        command fixed it, and one key meaning both across the JSON surface is how a
+        consumer comes to alert on a browser crom had already put right.
+        """
+        self.crom("init")
+        self.crom("add", "ci", "--flag", "--window-size=800,600")
+        directory = self._record_the_launch_of("ci")
+        self._resize_ci()
+
+        # `stdout` and not the merged stream: a drifted `up` also says on stderr that it is
+        # replacing the browser, and a `--json` caller parses one of the two.
+        with self._process_table_that({directory: (4242,)}):
+            record = json.loads(self.invoke("up", "ci", "--json").stdout)
+
+        self.assertEqual(record["found"]["verdict"], "drifted")
+        self.assertEqual(
+            record["found"]["changes"],
+            [
+                {
+                    "subject": "--window-size",
+                    "launched": "--window-size=800,600",
+                    "resolves": "--window-size=1280,800",
+                }
+            ],
+        )
+        self.assertEqual(record["stopped"], [4242])
+        self.assertEqual(record["pids"], list(self.RELAUNCHED))
+
+    def test_up_names_a_change_no_layer_supplies_without_inventing_one(self):
+        """The two changes that have no layer clause to carry, in one relaunch.
+
+        A switch the config has since removed has no current side to attribute at all, and
+        an environment variable is not a switch — no layer *emits* one, so the provenance
+        `crom config` computes has nothing to say about it. Both are reported as changes,
+        and a clause on either would be crom naming a source it does not have.
+        """
+        self.crom("init")
+        self.crom("add", "ci", "--flag", "--window-size=800,600")
+        directory = self._record_the_launch_of("ci", env={"TZ": "UTC"})
+        config_path = self.project / ".crom.toml"
+        config_path.write_text(
+            config_path.read_text().replace(
+                'flags = ["--window-size=800,600"]', 'env = { TZ = "America/Denver" }'
+            )
+        )
+
+        with self._process_table_that({directory: (4242,)}):
+            output = self.crom("up", "ci")
+
+        self.assertIn("--window-size: launched --window-size=800,600, now (absent)", output)
+        self.assertIn("env TZ: launched UTC, now America/Denver", output)
+        self.assertNotIn("(from", output)
+
+    def test_show_raises_a_drifted_window_rather_than_replacing_it(self):
+        """Converging is `crom up`'s job, and it is the whole difference between the two
+        commands now that they share a start path.
+
+        `show` names one end state — that window, in front — and a user who asked for it
+        would otherwise have crom close the window instead, on the strength of a config
+        edit they made after the browser started. The shared helper hands `show` the same
+        verdict `up` acts on, so nothing but this keeps the convergence out of it.
+        """
+        self.crom("init")
+        self.crom("add", "ci", "--flag", "--window-size=800,600")
+        directory = self._record_the_launch_of("ci")
+        self._resize_ci()
+
+        with self._process_table_that({directory: (4242,)}):
+            with mock.patch("crom.cli.window.raise_profile", return_value=1):
+                record = json.loads(self.crom("show", "ci", "--json"))
+
+        self.assertEqual(record["pids"], [4242])
+        self.assertFalse(record["started"])
+
+    def test_up_says_why_it_is_replacing_a_browser_before_it_stops_it(self):
+        """On stderr, and before the kill, for the reason `restart` says what it stopped
+        before starting again: a relaunch whose start half fails leaves the user with no
+        browser, and an error naming only the start would hide that crom stopped the
+        working one they had. It doubles as the progress line for the pause."""
+        self.crom("init")
+        self.crom("add", "ci", "--flag", "--window-size=800,600")
+        directory = self._record_the_launch_of("ci")
+        self._resize_ci()
+
+        with self._process_table_that({directory: (4242,)}):
+            result = self.invoke("up", "ci")
+
+        self.assertIn("drifted — --window-size; replacing it", result.stderr)
+        # Convergence is work crom did that the user did not ask for, so it goes where
+        # crom says such things and not into the answer a script parses.
+        self.assertNotIn("replacing it", result.stdout)
+
+    def test_up_says_it_was_replacing_a_browser_when_either_half_fails(self):
+        """A relaunch that fails half-way leaves the user with no browser at all.
+
+        `restart` has the same hazard and the same guard, but here it bites harder: the
+        user asked for a browser, not for a restart, and crom went to replace the working
+        one on its own initiative because a config edit said so. Told only that stopping
+        or starting failed, they have no reason to connect it to the edit they made.
+
+        Both halves, because the line is emitted before either runs and only a test of
+        each says so. The stop half fails for real when a stranger holds the CDP port —
+        `chrome.kill` refuses rather than guessing — and that arm never reaches the second
+        read of the process table, which is why it offers only one.
+        """
+        self.crom("init")
+        self.crom("add", "ci", "--flag", "--window-size=800,600")
+        self._record_the_launch_of("ci")
+        self._resize_ci()
+        halves = (
+            ("the stop", [(4242,)], {"side_effect": Reason.CHROME_STOP_FAILED.error("port held")}),
+            ("the start", [(4242,), ()], {"return_value": (4242,)}),
+        )
+
+        for half, reads, killing in halves:
+            with self.subTest(half=half):
+                with (
+                    mock.patch("crom.cli.seed.materialize_under_lock"),
+                    mock.patch("crom.cli.chrome.find_pids", side_effect=reads),
+                    mock.patch("crom.cli.chrome.kill", **killing),
+                    mock.patch(
+                        "crom.cli.chrome.launch",
+                        side_effect=Reason.CHROME_STARTUP_FAILED.error("Chrome exited 1"),
+                    ),
+                ):
+                    result = self.invoke("up", "ci", expect=1)
+
+                self.assertIn("myproj/ci drifted — --window-size; replacing it", result.output)
+
     def test_mcp_wires_the_profile_port(self):
         self.crom("init")
         port = self.crom("port").strip()
