@@ -2233,6 +2233,164 @@ class CliTest(unittest.TestCase):
         self.assertIn(f"{config_file} is gone", errors[1])
         self.assertIn("1 namespace(s) crom could not check", self.crom("doctor"))
 
+    # --- every leak at once -----------------------------------------------------------
+
+    @contextlib.contextmanager
+    def _a_machine_carrying_every_leak(self):
+        """One machine with all four detections firing, which nothing else here builds.
+
+        Every test above breaks one thing and asserts crom sees it, and no number of those
+        can catch a detection that *shadows* another. `doctor.survey` leaves room for it:
+        one `consulted` dict answers both halves of the survey for every namespace, and
+        the process table is read once for every row — so a config that will not parse in
+        one namespace has to leave the next namespace's answer untouched, and a machine
+        with a single fault cannot say whether it does. [LAW:verifiable-goals]
+
+        Four namespaces, arranged so all three standings and all four livenesses appear at
+        once and each is somebody's only claim:
+
+        - `myapp` — `dev` is declared with its own browser up, and an interrupted seed left
+          a staging directory under its root; `alpha` was dropped from the config while a
+          stranger took its port.
+        - `broken` — reserved a port and then stopped parsing, so crom refuses to guess
+          about the reservation and about the profile root alike.
+        - `gone` — config deleted and its profile root replaced by a regular file. The one
+          namespace here that yields two staging findings, which is what a reader keyed by
+          namespace would silently drop.
+        - `user` — untouched, so there is a clean row in the answer to lose.
+
+        Plus `../alpha`, a ledger key naming no namespace — hand-editing this file is how
+        an orphan was released before `crom release` existed, so the machines that need
+        this command are the machines that have been hand-edited. It is here for both
+        halves at once: the row has to survive into the report, and the scan has to
+        decline to walk out of the profiles root after it.
+        """
+        dev_only = f'namespace = "myapp"\n\n[profiles.dev]\nport = 9401\nseed = "{self.root / "seed"}"\n'
+        self._interrupted_seed(dev_only + "[profiles.alpha]\nport = 9402\n")
+        self.crom("list")  # reserves alpha; dev's port was taken by the seeded run
+        (self.project / ".crom.toml").write_text(dev_only)  # and now nothing declares alpha
+
+        broken = self.root / "brokenproj"
+        broken.mkdir()
+        (broken / ".crom.toml").write_text('namespace = "broken"\n\n[profiles.x]\nport = 9403\n')
+        self.crom("list", cwd=broken)
+        (broken / ".crom.toml").write_text('namespace = "broken"\n\n[profiles.x\n')
+
+        gone = self.root / "goneproj"
+        gone.mkdir()
+        (gone / ".crom.toml").write_text('namespace = "gone"\n\n[profiles.y]\nport = 9404\n')
+        self.crom("list", cwd=gone)
+        (gone / ".crom.toml").unlink()
+        # A regular file where the root belongs, rather than `chmod 0`, which does not stop
+        # a suite running as root: `NotADirectoryError` is an `OSError` that is not
+        # `FileNotFoundError`, which is the arm this needs.
+        (state_home() / "profiles").mkdir(parents=True, exist_ok=True)
+        (state_home() / "profiles" / "gone").write_text("not a directory")
+
+        ledger = json.loads(registry_file().read_text())
+        ledger["ports"]["../alpha"] = {
+            "port": 9405,
+            "pinned": False,
+            "source": str(self.project / ".crom.toml"),
+        }
+        registry_file().write_text(json.dumps(ledger))
+
+        def port_is_free(port: int) -> bool:
+            """Who is on each port: nobody, somebody, or a question that would not answer.
+
+            This settles `idle` and `unprobed` outright and leaves the two held ports for
+            the process table to tell apart — 9401 is `dev`'s own browser and 9402 is a
+            stranger on `alpha`'s number, which is the pair a survey reading one probe for
+            the whole machine would collapse.
+            """
+            if port == 9403:
+                raise Reason.PORT_CHECK_FAILED.error(
+                    "could not check whether port 9403 is free: [Errno 24] Too many open files"
+                )
+            return port not in (9401, 9402)
+
+        with (
+            mock.patch("crom.chrome.port_is_free", port_is_free),
+            mock.patch(
+                "crom.chrome.scan",
+                return_value={str(state_home() / "profiles" / "myapp" / "dev"): (4242,)},
+            ),
+        ):
+            yield
+
+    def test_doctor_reports_every_leak_on_a_machine_that_has_them_all(self):
+        """Every standing and every liveness in one run, asserted as the whole answer.
+
+        The comparison is an equality over all six rows rather than a lookup per row, and
+        that is the point of it: a detection that dropped a row, doubled one, or answered
+        for a neighbour would pass every `assertIn` and fail here. The leaf tests each
+        prove a verdict is reachable; this proves the six of them coexist.
+        [LAW:verifiable-goals]
+
+        Both axes on every row, because their independence is what regresses first. Three
+        rows here are orphaned and no two of them agree about who holds the port, and
+        `myapp/alpha` is orphaned *and* stolen — the row a reader is being told to act on,
+        and the one a survey that folded the axes together could not describe.
+        """
+        with self._a_machine_carrying_every_leak():
+            rows = self._rows()
+
+        self.assertEqual(
+            {
+                "user/default": ("declared", "idle"),
+                "myapp/dev": ("declared", "own"),
+                "myapp/alpha": ("orphaned", "foreign"),
+                "broken/x": ("unchecked", "unprobed"),
+                "gone/y": ("orphaned", "idle"),
+                "../alpha": ("orphaned", "idle"),
+            },
+            {ref: (row["standing"], row["liveness"]) for ref, row in rows.items()},
+        )
+
+    def test_doctor_keeps_both_staging_findings_of_the_namespace_with_two(self):
+        """The array where one namespace speaks twice, and the reader that would halve it.
+
+        `gone` has a config that was deleted and a profile root that is a regular file, so
+        both arms answer: the scan reports the root it could not read, and the `_Gone` arm
+        appends the caveat that a `state_dir` that config declared would have put the
+        profiles somewhere crom can no longer name. Two entries saying different things,
+        and any helper shaped like `{item["namespace"]: item}` keeps whichever came last.
+        So this asserts the whole array as a list. [LAW:no-silent-failure]
+
+        The array is asserted whole rather than searched, which is what also holds the
+        scan open to the end. `broken` is the first namespace it walks and the first it
+        cannot read, so a scan that gave up there would lose `myapp`'s real leak and both
+        of `gone`'s findings behind it — and every one of those is a leak a reader is here
+        to be shown.
+        """
+        with self._a_machine_carrying_every_leak():
+            found = self._staging()
+
+        self.assertEqual(["myapp", "broken", "gone", "gone"], [item["namespace"] for item in found])
+        self.assertEqual(4096, found[0]["bytes"])
+        self.assertTrue(Path(found[0]["path"]).name.startswith(".dev."))
+        errors = [item["error"] for item in found if item["namespace"] == "gone"]
+        self.assertIn(f"{state_home() / 'profiles' / 'gone'} could not be read", errors[0])
+        self.assertIn(f"{self.root / 'goneproj' / '.crom.toml'} is gone", errors[1])
+
+    def test_doctor_counts_each_kind_of_leak_over_the_collection_it_is_about(self):
+        """Three counts that only diverge on a machine leaking in more than one way.
+
+        Every machine above leaks one way, so its counts nearly coincide and a line
+        totalling the wrong collection reads correctly on all of them. Here they separate:
+        six reservations, one staging directory, and a `staging` array of four — so a
+        summary counting that array would announce four abandoned profile copies, three of
+        which are namespaces crom could not look at. Those namespaces are two, not the
+        three entries they wrote. [FRAMING:representation] the entries are the territory;
+        these lines are a map of it, and this is the machine where a wrong map shows.
+        """
+        with self._a_machine_carrying_every_leak():
+            report = self.crom("doctor")
+
+        self.assertIn(f"6 reservation(s) in {registry_file()}", report)
+        self.assertIn("1 staging directory(s) from a seed", report)
+        self.assertIn("2 namespace(s) crom could not check", report)
+
     # --- handing leaked state back ---------------------------------------------------
 
     def _orphan_beta(self) -> None:
