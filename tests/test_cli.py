@@ -22,6 +22,7 @@ from itertools import takewhile
 from pathlib import Path
 from unittest import mock
 
+from click.shell_completion import ShellComplete
 from click.testing import CliRunner
 
 from crom import chrome, cli, config, configwrite, doctor, launched, mcp, migrate, operations, registry
@@ -169,6 +170,31 @@ class CliTest(unittest.TestCase):
         """What a script sees: stdout and stderr as one stream, which is what a terminal
         shows. `invoke` is for the few tests that need the two told apart."""
         return self.invoke(*args, cwd=cwd, expect=expect).output
+
+    def suggestions(self, *args) -> tuple[str, ...]:
+        """The commands crom offered for a word it did not recognise, in the order shown.
+
+        Read out of the rendered section rather than from `_nearest`, because what is
+        under test is what reaches the terminal. `expect=2` is the assertion the ticket
+        asks for: click's usage-error code survives crom having something to add.
+
+        An empty tuple is a real answer here — it means crom printed its whole map
+        instead of a suggestion, which is a different thing to have said. That
+        distinction is why this parses the "Did you mean" heading rather than searching
+        the output for a command name: the map names every command, so `assertIn("mcp",
+        ...)` would pass just as green on a run that suggested nothing at all.
+
+        Rows are found by their indent, not by taking the first word of every line.
+        `write_dl` writes a name at two spaces and wraps its help to the second column,
+        so in a terminal narrow enough to wrap — `COLUMNS=60` reaches it, and `config`'s
+        help clears the default width by one character — the first word of a continuation
+        line reads as a command crom never offered. This suite is green under `CliRunner`
+        only because it pins a width, which makes the developer's terminal an input to
+        the assertion. [LAW:no-ambient-temporal-coupling] Matching the row indent settles
+        it in the parse rather than by holding the width still.
+        """
+        offered = self.crom(*args, expect=2).partition("Did you mean:\n")[2]
+        return tuple(re.findall(r"^ {2}(\S+)", offered, flags=re.MULTILINE))
 
     # --- bootstrap ------------------------------------------------------------------
 
@@ -3908,6 +3934,125 @@ class CliTest(unittest.TestCase):
         self.assertEqual(sorted(listed), sorted(set(listed)), "a command is listed twice")
         self.assertEqual(set(cli.main.commands) - set(listed), set(), "ungrouped command(s)")
         self.assertEqual(set(listed) - set(cli.main.commands), set(), "section names a dead command")
+
+    def test_a_real_command_with_an_invented_suffix_routes_to_the_real_one(self):
+        """`crom mcp-serve` — a real user's actual failure, and the reason the ticket
+        exists. It is not a misspelling of `mcp`: it is `mcp` with a word appended, which
+        difflib rates 0.5 and would never offer at any cutoff worth having. The
+        containment arm of `_closeness` is the only thing that reaches it.
+        """
+        self.assertEqual(self.suggestions("mcp-serve"), ("mcp",))
+
+    def test_a_typo_one_character_off_routes_to_the_real_command(self):
+        """`crom confg`, the other half of the pair: nothing contains anything here, so
+        this is the arm containment cannot answer and difflib must."""
+        self.assertEqual(self.suggestions("confg"), ("config",))
+
+    def test_a_word_near_nothing_gets_the_whole_command_list_instead(self):
+        """No near match is not an empty suggestion; it is crom saying it does not know,
+        and the useful answer to that is the map. [LAW:parse-dont-validate]
+
+        Asserted against the section headings rather than against a command name, because
+        the map names every command — a test looking for a name could not tell this
+        answer from the suggestion arm, and would stay green if the two were swapped.
+        [LAW:one-source-of-truth] the headings are read from `_COMMAND_SECTIONS` so this
+        agrees with the curation by construction.
+        """
+        output = self.crom("zzzqqq", expect=2)
+        self.assertNotIn("Did you mean", output)
+        for title, _names in cli._COMMAND_SECTIONS:
+            self.assertIn(title, output)
+
+    def test_a_single_character_is_not_treated_as_a_word(self):
+        """One keystroke names no command, and crom's answer to it is the map.
+
+        Five characters because a floor on one arm of the measure is not a floor. `o`
+        begins nothing and reaches crom through difflib alone; `u` and `r` begin `up`
+        and `rm`, the two-letter commands; `m` and `p` end them, and difflib rates a
+        one-of-two-character match 0.667 — over the cutoff. A test holding only `o`
+        passes just as green while `crom u` answers "Did you mean: up", which is how
+        this shipped in the first place.
+        """
+        for word in ("o", "u", "r", "m", "p"):
+            with self.subTest(word=word):
+                self.assertEqual(self.suggestions(word), ())
+
+    def test_a_coincidental_run_of_letters_is_not_a_command(self):
+        """crom's two-letter commands are a letter-run away from ordinary words, and a
+        perfect score handed to a coincidence outranks every real match beneath it.
+
+        Four words because this bug has been fixed twice in the wrong place. Scored on
+        where a command *appears*, `confirm` ended in `rm` and put crom's one destructive
+        command above the `config` the user meant. Scored on what the word *starts with*,
+        the same `rm` reappeared under `rmdir`, and `up` under `update` and `upload` —
+        the failure moved from the middle of the word to its front rather than leaving.
+        Only an exact name up to a word boundary answers all four, which is why all four
+        are here: `confirm` alone stays green while `rmdir` offers to delete a profile.
+        """
+        for word, offered in (
+            ("confirm", ("config",)),
+            ("rmdir", ()),
+            ("update", ()),
+            ("upload", ()),
+        ):
+            with self.subTest(word=word):
+                self.assertEqual(self.suggestions(word), offered)
+
+    def test_the_suggestion_reader_is_not_fooled_by_a_wrapped_row(self):
+        """A guard on this file's own helper, because four tests above assert through it.
+
+        `write_dl` wraps a row's help to the second column in a narrow terminal, and
+        `config`'s help clears the default width by one character — so reading the first
+        word of every line reports `profile`, the first word of the continuation, as a
+        command crom offered. `CliRunner` pins a width, so the suite never meets the
+        wrap; that is what makes the developer's terminal an undeclared input rather
+        than what makes the helper safe. [LAW:no-ambient-temporal-coupling]
+
+        Narrowed through `terminal_width`, click's own context setting, because
+        `CliRunner` pins `FORCED_WIDTH` to 80 for the length of an invocation and
+        restores it after — so the width every other test here runs at is not one this
+        suite chose, and not one it can override the way a terminal would. The first
+        assertion is the load-bearing half: a render that stopped wrapping would leave
+        the second passing for the wrong reason.
+        """
+        with mock.patch.dict(cli.main.context_settings, {"terminal_width": 52}):
+            self.assertIn("\n          profile", self.crom("confirm", expect=2))
+            self.assertEqual(self.suggestions("confirm"), ("config",))
+
+    def test_a_command_typed_in_the_wrong_case_still_routes_to_it(self):
+        """`crom UP` is an exact match wearing a different case, and an unfolded
+        comparison scores it 0 — the whole map, for the one input crom knows most
+        certainly. Caps lock and shell history are how a user gets here."""
+        self.assertEqual(self.suggestions("UP"), ("up",))
+
+    def test_completing_a_half_typed_command_is_not_a_refusal(self):
+        """`crom mcp-ser <TAB>` reaches the same lookup a typed command does, and click
+        answers it with no command rather than an error on purpose. Refusing there would
+        put crom's new message on the user's terminal every time they pressed tab — a
+        break no test that runs a command can see, because completion never runs one.
+
+        The word is complete and the cursor past it, which is what `args`/`incomplete`
+        below say: click resolves the words already typed and completes the one being
+        typed, so the half-word itself never reaches `resolve_command`.
+        """
+        completer = ShellComplete(cli.main, {}, "crom", "_CROM_COMPLETE")
+        self.assertTrue(completer.get_completions(["mcp-ser"], ""))
+
+    def test_an_unknown_option_still_gets_clicks_own_refusal(self):
+        """A word crom can measure against its commands and a mistyped option are two
+        different failures, and crom answers only the first.
+
+        `--nope` is refused by the group's parser before resolution runs; `-- --nope`
+        puts the same token where a command goes and reaches resolution, which is the
+        one way an option-shaped word arrives. Both keep click's sentence, because
+        "No such option" is the true one — a map of sixteen commands, none of them
+        starting with a dash, would be crom answering a question it was not asked.
+        """
+        for argv in (("--nope",), ("--", "--nope")):
+            with self.subTest(argv=argv):
+                output = self.crom(*argv, expect=2)
+                self.assertIn("No such option", output)
+                self.assertNotIn("Did you mean", output)
 
     def test_every_config_key_the_parser_accepts_is_named_in_help(self):
         """crom's primary reader is an agent that gets one look at `--help` and then
