@@ -418,7 +418,7 @@ class _Gone:
     and not a `_Read` with an assumed root.
 
     *Project* is the whole of it, and the user config does not want a fourth outcome
-    beside this one. `cli._bootstrap_user_config` writes it from
+    beside this one. `session._bootstrap_user_config` writes it from
     `CromGroup.command_class.invoke`, before the body of every command including this
     one, so by the time `survey` looks there is a file there to read. A separate outcome
     for the user config that was never written describes a state this program cannot

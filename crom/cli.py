@@ -36,7 +36,6 @@ from . import (
     drift,
     flags,
     mcp,
-    migrate,
     reclaim,
     registry,
     report,
@@ -44,7 +43,7 @@ from . import (
     seed,
     window,
 )
-from .config import discover, load_ambient, load_user_scope, parse_layer, parse_port, parse_seed
+from .config import discover, load_user_scope, parse_layer, parse_port, parse_seed
 from .model import (
     DEFAULT_SEED,
     DEFAULTS_STANZA,
@@ -63,12 +62,12 @@ from .model import (
     ResolvedProfile,
     Resolution,
     Scope,
-    parse_ref,
     profile_stanza,
     slug_for,
     validate_name,
 )
 from .paths import PROJECT_CONFIG_CANDIDATES, user_config_file
+from .session import Session
 
 EXIT_FAILURE = 1
 EXIT_NOT_FOUND = 3
@@ -157,7 +156,7 @@ _ANSWERS = (
 )
 
 # Where a parsed `--json` is recorded, under the key `_json_option` writes and `_answer`
-# reads. `Context.meta` and not the `_Session` on `ctx.obj`: meta is one dict shared by
+# reads. `Context.meta` and not the `Session` on `ctx.obj`: meta is one dict shared by
 # click's whole context tree, so it is readable from the group without depending on the
 # group callback having already built a session.
 _JSON_REQUESTED = "crom.json_requested"
@@ -258,16 +257,16 @@ _COMMAND_SECTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
 class CromCommand(click.Command):
     """Gets crom ready to run a command, once click knows which command that is.
 
-    Migration and the user-config bootstrap can both refuse — `_require_all_stopped`
-    raises on a legacy install whose Chrome is still up, and bootstrapping fails on a
-    home crom cannot write. They ran from the group callback, which click calls *before*
-    `make_context` parses the invoked subcommand, so `--json` had not been recorded yet
-    and `_answer` had nothing to honour: `crom list --json` answered a refusal with prose
-    and an empty stdout. Moving the work here does not catch that failure earlier, it
-    makes it happen later — past the parse, where the flag is already known and the
-    boundary can answer for it like any other. [LAW:no-ambient-temporal-coupling] the
-    ordering is stated as a place rather than left to which of click's phases happens to
-    run first.
+    `Session.begin` can refuse — a legacy install whose Chrome is still up, a home crom
+    cannot write — and *where* that refusal lands is this class's whole subject; what it
+    is refusing over belongs to `session.py` and is not spelled a second time here.
+    Readying ran from the group callback, which click calls *before* `make_context`
+    parses the invoked subcommand, so `--json` had not been recorded yet and `_answer`
+    had nothing to honour: `crom list --json` answered a refusal with prose and an empty
+    stdout. Calling it here does not catch that failure earlier, it makes it happen later
+    — past the parse, where the flag is already known and the boundary can answer for it
+    like any other. [LAW:no-ambient-temporal-coupling] the ordering is stated as a place
+    rather than left to which of click's phases happens to run first.
 
     `CromGroup.command_class` is what makes it a rule instead of a habit: every command
     built by `@main.command` is this class, so a command added tomorrow is ready without
@@ -281,9 +280,7 @@ class CromCommand(click.Command):
     """
 
     def invoke(self, ctx):
-        migrate.run_if_needed()
-        _bootstrap_user_config()
-        ctx.obj = _Session()
+        ctx.obj = Session.begin()
         return super().invoke(ctx)
 
 
@@ -378,38 +375,6 @@ class CromGroup(click.Group):
                     formatter.write_dl(rows)
 
 
-class _Session:
-    """Lazily-loaded ambient state, so `crom init` need not find a config or a Chrome."""
-
-    def __init__(self):
-        self._scope: Scope | None = None
-
-    @property
-    def scope(self) -> Scope:
-        if self._scope is None:
-            self._scope = load_ambient()
-            if self._scope.source and not self._scope.is_user:
-                # Remembering the namespace here — the moment crom reads a project
-                # config — is what lets `crom up thatproject/dev` work from anywhere.
-                registry.remember_namespace(self._scope.namespace, self._scope.source)
-        return self._scope
-
-    def profile(self, ref_text: str) -> ResolvedProfile:
-        """A profile that must already be declared — for `down` and `rm`."""
-        return resolver.resolve(parse_ref(ref_text, self.scope.namespace), self.scope)
-
-    def working(self, ref_text: str) -> ResolvedProfile:
-        """A profile to work with, declared on the spot if nothing declares it yet.
-
-        The split is the whole of crom's stance on prerequisites, stated as two calls
-        rather than as a flag: a command asking *where profile X is* gets it created, a
-        command asking crom to *take X away* does not. [LAW:types-are-the-program] a
-        `declare=True` parameter would have made "create the profile I am about to
-        delete" expressible at every call site.
-        """
-        return resolver.resolve_or_declare(parse_ref(ref_text, self.scope.namespace), self.scope)
-
-
 def _emit(as_json: bool, payload, lines: list[str]) -> None:
     """Render one successful result. The last inch of UI, and the only place a *result*
     chooses its format — a failure has two readers at once, so it renders in
@@ -485,39 +450,6 @@ def _moved(verdict: drift.Drifted, notes: dict[str, str]) -> list[str]:
 def _status(profile: ResolvedProfile, live: dict[str, tuple[int, ...]]) -> tuple[bool, tuple[int, ...]]:
     pids = live.get(str(profile.profile_dir), ())
     return bool(pids), pids
-
-
-def _bootstrap_user_config() -> None:
-    """On a machine with no user config, declare the profile a bare `crom up` expects.
-
-    Written explicitly into the file rather than defaulted in code, so `user/default`
-    cloning your real Chrome profile is a visible, editable decision and not folklore.
-    """
-    # Repairing first is what makes the write below safe on a user config crom cannot
-    # read. `configwrite._load` raises on such a file, and this function runs before every
-    # command — so an unreadable `~/.config/crom/config.toml` failed all of them, the ones
-    # that would have repaired it included. [LAW:no-ambient-temporal-coupling] the
-    # ordering is the repair's, and stating it here is what keeps it from being luck.
-    #
-    # `repair_unreadable`, not `load_user_scope`: loading resolves `chrome_binary`, which
-    # would make `find_chrome()` a precondition of every command including `crom init` —
-    # the one `_Session` exists to keep working on a machine with no Chrome yet. Whether a
-    # file tokenizes as TOML is a question about bytes and asks nothing of the machine.
-    config.repair_unreadable(user_config_file(), namespace=USER_NAMESPACE)
-    # The seed comes from `model.DEFAULT_SEED`, which the project template renders too.
-    # The literal `SeedChrome()` that used to sit here was the half of the disagreement
-    # that happened to be right. [LAW:one-source-of-truth]
-    #
-    # `ensure_profile`, not `add_profile`: the goal is that the declaration *exist*, not
-    # that this process be the one to write it. On a fresh machine two crom invocations
-    # both find no user config and both try; `add_profile` raises FileExistsError at the
-    # loser — a reported failure for a race that harmed nothing. Converging makes it a
-    # no-op instead of an error to catch.
-    configwrite.ensure_profile(
-        user_config_file(),
-        ProfileSpec(name="default", seed=DEFAULT_SEED),
-        header=configwrite.USER_CONFIG_HEADER,
-    )
 
 
 @click.group(cls=CromGroup)
@@ -659,7 +591,7 @@ class _OnDrift(Enum):
 )
 @_json_option
 @click.pass_obj
-def up_cmd(session: _Session, ref: str, no_restart: bool, as_json: bool):
+def up_cmd(session: Session, ref: str, no_restart: bool, as_json: bool):
     """Bring a profile up on its current config, whatever is running.
 
     Idempotent: a browser already running what this config resolves to is reported, not
@@ -791,7 +723,7 @@ def up_cmd(session: _Session, ref: str, no_restart: bool, as_json: bool):
 @click.argument("ref", required=False, default="default")
 @_json_option
 @click.pass_obj
-def down_cmd(session: _Session, ref: str, as_json: bool):
+def down_cmd(session: Session, ref: str, as_json: bool):
     """Stop a running profile."""
     profile = session.profile(ref)
     # Under the same lock `up` and `rm` hold. `up` keeps it from before seeding until CDP
@@ -816,7 +748,7 @@ def down_cmd(session: _Session, ref: str, as_json: bool):
 @click.argument("ref", required=False, default="default")
 @_json_option
 @click.pass_obj
-def restart_cmd(session: _Session, ref: str, as_json: bool):
+def restart_cmd(session: Session, ref: str, as_json: bool):
     """Stop a profile and start it again on its current config."""
     profile = session.working(ref)
     # Both halves under one hold of the lock, which is the whole of what this command adds
@@ -870,7 +802,7 @@ def restart_cmd(session: _Session, ref: str, as_json: bool):
 @click.argument("ref", required=False, default="default")
 @_json_option
 @click.pass_obj
-def show_cmd(session: _Session, ref: str, as_json: bool):
+def show_cmd(session: Session, ref: str, as_json: bool):
     """Bring a profile's window to the front, launching it if it is not running."""
     profile = session.working(ref)
     # Starting and raising under one hold, so the PIDs raised are the PIDs observed. A
@@ -923,7 +855,7 @@ def show_cmd(session: _Session, ref: str, as_json: bool):
 @click.option("--all", "everything", is_flag=True, help="Include every namespace crom knows.")
 @_json_option
 @click.pass_obj
-def list_cmd(session: _Session, everything: bool, as_json: bool):
+def list_cmd(session: Session, everything: bool, as_json: bool):
     """List the profiles addressable from here."""
     scopes, unavailable = _scopes_to_list(session, everything)
 
@@ -955,7 +887,7 @@ def list_cmd(session: _Session, everything: bool, as_json: bool):
     _emit(as_json, records, lines)
 
 
-def _scopes_to_list(session: _Session, everything: bool) -> tuple[list[Scope], list[tuple[str, str]]]:
+def _scopes_to_list(session: Session, everything: bool) -> tuple[list[Scope], list[tuple[str, str]]]:
     """The scopes `crom list` should report, plus the namespaces it could not load.
 
     A remembered namespace whose config file has been deleted or moved raises `NotFound`
@@ -1105,7 +1037,7 @@ def _reject_restatement(
 @click.option("--flag", "flag_texts", multiple=True, help="Chrome flag; repeatable.")
 @click.option("--port", type=int, default=None, help="Pin the CDP port instead of letting crom assign one.")
 @click.pass_obj
-def add_cmd(session: _Session, name: str, seed_text: str | None, flag_texts: tuple[str, ...], port: int | None):
+def add_cmd(session: Session, name: str, seed_text: str | None, flag_texts: tuple[str, ...], port: int | None):
     """Declare a profile in the config governing this directory. Idempotent."""
     validate_name("profile name", name)
     scope = session.scope
@@ -1293,7 +1225,7 @@ def add_cmd(session: _Session, name: str, seed_text: str | None, flag_texts: tup
 @click.option("--yes", is_flag=True, help="Skip the confirmation prompt.")
 @click.option("--keep-data", is_flag=True, help="Undeclare the profile but leave its directory.")
 @click.pass_obj
-def rm_cmd(session: _Session, ref: str, yes: bool, keep_data: bool):
+def rm_cmd(session: Session, ref: str, yes: bool, keep_data: bool):
     """Stop a profile if it is running, undeclare it, release its port, delete its data."""
     profile = session.profile(ref)
 
@@ -1508,7 +1440,7 @@ def init_cmd(namespace: str | None, seed_text: str | None):
 @click.argument("ref", required=False)
 @_json_option
 @click.pass_obj
-def config_cmd(session: _Session, ref: str | None, as_json: bool):
+def config_cmd(session: Session, ref: str | None, as_json: bool):
     """Show the config in effect, and how a profile resolves flag by flag.
 
     With a REF, every flag of the launch command is printed with the layer that
@@ -1728,7 +1660,7 @@ def config_cmd(session: _Session, ref: str | None, as_json: bool):
 @main.command("port")
 @click.argument("ref", required=False, default="default")
 @click.pass_obj
-def port_cmd(session: _Session, ref: str):
+def port_cmd(session: Session, ref: str):
     """Print a profile's CDP port and nothing else."""
     click.echo(session.working(ref).port)
 
@@ -1736,7 +1668,7 @@ def port_cmd(session: _Session, ref: str):
 @main.command("env")
 @click.argument("ref", required=False, default="default")
 @click.pass_obj
-def env_cmd(session: _Session, ref: str):
+def env_cmd(session: Session, ref: str):
     """Print shell exports for a profile: eval "$(crom env dev)"."""
     profile = session.working(ref)
     # `CROM_PROFILE` is the profile *name*, matching what the same spelling means inside
@@ -1795,7 +1727,7 @@ def _legacy_notes(legacy: mcp.Legacy, ref: ProfileRef, key: str, path: str) -> t
 @click.argument("ref", required=False, default="default")
 @click.option("--path", "path", default=".mcp.json", help="File to write.")
 @click.pass_obj
-def mcp_cmd(session: _Session, ref: str, path: str):
+def mcp_cmd(session: Session, ref: str, path: str):
     """Wire chrome-devtools-mcp at a profile by writing .mcp.json here."""
     profile = session.working(ref)
     legacy = mcp.write(profile, Path(path))
