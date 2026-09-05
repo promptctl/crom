@@ -23,7 +23,7 @@ from unittest import mock
 
 from click.testing import CliRunner
 
-from crom import cli, config, configwrite, doctor, mcp, migrate
+from crom import cli, config, configwrite, doctor, mcp, migrate, registry
 from crom.config import load_ambient
 from crom.model import USER_NAMESPACE, Conflict, CromError, ProfileRef, Reason
 from crom.paths import registry_file, state_home, user_config_file
@@ -2432,6 +2432,38 @@ class CliTest(unittest.TestCase):
 
         self.assertEqual(Reason.RESERVATION_UNKNOWN, failure.reason)
         self.assertIn("crom doctor", str(failure))
+
+    def test_release_credits_a_concurrent_release_rather_than_claiming_the_port_itself(self):
+        """The window between deciding and writing, and the only lie available inside it.
+
+        `crom release` decides from a survey and writes under `registry.forget`'s own lock,
+        so another release can empty the key in between. A command that printed "Released"
+        there would be crediting crom with freeing a number it found already free — the
+        quietest possible lie about crom's own state, and the whole reason `forget` reports
+        whether an entry was actually removed. Nothing else reads that boolean.
+        [LAW:no-silent-failure]
+
+        The rival release is the real one, run from inside the survey the command is about
+        to decide on, rather than a ledger fabricated to look raced: what is asserted is
+        that the two orderings tell the user apart, not that a particular stub was reached.
+        [LAW:behavior-not-structure]
+
+        This exits 0, and that is the answer rather than a failure — the caller asked for
+        the port to be unreserved and it is.
+        """
+        self._orphan_beta()
+        survey = doctor.survey
+
+        def lose_the_race():
+            found = survey()
+            registry.forget("myapp/beta")
+            return found
+
+        with mock.patch("crom.doctor.survey", lose_the_race):
+            output = self.crom("release", "myapp/beta")
+
+        self.assertIn("Already released myapp/beta", output)
+        self.assertNotIn("myapp/beta", self._rows())
 
     def test_clean_deletes_the_staging_directory_a_seed_abandoned(self):
         """The other half of the leak, and the bytes are the point.
