@@ -31,6 +31,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from typing import IO
 
@@ -94,13 +95,48 @@ PORT_REPLY_BYTES = 65536
 # that a minified page cannot become the error message.
 PORT_REPLY_SUMMARY_CHARS = 120
 
-# HTTP/1.1 because Chrome's DevTools server answers nothing at all to HTTP/1.0 — measured.
-# `Connection: close` is a courtesy to every other server: Chrome ignores it and holds the
-# socket open, so the read cannot rely on it, but a listener that honours it lets the read
-# finish on end-of-reply rather than on the clock.
-_VERSION_REQUEST = (
-    b"GET /json/version HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
-)
+# What the browser says about itself, and what it has open. Two questions rather than one:
+# `/json/version` says what the browser is, `/json/list` says what it is showing, and only
+# `crom status` asks the second — folding it into the probe would cost every `crom list`
+# row a second round trip against a browser measured at up to 282ms for one document.
+_VERSION_PATH = "/json/version"
+_TARGETS_PATH = "/json/list"
+
+
+def _request(path: str, port: int) -> bytes:
+    """One HTTP GET as crom spells it, for the port it is about to be sent to.
+
+    HTTP/1.1 because Chrome's DevTools server answers nothing at all to HTTP/1.0 —
+    measured. `Connection: close` is a courtesy to every other server: Chrome ignores it
+    and holds the socket open, so the read cannot rely on it, but a listener that honours
+    it lets the read finish on end-of-reply rather than on the clock.
+
+    The port belongs in `Host`, and this is not pedantry about RFC 9110 — Chrome *builds
+    its reply out of that header*. Asked with a bare `Host: 127.0.0.1`, Chrome/152 answers
+    `"webSocketDebuggerUrl": "ws://127.0.0.1/devtools/browser/<id>"`, and a client that
+    connects to that reaches port 80. Observed live against a crom-launched browser on
+    9228, beside a `curl` of the same endpoint — whose `Host: 127.0.0.1:9228` came back
+    with the port intact. [FRAMING:representation] the URL is Chrome's map of how to reach
+    itself, and crom is holding the pen: ask the wrong way and the browser writes down an
+    address it is not at.
+
+    It went unnoticed for as long as the reply was only a discriminator: `_probe_port`
+    reads this document to decide whether anything drivable is there, and a URL missing
+    its port still starts with `ws://`. It became a lie the moment `crom status` published
+    the URL to somebody who would connect by it.
+    """
+    return (
+        f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+    ).encode()
+
+# The target listing's own cap, and much larger than `PORT_REPLY_BYTES` because its size
+# is set by how many things are open rather than by one configurable flag. Measured
+# against Chrome 152, a listing runs ~520 bytes per target — most of it the
+# `devtoolsFrontendUrl` — so 1MiB holds around two thousand, and every tab, extension
+# background page, service worker and iframe counts as one. Past that the reply is clipped,
+# stops parsing as JSON, and `crom status` says it could not list the tabs rather than
+# printing a number that is quietly short. [LAW:no-silent-failure]
+TARGET_LIST_BYTES = 1 << 20
 
 
 # `ps` hands us one flat string per process with no argv boundaries, so the directory
@@ -162,24 +198,26 @@ def _group_by_user_data_dir(ps_output: str) -> dict[str, tuple[int, ...]]:
     return {directory: tuple(pids) for directory, pids in found.items()}
 
 
-def scan() -> dict[str, tuple[int, ...]]:
-    """Every running main Chrome, grouped by the user-data-dir it was launched with.
+def _ps(columns: str) -> str:
+    """One reading of the whole process table, in the columns the caller asks for.
 
-    One `ps` call answers the liveness question for every profile at once, so listing
-    twenty profiles costs one process scan rather than twenty.
-    [LAW:one-source-of-truth] this is the only place crom reads the process table.
+    Every process, never `-p <pids>`: BSD `ps` refuses the *whole* call when one pid it is
+    handed is out of range — measured, `ps -p 14995,999999` prints "process id too large"
+    and exits 1, answering nothing about the pid that was fine. Asking for the table and
+    indexing it cannot fail that way, and it is what `scan` has always done.
+
+    [LAW:single-enforcer] the two ways `ps` can fail are answered here, once, for both
+    questions crom puts to it. `list`, `up`, `down`, `rm`, `config`, `status` and
+    migration all arrive here, so a raw `CalledProcessError` would escape the exit-code
+    contract from every one of them, and a missing `ps` would name the file and not the
+    reason. [LAW:no-silent-failure]
+
+    macOS BSD `pgrep` doesn't support -a (print cmdline), so this is the portable path and
+    the one that gives us full argv to tell a main browser from a helper process.
     """
-    # macOS BSD `pgrep` doesn't support -a (print cmdline), so we use `ps` and filter in
-    # Python. This is the portable path and gives us the full argv to distinguish the
-    # main browser from helper processes.
-    # This became the single process-table reader in this design, which concentrates the
-    # benefit and the failure alike: `list`, `up`, `down`, `rm`, `config` and migration
-    # all arrive here, so a raw `CalledProcessError` would escape the exit-code contract
-    # from every one of them, and a missing `ps` would name the file and not the reason.
-    # [LAW:no-silent-failure]
     try:
         result = subprocess.run(
-            ["ps", "-Ao", "pid=,command="],
+            ["ps", "-Ao", columns],
             capture_output=True,
             text=True,
             check=True,
@@ -195,7 +233,74 @@ def scan() -> dict[str, tuple[int, ...]]:
             f"could not read the process table: `ps` exited {e.returncode}"
             f"{(chr(10) + e.stderr.strip()) if e.stderr else ''}"
         ) from e
-    return _group_by_user_data_dir(result.stdout)
+    return result.stdout
+
+
+def scan() -> dict[str, tuple[int, ...]]:
+    """Every running main Chrome, grouped by the user-data-dir it was launched with.
+
+    One `ps` call answers the liveness question for every profile at once, so listing
+    twenty profiles costs one process scan rather than twenty.
+    [LAW:one-source-of-truth] this is the only place crom reads the process table for
+    *which browsers exist*; `uptimes` below reads it for how long one has been up, which
+    is a second question and not a second authority.
+    """
+    return _group_by_user_data_dir(_ps("pid=,command="))
+
+
+# `ps` prints elapsed time as `[[DD-]HH:]MM:SS`, and the two leading fields drop out
+# together as the process gets younger — `05-00:23:43`, `01:02:03`, `00:28` are all real
+# readings taken from this machine. Anchored whole rather than searched, because a
+# partial match on a line `ps` formatted differently would silently produce a plausible
+# wrong duration rather than nothing. [LAW:parse-dont-validate]
+_ELAPSED_RE = re.compile(r"(?:(?:(\d+)-)?(\d+):)?(\d+):(\d+)")
+
+
+def _elapsed(text: str) -> timedelta | None:
+    """How long `ps` says a process has been up, or nothing when that is not what it said.
+
+    A duration rather than the text, so every reader downstream — a human line, a JSON
+    number — renders one value instead of re-parsing Chrome-independent trivia about how
+    BSD `ps` spells a day. [LAW:parse-dont-validate]
+    """
+    reading = _ELAPSED_RE.fullmatch(text.strip())
+    if reading is None:
+        return None
+    days, hours, minutes, seconds = (int(field or 0) for field in reading.groups())
+    return timedelta(days=days, hours=hours, minutes=minutes, seconds=seconds)
+
+
+def _group_elapsed(ps_output: str) -> dict[int, timedelta]:
+    """Parse `pid=,etime=` output into durations keyed by pid.
+
+    Pure and separate from the `ps` call for the reason `_group_by_user_data_dir` is: the
+    parsing is the part with the edge cases. [LAW:effects-at-boundaries]
+
+    A line that does not parse is dropped rather than defaulted. `ps` prints a header-less
+    two-column table here and every line of it is a process, so a line crom cannot read is
+    a process crom cannot time — and a zero would be a duration-shaped void, published as
+    "up 0s" beside a browser that has been running for days.
+    """
+    timed = {}
+    for line in ps_output.splitlines():
+        pid, _, etime = line.strip().partition(" ")
+        elapsed = _elapsed(etime) if pid.isdigit() else None
+        if elapsed is not None:
+            timed[int(pid)] = elapsed
+    return timed
+
+
+def uptimes() -> dict[int, timedelta]:
+    """How long every running process has been up, keyed by pid.
+
+    The second question crom puts to the process table, and a separate reading because it
+    is a separate question: `scan` asks which browsers exist and this asks how long one of
+    them has been there. Total over the table rather than over a caller's pids, so a
+    caller indexes it and a pid that is missing means the process is gone — the same shape
+    `scan` has, and the honest one, since these are two moments and a pid can die between
+    them. [FRAMING:representation] a pid absent from this reading is a fact, not a gap.
+    """
+    return _group_elapsed(_ps("pid=,etime="))
 
 
 def find_pids_for_dir(profile_dir: Path) -> tuple[int, ...]:
@@ -343,8 +448,23 @@ class _Silent:
 
 
 @dataclass(frozen=True)
+class _Version:
+    """What a CDP version document says about the browser serving it."""
+
+    browser: str
+    websocket: str
+
+
+@dataclass(frozen=True)
 class _Answered:
-    """A Chrome DevTools endpoint answered on the port we asked for."""
+    """A Chrome DevTools endpoint answered on the port we asked for, and what it said.
+
+    The document was already fetched and already parsed to decide this variant; carrying
+    it costs nothing and asking for it again would be a second reading of one fact.
+    [LAW:one-source-of-truth]
+    """
+
+    version: _Version
 
 
 @dataclass(frozen=True)
@@ -408,8 +528,17 @@ _PortKnowledge = _PortAnswer | _Unasked
 _LaunchOutcome = _Answered | _AnsweredByStranger | _Exited | _NeverAnswered
 
 
-def _advertises_devtools(reply: bytes) -> bool:
-    """Whether this reply is a CDP version document — one that names a browser websocket.
+# What a version document that names no browser is called. Chrome has sent `Browser` in
+# every reading taken here, so this is the shape of a CDP-speaking endpoint that is not
+# Chrome — and it is a sentence rather than an empty string or a null precisely so it can
+# never be mistaken for a version. [LAW:parse-dont-validate] an answer-shaped void is what
+# `""` would be: it renders as a blank where a version goes and compares as one.
+UNNAMED_BROWSER = "an unnamed CDP endpoint"
+
+
+def _devtools_version(reply: bytes) -> _Version | None:
+    """What this reply says about the browser, or nothing when it is not a CDP version
+    document — one that names a browser websocket.
 
     `webSocketDebuggerUrl` is the discriminator because it is the handle a CDP client
     actually connects by: a reply that names one is drivable, and a reply that does not is
@@ -417,16 +546,85 @@ def _advertises_devtools(reply: bytes) -> bool:
     not JSON, JSON that is not an object, an object without the key — is the same answer,
     so they are caught together rather than enumerated into distinct diagnoses nobody
     would act on differently.
+
+    A parser and not the predicate this used to be: the caller needed to know the reply was
+    a version document *and* what version it named, and returning a bool threw the second
+    half away at the one moment crom held it. [LAW:parse-dont-validate] the answer now
+    carries its own evidence, so nothing downstream re-opens the port to ask again.
+
+    `Browser` is read but is not part of the discriminator, and the two are deliberately
+    not the same test: an endpoint that hands over a browser websocket is drivable whether
+    or not it also names itself, and tying drivability to a courtesy field would make crom
+    refuse a browser it could in fact drive.
     """
     try:
-        return str(json.loads(reply)["webSocketDebuggerUrl"]).startswith("ws://")
+        document = json.loads(reply)
+        websocket = str(document["webSocketDebuggerUrl"])
     except (ValueError, TypeError, KeyError, RecursionError):
         # `RecursionError` because `PORT_REPLY_BYTES` is large enough to hold JSON nested
         # deeper than the decoder will follow — measured, that starts around 32KB of
         # `[[[…`, which only a stranger would send and which is still just "not a DevTools
         # document". It is not a `ValueError`, so without it a hostile listener answers a
         # launch with a traceback instead of a CromError.
-        return False
+        return None
+    if not websocket.startswith("ws://"):
+        return None
+    return _Version(str(document.get("Browser") or UNNAMED_BROWSER), websocket)
+
+
+def _names_a_browser(reply: bytes) -> bool:
+    """Whether a reply read this far is already a whole version document."""
+    return _devtools_version(_body_of(reply)) is not None
+
+
+@dataclass(frozen=True)
+class Tab:
+    """One page open in a browser crom can drive.
+
+    Named without an underscore because `cli` prints these: a browser's open pages are a
+    fact about the browser, not an implementation detail of asking for them.
+    """
+
+    title: str
+    url: str
+
+
+def _pages_in(reply: bytes) -> tuple[Tab, ...] | None:
+    """The pages a CDP target listing names, or nothing when this is not that listing.
+
+    Only `type == "page"` — measured against Chrome 152, a browser showing one new tab
+    lists five targets: two `browser_ui` omnibox popups, a `background_page`, an `iframe`
+    inside the tab, and a `service_worker`. Counting those is how "1 tab" becomes "5 tabs"
+    for a browser nobody has touched, so the filter is what makes the number true rather
+    than a tidying preference. [FRAMING:representation] the map is "tabs"; the territory
+    is pages.
+
+    An empty tuple and `None` are different answers and stay apart: a browser with nothing
+    open lists zero pages, and a port that answered with something that is not a listing at
+    all told crom nothing. Collapsed, "no tabs" would be published for a browser whose
+    reply crom could not read. [LAW:parse-dont-validate]
+    """
+    try:
+        listing = json.loads(reply)
+    except (ValueError, RecursionError):
+        return None
+    match listing:
+        case [*targets]:
+            return tuple(
+                Tab(str(target["title"]), str(target["url"]))
+                for target in targets
+                if isinstance(target, dict)
+                and target.get("type") == "page"
+                and "title" in target
+                and "url" in target
+            )
+        case _:
+            return None
+
+
+def _lists_targets(reply: bytes) -> bool:
+    """Whether a reply read this far is already a whole target listing."""
+    return _pages_in(_body_of(reply)) is not None
 
 
 def _body_of(reply: bytes) -> bytes:
@@ -456,9 +654,10 @@ def _classify(reply: bytes) -> _PortAnswer:
     """
     if not reply:
         return _Silent()
-    if _advertises_devtools(_body_of(reply)):
-        return _Answered()
-    return _AnsweredByStranger(_describe(reply))
+    version = _devtools_version(_body_of(reply))
+    if version is None:
+        return _AnsweredByStranger(_describe(reply))
+    return _Answered(version)
 
 
 @dataclass(frozen=True)
@@ -481,8 +680,17 @@ class _StillSpeaking:
 _ReadOutcome = _Said | _StillSpeaking
 
 
-def _read_reply(conn: socket.socket, deadline: float) -> _ReadOutcome:
+def _read_reply(
+    conn: socket.socket, deadline: float, complete: Callable[[bytes], bool], cap: int
+) -> _ReadOutcome:
     """Whatever the port says, until the answer is known or the clock runs out.
+
+    `complete` and `cap` are what differs between the two documents crom asks a port for,
+    and they are values rather than an arm inside here deciding which question is in
+    flight: the loop below runs the same way for a version document and a target listing,
+    and only what it is watching for differs. [LAW:dataflow-not-control-flow] The pair
+    travels together because a cap without the parse that clears it is a truncation, and a
+    parse without a cap is an unbounded read.
 
     Four endings, and the clock is the one that had to exist. An HTTP client borrowed from
     the library bounds each `recv` and never the call, so a listener trickling one byte
@@ -504,12 +712,12 @@ def _read_reply(conn: socket.socket, deadline: float) -> _ReadOutcome:
     """
     reply = b""
     while time.monotonic() < deadline:
-        if len(reply) >= PORT_REPLY_BYTES:
-            # More than any real version document, so there is nothing left to wait for:
-            # whatever this is, it is not the browser, and it has said enough to say so.
+        if len(reply) >= cap:
+            # More than the document being asked for can be, so there is nothing left to
+            # wait for: whatever this is, it has said enough to say what it is not.
             return _Said(reply)
         try:
-            chunk = conn.recv(PORT_REPLY_BYTES - len(reply))
+            chunk = conn.recv(cap - len(reply))
         except TimeoutError:
             # Nothing arrived in this slice, which says nothing about the peer being
             # finished — only the deadline gets to decide that, so it is asked again.
@@ -522,9 +730,32 @@ def _read_reply(conn: socket.socket, deadline: float) -> _ReadOutcome:
         if not chunk:
             return _Said(reply)
         reply += chunk
-        if _advertises_devtools(_body_of(reply)):
+        if complete(reply):
             return _Said(reply)
     return _StillSpeaking()
+
+
+def _ask(port: int, path: str, complete: Callable[[bytes], bool], cap: int) -> _ReadOutcome:
+    """One HTTP question put to a CDP port, and the whole of what came back.
+
+    [LAW:single-enforcer] what a question to a port may cost is decided here for every
+    question crom puts — the connect timeout, the whole-exchange deadline, and what a
+    refusal amounts to — so a second question cannot come with a second timeout policy.
+
+    A refused connection comes back as a reply with nothing in it because that is what it
+    is: overwhelmingly the ordinary case is a port Chrome has not opened yet, and beside it
+    sits a connection that broke before the peer said anything. Both are the same fact —
+    nothing on this port has spoken to us — and returning them as one value keeps that
+    reading in the data rather than resting on which `except` arm caught which library
+    exception. Each caller then decides what silence means for its own question.
+    """
+    deadline = time.monotonic() + PORT_REPLY_SECONDS
+    try:
+        with socket.create_connection(("127.0.0.1", port), PORT_RECV_SECONDS) as conn:
+            conn.sendall(_request(path, port))
+            return _read_reply(conn, deadline, complete, cap)
+    except OSError:
+        return _Said(b"")
 
 
 def _probe_port(port: int) -> _PortAnswer:
@@ -562,22 +793,9 @@ def _probe_port(port: int) -> _PortAnswer:
     stranger is not a browser.
 
     The socket is ours rather than an HTTP client's because the deadline has to cover the
-    whole exchange — see `_read_reply`. That also settles what a peer accepting and then
-    closing means: it is a read of zero bytes, so silence falls out of the data, instead of
-    resting on `RemoteDisconnected` being caught by one `except` arm and not the next.
+    whole exchange — see `_ask` and `_read_reply`.
     """
-    deadline = time.monotonic() + PORT_REPLY_SECONDS
-    try:
-        with socket.create_connection(("127.0.0.1", port), PORT_RECV_SECONDS) as conn:
-            conn.sendall(_VERSION_REQUEST)
-            heard = _read_reply(conn, deadline)
-    except OSError:
-        # Overwhelmingly the ordinary case: the port refuses connections because Chrome
-        # has not opened it yet. Also a connection that broke before it said anything,
-        # which is the same fact — nothing on this port has spoken to us.
-        return _Silent()
-
-    match heard:
+    match _ask(port, _VERSION_PATH, _names_a_browser, PORT_REPLY_BYTES):
         case _Said(reply):
             return _classify(reply)
         case _StillSpeaking():
@@ -585,6 +803,30 @@ def _probe_port(port: int) -> _PortAnswer:
             # a stranger is terminal, which makes this the difference between a loaded
             # machine costing another 100ms round and a launch that fails for good.
             return _Silent()
+
+
+def tabs_on(port: int) -> tuple[Tab, ...] | None:
+    """The pages open in the browser on this port, or nothing when it did not list them.
+
+    crom's second question for a port, asked only by `crom status` and only of a browser
+    that has already answered the first — a listing is a question for something that can
+    be driven, and `Ready` is the stamp saying one answered.
+    [LAW:parse-dont-validate] the caller reads that off the state rather than asking a
+    port it already knows is silent.
+
+    `None` is a typed absence and not "no tabs": a browser that answered `/json/version`
+    a moment ago and then failed to list its targets is worth a sentence of its own, and
+    a browser genuinely showing nothing is an empty tuple. Folded together, a `crom status`
+    run against a browser wedging mid-question would report an empty desktop.
+    [LAW:no-silent-failure]
+    """
+    match _ask(port, _TARGETS_PATH, _lists_targets, TARGET_LIST_BYTES):
+        case _Said(reply):
+            return _pages_in(_body_of(reply))
+        case _StillSpeaking():
+            # The listing was still arriving when the clock ran out, so what crom holds is
+            # a prefix — and a prefix of a target list is not a shorter target list.
+            return None
 
 
 # --- what a profile's browser is actually doing --------------------------------------
@@ -738,8 +980,8 @@ def _reachability(pids: tuple[int, ...], heard: _PortKnowledge) -> Health:
             return Stopped()
         case _, _Unasked():
             return Unprobed(pids)
-        case _, _Answered():
-            return Ready(pids)
+        case _, _Answered(version=version):
+            return Ready(pids, version.browser, version.websocket)
         case _, _AnsweredByStranger(served=served):
             return Unreachable(
                 pids, f"its CDP port answered, but not as a browser crom can drive: {served}"

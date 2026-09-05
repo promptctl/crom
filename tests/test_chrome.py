@@ -7,6 +7,7 @@ a second one on top of it.
 """
 
 import dataclasses
+import json
 import os
 import shutil
 import signal
@@ -18,6 +19,7 @@ import threading
 import time
 import unittest
 from collections.abc import Callable
+from datetime import timedelta
 from itertools import chain, repeat
 from pathlib import Path
 from unittest import mock
@@ -25,6 +27,23 @@ from unittest import mock
 from crom import chrome, launched
 from crom.model import CromError, ProfileRef, Reason, ResolvedProfile, SeedFresh
 from crom.resolve import build_argv
+
+# What a healthy version document amounts to, for the many tests whose subject is the
+# probe rather than the document. Spelled once so a test that is *about* the version
+# crom reports names its own strings inline and stands out from the ones that do not care
+# what the browser is called. [LAW:one-source-of-truth]
+BROWSER = "Chrome/152.0.7977.76"
+BROWSER_WEBSOCKET = "ws://127.0.0.1:9300/devtools/browser/45e0cffe-114f-49ae-857b-531c7c06e1ad"
+
+
+def answered(browser: str = BROWSER, websocket: str = BROWSER_WEBSOCKET) -> chrome._Answered:
+    """The answer a browser that is there gives to the probe."""
+    return chrome._Answered(chrome._Version(browser, websocket))
+
+
+def ready_state(pids: tuple[int, ...], browser: str = BROWSER, websocket: str = BROWSER_WEBSOCKET):
+    """The state `answered()` folds to, so the two cannot drift apart in a test file."""
+    return chrome.Ready(pids, browser, websocket)
 
 
 def ps_line(pid: int, argv) -> str:
@@ -509,7 +528,7 @@ class LaunchReadinessTest(LaunchHarness):
     def test_a_browser_that_answers_is_returned_with_its_pids(self):
         """The port is rarely up on the first probe, so the loop has to keep waiting."""
         with mock.patch.object(
-            chrome, "_probe_port", side_effect=[chrome._Silent(), chrome._Answered()]
+            chrome, "_probe_port", side_effect=[chrome._Silent(), answered()]
         ):
             self.assertEqual(chrome.launch(self.profile), (4242,))
 
@@ -540,7 +559,7 @@ class LaunchReadinessTest(LaunchHarness):
         cannot express it; the ordering rationale lives in `_await_startup`'s docstring.
         """
         self.proc.poll.return_value = 0
-        with mock.patch.object(chrome, "_probe_port", return_value=chrome._Answered()):
+        with mock.patch.object(chrome, "_probe_port", return_value=answered()):
             self.assertEqual(chrome.launch(self.profile), (4242,))
 
     def test_a_live_chrome_that_never_answers_names_the_timeout_and_says_it_was_alive(self):
@@ -596,7 +615,7 @@ class LaunchReadinessTest(LaunchHarness):
         the browser the caller is about to be handed. Nothing else in this class would
         notice — the pids come back either way — so the signal log is the only witness.
         """
-        with mock.patch.object(chrome, "_probe_port", return_value=chrome._Answered()):
+        with mock.patch.object(chrome, "_probe_port", return_value=answered()):
             self.assertEqual(chrome.launch(self.profile), (4242,))
         self.assertEqual(self.signals, [])
 
@@ -611,7 +630,7 @@ class LaunchReadinessTest(LaunchHarness):
         [LAW:parse-dont-validate] the promise is kept, or the call fails saying so.
         """
         with (
-            mock.patch.object(chrome, "_probe_port", return_value=chrome._Answered()),
+            mock.patch.object(chrome, "_probe_port", return_value=answered()),
             mock.patch.object(chrome, "find_pids", return_value=()),
             self.assertRaises(CromError) as caught,
         ):
@@ -643,7 +662,7 @@ class LaunchReadinessTest(LaunchHarness):
             return next(scans, tuple(self.running))
 
         with (
-            mock.patch.object(chrome, "_probe_port", return_value=chrome._Answered()),
+            mock.patch.object(chrome, "_probe_port", return_value=answered()),
             mock.patch.object(chrome, "find_pids", find_pids),
             self.assertRaises(CromError) as caught,
         ):
@@ -666,7 +685,7 @@ class LaunchReadinessTest(LaunchHarness):
         """
         with (
             mock.patch.object(chrome, "SHUTDOWN_TIMEOUT_SECONDS", 0.2),
-            mock.patch.object(chrome, "_probe_port", return_value=chrome._Answered()),
+            mock.patch.object(chrome, "_probe_port", return_value=answered()),
             mock.patch.object(chrome, "find_pids", lambda _profile: ()),
             mock.patch.object(chrome, "port_is_free", lambda _port: False),
             self.assertRaises(CromError) as caught,
@@ -1134,7 +1153,7 @@ class LaunchRecordTest(LaunchHarness):
     def test_a_successful_launch_records_the_flags_it_used(self):
         profile = self.flagged("--disable-extensions")
 
-        with mock.patch.object(chrome, "_probe_port", return_value=chrome._Answered()):
+        with mock.patch.object(chrome, "_probe_port", return_value=answered()):
             chrome.launch(profile)
 
         self.assertEqual(launched.read(profile.profile_dir), launched.Launch.of(profile))
@@ -1150,7 +1169,7 @@ class LaunchRecordTest(LaunchHarness):
         """
         profile = self.flagged("--disable-extensions")
 
-        with mock.patch.object(chrome, "_probe_port", return_value=chrome._Answered()):
+        with mock.patch.object(chrome, "_probe_port", return_value=answered()):
             chrome.launch(profile)
 
         rewritten = ps_line(
@@ -1902,6 +1921,201 @@ def health_profile(port: int, name: str = "dev", directory: str | None = None) -
     )
 
 
+def stub_cdp(test: unittest.TestCase, replies: dict[str, bytes]) -> tuple[int, list[bytes]]:
+    """A listener answering one canned reply per path, and the requests it was sent.
+
+    In-process rather than the subprocess stubs above because the subject here is what crom
+    puts on the wire and what it keeps from the answer, not how a launch behaves. Bound to
+    port 0 so the kernel picks a free one: these tests run beside a developer's own Chrome.
+    """
+    server = socket.socket()
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("127.0.0.1", 0))
+    server.listen(8)
+    asked: list[bytes] = []
+
+    def serve():
+        while True:
+            try:
+                conn, _ = server.accept()
+            except OSError:  # the socket closed at cleanup; nothing left to answer
+                return
+            with conn:
+                request = conn.recv(4096)
+                asked.append(request)
+                body = replies.get(request.split(b" ")[1].decode(), b"")
+                conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s" % (len(body), body))
+
+    threading.Thread(target=serve, daemon=True).start()
+    test.addCleanup(server.close)
+    return server.getsockname()[1], asked
+
+
+def version_document(port: int, browser: str = BROWSER) -> bytes:
+    """What Chrome serves on /json/version, keyed the way Chrome keys it."""
+    return json.dumps(
+        {
+            "Browser": browser,
+            "Protocol-Version": "1.3",
+            "webSocketDebuggerUrl": f"ws://127.0.0.1:{port}/devtools/browser/stub-uuid",
+        }
+    ).encode()
+
+
+def target(kind: str, title: str, url: str) -> dict:
+    """One entry of /json/list, with the three fields crom reads and nothing else."""
+    return {"type": kind, "title": title, "url": url}
+
+
+class PortQuestionTest(unittest.TestCase):
+    """What crom asks a CDP port, and what it keeps of the answer."""
+
+    def test_the_host_header_names_the_port_so_the_url_chrome_returns_is_reachable(self):
+        """Chrome builds `webSocketDebuggerUrl` out of the Host header it is handed.
+
+        Asked with a bare `Host: 127.0.0.1`, Chrome/152 answers
+        `ws://127.0.0.1/devtools/browser/<id>` — port 80, where nothing crom launched is
+        listening. Observed live against a crom-launched browser on 9228, beside a `curl`
+        of the same endpoint whose `Host: 127.0.0.1:9228` came back with the port intact.
+
+        It cost nothing for as long as the document was only a discriminator, because a
+        URL missing its port still starts with `ws://`. It became a lie the moment `crom
+        status` published that URL to somebody who would connect by it — which is why the
+        header is pinned here rather than left to look like formatting.
+        """
+        port, asked = stub_cdp(self, {})
+
+        chrome._probe_port(port)
+
+        self.assertIn(f"Host: 127.0.0.1:{port}".encode(), asked[0])
+
+    def test_the_version_document_is_kept_rather_than_reduced_to_yes(self):
+        """The probe parses this document to decide the port is drivable at all, so what it
+        says is already in hand — and used to be thrown away at exactly that moment.
+        Keeping it is what spares `crom status` a second reading of one fact, which is a
+        reading that could disagree with the first."""
+        replies: dict[str, bytes] = {}
+        port, _ = stub_cdp(self, replies)
+        # Filled after binding, because a document naming the port cannot be written before
+        # the kernel has chosen one — the stub reads this dict per request.
+        replies["/json/version"] = version_document(port)
+
+        self.assertEqual(
+            chrome._probe_port(port),
+            chrome._Answered(
+                chrome._Version(BROWSER, f"ws://127.0.0.1:{port}/devtools/browser/stub-uuid")
+            ),
+        )
+
+    def test_an_endpoint_that_names_no_browser_is_still_one_crom_can_drive(self):
+        """`webSocketDebuggerUrl` is the discriminator and `Browser` is a courtesy field.
+
+        Tying drivability to the courtesy would make crom refuse a browser it can in fact
+        drive. The version is unknown instead, said in words that cannot be mistaken for a
+        version — an empty string would render as a blank where `Chrome/152` goes.
+        """
+        document = b'{"webSocketDebuggerUrl": "ws://127.0.0.1:1/devtools/browser/x"}'
+        self.assertEqual(
+            chrome._devtools_version(document),
+            chrome._Version(chrome.UNNAMED_BROWSER, "ws://127.0.0.1:1/devtools/browser/x"),
+        )
+
+    def test_a_document_that_names_a_browser_but_no_websocket_is_a_stranger(self):
+        """The discriminator is the handle a client connects by, and nothing else. A
+        listener can call itself Chrome; only a websocket makes it drivable."""
+        self.assertIsNone(chrome._devtools_version(b'{"Browser": "Chrome/152.0.7977.76"}'))
+
+
+class TabListingTest(unittest.TestCase):
+    """The second question crom puts to a port, and the three answers it can get."""
+
+    def test_only_pages_are_counted_as_tabs(self):
+        """Measured against Chrome 152, a browser showing one new tab lists five targets:
+        two omnibox popups, an extension background page, an iframe inside the tab, and a
+        service worker. Counting those is how "1 tab" becomes "5 tabs" for a browser
+        nobody has touched, so the filter is what makes the number true."""
+        listing = json.dumps(
+            [
+                target("browser_ui", "Omnibox Popup", "chrome://omnibox-popup.top-chrome/"),
+                target("page", "Example Domain", "https://example.com/"),
+                target("background_page", "Google Hangouts", "chrome-extension://x/background.html"),
+                target("iframe", "one-google-bar", "chrome-untrusted://new-tab-page/one-google-bar"),
+                target("service_worker", "Service Worker", "chrome-extension://y/sw.js"),
+            ]
+        ).encode()
+        port, _ = stub_cdp(self, {"/json/list": listing})
+
+        self.assertEqual(chrome.tabs_on(port), (chrome.Tab("Example Domain", "https://example.com/"),))
+
+    def test_a_browser_showing_nothing_is_not_the_same_answer_as_one_that_would_not_say(self):
+        """The distinction the return type exists for. Collapsed, a `crom status` run
+        against a browser that wedged between the two questions would report an empty
+        desktop for a browser crom simply could not read."""
+        listening, _ = stub_cdp(self, {"/json/list": b"[]"})
+        prose, _ = stub_cdp(self, {"/json/list": b"<html>a dev server</html>"})
+        # JSON, and still not a listing — the arm the two above never reach. A CDP endpoint
+        # refusing a request answers with an object, so this is the shape a real browser
+        # produces on a bad day rather than one only a stranger could send.
+        refusal, _ = stub_cdp(self, {"/json/list": b'{"error": "not allowed"}'})
+
+        self.assertEqual(chrome.tabs_on(listening), ())
+        self.assertIsNone(chrome.tabs_on(prose))
+        self.assertIsNone(chrome.tabs_on(refusal))
+
+    def test_a_listing_past_the_cap_is_unreadable_rather_than_quietly_short(self):
+        """A clipped reply stops parsing as JSON, so it comes back as nothing rather than
+        as the tabs that fitted. A truncated array read as a shorter array is the failure
+        this cap could otherwise cause: a number that is wrong and looks right."""
+        huge = json.dumps([target("page", "t" * 200, f"https://example.com/{n}") for n in range(400)])
+        port, _ = stub_cdp(self, {"/json/list": huge.encode()})
+
+        with mock.patch.object(chrome, "TARGET_LIST_BYTES", 4096):
+            self.assertIsNone(chrome.tabs_on(port))
+
+    def test_a_port_nothing_listens_on_lists_nothing_rather_than_no_tabs(self):
+        """The state already says the browser is not there; this must not also claim it is
+        there with an empty desktop."""
+        with socket.socket() as free:
+            free.bind(("127.0.0.1", 0))
+            port = free.getsockname()[1]
+
+        self.assertIsNone(chrome.tabs_on(port))
+
+
+class ElapsedTest(unittest.TestCase):
+    """How long `ps` says a process has been up, parsed into something a reader can use."""
+
+    def test_the_three_shapes_ps_prints(self):
+        """All three taken from this machine's own process table: a browser minutes old, a
+        process hours old, and `launchd`."""
+        self.assertEqual(chrome._elapsed("00:28"), timedelta(seconds=28))
+        self.assertEqual(chrome._elapsed("01:02:03"), timedelta(hours=1, minutes=2, seconds=3))
+        self.assertEqual(
+            chrome._elapsed("05-00:23:43"), timedelta(days=5, minutes=23, seconds=43)
+        )
+
+    def test_a_reading_that_is_not_a_duration_is_dropped_rather_than_timed_at_zero(self):
+        """Every line of this table is a process, so a line crom cannot read is a process
+        crom cannot time — and a zero would publish "up 0s" beside a browser that has been
+        running for days."""
+        self.assertIsNone(chrome._elapsed("not-a-duration"))
+        self.assertEqual(chrome._group_elapsed("4242 00:28\n4243 whenever\nnonsense\n"), {4242: timedelta(seconds=28)})
+
+    def test_every_elapsed_time_this_machine_prints_is_one_crom_can_read(self):
+        """The parser against its actual producer, on one reading so the table cannot move
+        between the two halves. A format `ps` uses and crom does not know would drop real
+        processes out of the answer, silently, and only here would anyone find out.
+        [LAW:verifiable-goals]
+        """
+        reading = subprocess.run(
+            ["ps", "-Ao", "pid=,etime="], capture_output=True, text=True, check=True
+        ).stdout
+        rows = [line for line in reading.splitlines() if line.strip()]
+
+        self.assertGreater(len(rows), 1, "this machine reported no processes")
+        self.assertEqual(len(chrome._group_elapsed(reading)), len(rows))
+
+
 class ReachabilityTest(unittest.TestCase):
     """Two readings, eight combinations, folded into the state a consumer acts on.
 
@@ -1919,7 +2133,7 @@ class ReachabilityTest(unittest.TestCase):
         """
         answers = (
             chrome._Silent(),
-            chrome._Answered(),
+            answered(),
             chrome._AnsweredByStranger("nginx"),
             # Including the reading `--no-probe` supplies. A profile with no process is
             # `stopped` whether or not crom asked its port, because the port was never
@@ -1940,9 +2154,9 @@ class ReachabilityTest(unittest.TestCase):
                 self.assertEqual(state.pids, ())
 
     def test_a_process_and_a_devtools_answer_is_ready(self):
-        state = chrome._reachability((4242,), chrome._Answered())
+        state = chrome._reachability((4242,), answered())
 
-        self.assertEqual(state, chrome.Ready((4242,)))
+        self.assertEqual(state, ready_state((4242,)))
         self.assertTrue(state.running)
         self.assertEqual(state.pids, (4242,))
 
@@ -2017,13 +2231,13 @@ class HealthTest(unittest.TestCase):
         fold that shared state between rows would show up here and nowhere else.
         """
         ready, wedged, stopped = health_profile(9300, "ready"), health_profile(9301, "wedged"), health_profile(9302, "off")
-        answers = {9300: chrome._Answered(), 9301: chrome._Silent(), 9302: chrome._Silent()}
+        answers = {9300: answered(), 9301: chrome._Silent(), 9302: chrome._Silent()}
         live = {str(ready.profile_dir): (11,), str(wedged.profile_dir): (22,)}
 
         with mock.patch.object(chrome, "_probe_port", side_effect=lambda port: answers[port]):
             standing = chrome.health([ready, wedged, stopped], live)
 
-        self.assertEqual(standing[ready.ref], chrome.Ready((11,)))
+        self.assertEqual(standing[ready.ref], ready_state((11,)))
         self.assertIsInstance(standing[wedged.ref], chrome.Unreachable)
         self.assertEqual(standing[stopped.ref], chrome.Stopped())
 
@@ -2054,14 +2268,14 @@ class HealthTest(unittest.TestCase):
 
         def record(port):
             asked.append(port)
-            return chrome._Answered()
+            return answered()
 
         with mock.patch.object(chrome, "_probe_port", side_effect=record):
             standing = chrome.health([profile], {str(profile.profile_dir): (97805,)})
 
         self.assertEqual(asked, [9300])
         # The pid from the scan travels on as evidence, and never into the question.
-        self.assertEqual(standing[profile.ref], chrome.Ready((97805,)))
+        self.assertEqual(standing[profile.ref], ready_state((97805,)))
 
     def test_a_browser_that_changed_pid_under_the_scan_is_still_ready(self):
         """The same hazard from the other side: stale pids must not downgrade the state.
@@ -2072,7 +2286,7 @@ class HealthTest(unittest.TestCase):
         """
         profile = health_profile(9300)
 
-        with mock.patch.object(chrome, "_probe_port", return_value=chrome._Answered()):
+        with mock.patch.object(chrome, "_probe_port", return_value=answered()):
             standing = chrome.health([profile], {str(profile.profile_dir): (97805,)})
 
         self.assertIsInstance(standing[profile.ref], chrome.Ready)
@@ -2090,7 +2304,7 @@ class HealthTest(unittest.TestCase):
 
         def rendezvous(port):
             together.wait()
-            return chrome._Answered()
+            return answered()
 
         with mock.patch.object(chrome, "_probe_port", side_effect=rendezvous):
             standing = chrome.health(profiles, {})
@@ -2112,7 +2326,7 @@ class HealthTest(unittest.TestCase):
         first, second = health_profile(9300, "a"), health_profile(9300, "b")
         asked = []
 
-        with mock.patch.object(chrome, "_probe_port", side_effect=lambda port: asked.append(port) or chrome._Answered()):
+        with mock.patch.object(chrome, "_probe_port", side_effect=lambda port: asked.append(port) or answered()):
             standing = chrome.health([first, second], {str(first.profile_dir): (11,)})
 
         self.assertEqual(asked, [9300])
@@ -2188,11 +2402,11 @@ class PortReadingTest(unittest.TestCase):
         """
         profile = health_profile(9300)
 
-        with mock.patch.object(chrome, "_probe_port", return_value=chrome._Answered()):
-            self.assertEqual(chrome.health_of(profile, (11,)), chrome.Ready((11,)))
+        with mock.patch.object(chrome, "_probe_port", return_value=answered()):
+            self.assertEqual(chrome.health_of(profile, (11,)), ready_state((11,)))
             self.assertEqual(
                 chrome.health([profile], {str(profile.profile_dir): (11,)})[profile.ref],
-                chrome.Ready((11,)),
+                ready_state((11,)),
             )
 
 
