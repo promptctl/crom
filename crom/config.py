@@ -661,10 +661,10 @@ def init_target(here: Path) -> Path:
     `crom init`'s two endings are that one question. A separately-carried "did it
     exist" would be a second answer to it, taken at a different instant.
 
-    A derivation both `crom init` and `operations.init` read, the way both halves of
-    `crom add` read `write_target`: the command needs it to say which file a bad
-    `--seed` was rejected for, the operation needs it to write. Two call sites of one
-    rule, rather than two spellings of it.
+    One caller — `operations.init` — and it lives here rather than there because
+    `PROJECT_CONFIG_CANDIDATES` precedence is a rule about where a project's config
+    *is*, which is what `discover` and `write_target` beside it also answer. Its home is
+    the question it answers, not the number of readers it has. [LAW:decomposition]
     """
     return next(
         (here / relative for relative in PROJECT_CONFIG_CANDIDATES if (here / relative).is_file()),

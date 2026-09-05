@@ -36,13 +36,13 @@ from . import chrome, config, configwrite, drift, flags, registry, report, seed
 from . import resolve as resolver
 from .model import (
     DEFAULT_SEED,
+    DEFAULTS_STANZA,
     USER_NAMESPACE,
     Layer,
     ProfileSpec,
     Reason,
     ResolvedProfile,
     Scope,
-    Seed,
     slug_for,
     validate_name,
 )
@@ -684,18 +684,29 @@ def rm(
     return stopped
 
 
-def init(here: Path, namespace: str | None, seed: Seed | None) -> Init:
+def init(here: Path, namespace: str | None, seed_text: str | None) -> Init:
     """Give a directory its own namespace by writing a project config into it.
 
     Idempotent, the way `add` is: a directory that already has a config is reported
     rather than rewritten, and a request asking that file for something it does not say
     is refused rather than reported as done.
 
-    Takes the directory and not the file, so the two facts `crom init` needs about that
-    file — where it goes, and whether the project is already initialised — come from one
-    argument and cannot be paired wrongly. `config.init_target` is the rule; this reads
-    it, and so does the caller that has to parse a `--seed` against the config's own
-    directory before there is a config.
+    Takes the directory and nothing derived from it, so every fact about the config file
+    — where it goes, whether the project is already initialised, and what a relative
+    `--seed` is anchored on — comes from one argument and from one look at the disk.
+    `config.init_target` reads the filesystem, so a caller that computed the target and
+    passed it alongside `here` would be handing over a second, older answer: a `crom
+    init` racing this one can create `.crom/config.toml` in between, and the seed would
+    then be rendered against a directory this call is not writing to — `render_seed`
+    falling back to this machine's absolute path in a file meant to be committed. Passing
+    the target instead of `here` closes the race and opens a worse hole, since a target
+    outside `here` becomes expressible. [LAW:types-are-the-program]
+
+    Which is why the seed arrives as *text* where `add` takes a parsed `ProfileSpec`. It
+    is still crom's own vocabulary and not argv — `fresh`, `chrome:<Profile>`, `./path`
+    is the spelling the config file itself holds, and `config.parse_seed` is the one
+    border both readers cross. What a caller cannot supply is the anchor a relative path
+    is resolved against, because that is the target's own directory. [LAW:single-enforcer]
 
     `namespace` is what the user *stated*, `None` when they stated nothing, and that
     absence is load-bearing rather than a convenience: it is what makes a bare `crom
@@ -709,6 +720,16 @@ def init(here: Path, namespace: str | None, seed: Seed | None) -> Init:
     reason `down` declines one too. [LAW:polishing-by-subtraction]
     """
     target = config.init_target(here)
+    # Everything downstream anchors on the config's own directory rather than on `here`:
+    # a relative seed path is parsed and rendered against it everywhere else, and
+    # `write_default` renders it back with `render_seed(seed, path.parent)`. The two agree
+    # today only because `PROJECT_CONFIG_CANDIDATES[0]` is the bare `.crom.toml`, whose
+    # parent *is* `here`; under the `.crom/config.toml` candidate they diverge, and
+    # `--seed ./fixtures` would parse to `here/fixtures`, fail `relative_to(here/'.crom')`,
+    # and be written as this machine's absolute path into a file meant to be committed.
+    # Taken from the same `target` the write uses, so no interleaving can put the parse
+    # and the write in different directories. [LAW:one-source-of-truth]
+    base = target.parent
     # The one read of "is this project already initialised". `init_target` answers with
     # the file it found, so asking the returned path is asking about that same file
     # rather than repeating its search under a second name.
@@ -738,6 +759,16 @@ def init(here: Path, namespace: str | None, seed: Seed | None) -> Init:
             f'"{USER_NAMESPACE}" is reserved; pass a different namespace'
         )
 
+    # After the namespace is settled and not before, because the order is what a script
+    # branching on the exit code sees: `crom init user --seed chorme` names the reserved
+    # namespace (a conflict) rather than the unrecognised seed (a failure), and the two
+    # answer on different codes. Parsed here rather than by the caller for the reason the
+    # docstring gives — `base` is this function's to derive. [LAW:parse-dont-validate] the
+    # border still runs before the write, so a misspelt seed cannot reach the file.
+    stated_seed = (
+        None if seed_text is None else config.parse_seed(seed_text, DEFAULTS_STANZA, target, base)
+    )
+
     # The refusal here is the kernel's `O_CREAT | O_EXCL`, not a check of ours, so two
     # `crom init` calls racing in one directory produce one file rather than one clobbering
     # the other. What changes is only what the loser does with the answer: it reads the
@@ -746,7 +777,7 @@ def init(here: Path, namespace: str | None, seed: Seed | None) -> Init:
     wrote = configwrite.write_default(
         target,
         namespace=chosen,
-        seed=DEFAULT_SEED if seed is None else seed,
+        seed=DEFAULT_SEED if stated_seed is None else stated_seed,
     )
 
     # Read back rather than echoed from the values above, because on the converging path
@@ -771,12 +802,6 @@ def init(here: Path, namespace: str | None, seed: Seed | None) -> Init:
             f"`crom init` again."
         )
 
-    # Anchored on `target.parent` and not on `here`: a relative seed path is rendered
-    # against the config's own directory everywhere else — `write_default` renders it with
-    # `render_seed(seed, path.parent)` — and the two agree today only because
-    # `PROJECT_CONFIG_CANDIDATES[0]` is the bare `.crom.toml`, whose parent *is* `here`.
-    # Under the `.crom/config.toml` candidate they diverge. [LAW:one-source-of-truth]
-    base = target.parent
     declared = configwrite.value_at(target, "defaults", "seed")
     # Narrowed to text once, here, rather than left raw for two readers to each coerce:
     # the comparison below and the caller's rendering are the same fact and must not be
@@ -789,7 +814,11 @@ def init(here: Path, namespace: str | None, seed: Seed | None) -> Init:
         f"{target} already configures this project, and this asks to change it:",
         (
             ("namespace", declared_namespace, namespace),
-            ("seed", declared_seed, None if seed is None else configwrite.render_seed(seed, base)),
+            (
+                "seed",
+                declared_seed,
+                None if stated_seed is None else configwrite.render_seed(stated_seed, base),
+            ),
         ),
         f"Edit {target} directly — crom writes a project config once and leaves it "
         f"yours after that. Changing the namespace also moves this project's ports and "

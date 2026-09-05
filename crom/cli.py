@@ -43,7 +43,6 @@ from . import (
 )
 from .config import discover, load_user_scope, parse_layer, parse_port, parse_seed
 from .model import (
-    DEFAULTS_STANZA,
     Conflict,
     CromError,
     Emitted,
@@ -977,33 +976,7 @@ def rm_cmd(session: Session, ref: str, yes: bool, keep_data: bool):
 )
 def init_cmd(namespace: str | None, seed_text: str | None):
     """Give this project its own namespace by writing a .crom.toml here. Idempotent."""
-    here = Path.cwd()
-    # Read for the parse below, and read again inside `operations.init` for the write —
-    # two call sites of one rule rather than two spellings of it, exactly as `crom add`
-    # and `operations.add` both read `config.write_target`. The seed cannot be parsed
-    # without it: a relative path is anchored on the config's own directory everywhere
-    # else, and `write_default` renders it back with `render_seed(seed, path.parent)`.
-    # Those agree today only because `PROJECT_CONFIG_CANDIDATES[0]` is the bare
-    # `.crom.toml`, so its parent *is* `here`. Under the `.crom/config.toml` candidate
-    # they diverge, and `--seed ./fixtures` would parse to `here/fixtures`, fail
-    # `relative_to(here/'.crom')`, and be written as this machine's absolute path into a
-    # file meant to be committed — the exact outcome `render_seed`'s docstring exists to
-    # prevent. [LAW:one-source-of-truth]
-    target = config.init_target(here)
-    # Parsed here, before the file exists, through the same checkpoint that reads the
-    # value back on the next command — so `crom init --seed chorme` fails naming the
-    # vocabulary rather than writing a config that every later command rejects.
-    # [LAW:parse-dont-validate]
-    #
-    # Named `stated_seed` rather than `seed` because this module imports the `seed`
-    # module, and a local of that name shadows it for the rest of the function — working
-    # today only because `init_cmd` happens not to need it, and failing with an
-    # AttributeError the first time someone adds a line that does.
-    stated_seed = (
-        None if seed_text is None else parse_seed(seed_text, DEFAULTS_STANZA, target, target.parent)
-    )
-
-    project = operations.init(here, namespace, stated_seed)
+    project = operations.init(Path.cwd(), namespace, seed_text)
 
     # The arm `operations.init` reached, worded rather than re-derived. The other way to
     # reach it from here is to ask whether the file existed before the call — a question
