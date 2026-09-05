@@ -231,7 +231,9 @@ crom can see exactly what is happening, and a declaration that vanished while it
 browser kept running is far more often a config mid-edit or a checkout in flight than a
 profile someone meant to delete. Close that browser and run it again — `crom down`
 cannot reach it, since `crom down` resolves profiles through the config that no longer
-declares this one.
+declares this one. Those four judge a reservation the ledger holds; a `KEY` it holds no
+row under has no standing or liveness to judge and exits 3, sending you back to
+`crom doctor`, which lists every key the ledger does hold.
 
 The two halves of the answer treat a gone config differently, on purpose. For a namespace
 whose config file is gone, the `staging` half falls back to crom's default profile root
