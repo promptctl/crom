@@ -10,7 +10,7 @@ import re
 from pathlib import Path
 
 from . import configwrite, flags, registry, report
-from .config import load_file, load_user_scope
+from .config import load_file, load_user_scope, write_target
 from .model import (
     DEFAULTS_STANZA,
     USER_NAMESPACE,
@@ -29,7 +29,6 @@ from .model import (
     Seed,
     profile_stanza,
 )
-from .paths import user_config_file
 from .policy import LAUNCH_POLICY_FEATURES, LAUNCH_POLICY_FLAGS, LAUNCH_POLICY_ORIGIN
 
 # The closed vocabulary a config may interpolate into flags and env values. Closed on
@@ -243,7 +242,7 @@ def _declare(ref: ProfileRef, scope: Scope, log) -> ProfileSpec:
     no `namespace` key. Recreating it from the same template `crom init` uses is the only
     write that leaves a file crom can read back.
     """
-    target = scope.source or user_config_file()
+    target = write_target(scope)
     configwrite.write_default(
         target,
         namespace=None if scope.is_user else scope.namespace,
@@ -288,7 +287,7 @@ def resolve_spec(scope: Scope, spec: ProfileSpec) -> ResolvedProfile:
     # `crom add`'s restatement check goes through `flags.compose` too, but over two layers
     # rather than three: it asks what this *config* states, and crom's launch policy is
     # not in the config. Deliberately different layer sets, not a drift — see
-    # `cli._effective_flags`, which owns that reasoning.
+    # `operations._effective_flags`, which owns that reasoning.
     #
     # Only the two config stanzas arrive as layers with drops: crom's policy is flags and
     # nothing else, and a `Layer` around it says so. A profile dropping a policy switch is
