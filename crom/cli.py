@@ -21,6 +21,8 @@ import errno
 import json
 import shlex
 from collections.abc import Callable
+from difflib import SequenceMatcher
+from itertools import takewhile
 from pathlib import Path
 from typing import NamedTuple
 
@@ -244,6 +246,63 @@ _COMMAND_SECTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Look after crom's own state", ("doctor", "release", "clean")),
 )
 
+# difflib's own default cutoff, so the measure and the point below which it stops calling
+# two words close come from one place. [LAW:one-source-of-truth]
+_NEARNESS = 0.6
+
+
+def _closeness(typed: str, name: str) -> float:
+    """How near a word someone typed is to a real command, as one number.
+
+    One measure rather than a chain of matching passes, so choosing what to suggest is a
+    threshold over values instead of a fallback between mechanisms.
+    [LAW:dataflow-not-control-flow] `mcp-serve` reaching `mcp` and `confg` reaching
+    `config` are then the same operation on two inputs, not two operations.
+
+    A word whose first segment is exactly a command scores perfect, because `crom
+    mcp-serve` is not a misspelling of `crom mcp` — it is the right command with an
+    invented suffix, which difflib rates 0.5, under any cutoff loose enough to be worth
+    having.
+
+    The separator is what carries that, and nothing weaker does. A command merely
+    *contained* in the word matched `rm` inside `confirm`; a command the word merely
+    *starts with* matched `rm` inside `rmdir`, and `up` inside `update`, `upload` and
+    `uptime` — the same false positive twice, moved from the middle of the word to its
+    front, because a two-letter name is satisfied by any word that happens to open with
+    those letters. Demanding an exact name up to a word boundary answers the whole class
+    rather than one instance of it: `mcp` is a segment of `mcp-serve`, while `up` is only
+    the opening of `update`. Everything else is difflib's to judge, and it rates `rmdir`
+    against `rm` at 0.57 and `update` against `up` at 0.5, both under the cutoff.
+
+    Case is folded because crom has no two commands that differ by it, so folding cannot
+    cost a distinction that exists, and `crom UP` scores 0 against `up` without it.
+    """
+    typed, name = typed.casefold(), name.casefold()
+    stem = "".join(takewhile(str.isalnum, typed))
+    return 1.0 if stem == name else SequenceMatcher(None, typed, name).ratio()
+
+
+def _nearest(typed: str, known: tuple[str, ...]) -> tuple[str, ...]:
+    """The commands worth offering for a word that is not one, nearest first.
+
+    A single character is not a word: it begins a third of crom's commands and names
+    none of them, so `crom u` answering "Did you mean: up" would be a guess wearing the
+    clothes of knowledge. Measured on the word here rather than inside `_closeness`,
+    because it is a fact about what was typed and not about any pairing of it with a
+    name — kept per-pair it floored one arm of the measure while the other let `u`
+    through at 0.667 anyway. [LAW:single-enforcer]
+
+    Carried as the set of candidates rather than as a branch around the search, so the
+    same operations run on every input and a word too short to mean anything is measured
+    against nothing. [LAW:dataflow-not-control-flow]
+    """
+    candidates = known if len(typed) > 1 else ()
+    scored = sorted(
+        ((_closeness(typed, name), name) for name in candidates),
+        key=lambda pair: (-pair[0], pair[1]),
+    )
+    return tuple(name for closeness, name in scored if closeness >= _NEARNESS)
+
 
 class CromCommand(click.Command):
     """Gets crom ready to run a command, once click knows which command that is.
@@ -341,8 +400,63 @@ class CromGroup(click.Group):
             parts = (error.filename, error.strerror or error)
             raise _answer(ctx, error, ": ".join(str(part) for part in parts if part)) from error
 
-    def format_commands(self, ctx, formatter) -> None:
-        """Render the command list in sections, and never omit a command.
+    def resolve_command(self, ctx, args):
+        """Answer an unrecognised word with a route forward rather than a dead end.
+
+        crom converges rather than errors (`report.py`), and this was the last surface
+        handing back nothing to do next: `crom mcp-serve` said only that no such command
+        existed, one character away from the `mcp` the user wanted.
+
+        Raised before delegating rather than caught after, because click's own arm is
+        `ctx.fail` — by the time this frame could see it, it is a `UsageError` carrying
+        nothing that separates it from click's other refusals, so enriching it would mean
+        matching on its wording. The lookup is click's own `get_command`, the same call
+        the overridden method makes, not a second index of the same names.
+        [LAW:one-source-of-truth]
+
+        `resilient_parsing` is the discriminator `parse_args` uses above, for the same
+        reason: `crom mcp-ser <TAB>` is shell completion resolving a word it will not run,
+        and click answers that with a `None` command rather than a refusal.
+        [LAW:dataflow-not-control-flow]
+
+        crom answers for words, and only for words. `crom --nope` never reaches
+        resolution — the group's parser refuses it first — but `crom -- --nope` puts the
+        same token where a command goes, and there click is the better answer: "No such
+        option" is accurate, where a map of sixteen commands, none of them starting with
+        a dash, is noise. `isalnum` is click's own test for the same thing, in
+        `_split_opt`; restated rather than imported because that name is private.
+        """
+        typed = args[0]
+        word = typed[:1].isalnum() and self.get_command(ctx, typed) is None
+        if word and not ctx.resilient_parsing:
+            raise self._unrecognised(ctx, typed)
+        return super().resolve_command(ctx, args)
+
+    def _unrecognised(self, ctx, typed: str) -> click.UsageError:
+        """What crom offers instead of the dead end: the commands nearest what was typed,
+        or — when nothing is near — the whole curated map.
+
+        Both arms are one value, `((heading, names), ...)`, written by the same hand that
+        writes `--help`, so a suggestion and the full listing cannot drift into two
+        pictures of one CLI. [LAW:one-type-per-behavior] a suggestion is that listing
+        filtered, not a second kind of thing.
+
+        No near match renders the map rather than an empty "Did you mean" — "did you mean
+        nothing" is an answer-shaped void where "here is everything crom does" is the
+        answer crom actually has. [LAW:parse-dont-validate]
+
+        Still a `UsageError`, so exit 2 is unchanged: a suggestion is more text, never a
+        different outcome. [CLI binding] exit codes are the contract a script branches
+        on, and this changes what a human reads.
+        """
+        near = _nearest(typed, tuple(self.list_commands(ctx)))
+        route = (("Did you mean", near),) if near else self._sections(ctx)
+        formatter = ctx.make_formatter()
+        self._write_sections(ctx, formatter, route)
+        return click.UsageError(f"No such command {typed!r}.\n{formatter.getvalue().rstrip()}", ctx)
+
+    def _sections(self, ctx) -> tuple[tuple[str, tuple[str, ...]], ...]:
+        """The curated map, plus a heading for whatever the curation missed.
 
         The leftover section is what makes the grouping safe to curate: a command added
         to the group but not to `_COMMAND_SECTIONS` still appears, under a heading whose
@@ -354,8 +468,11 @@ class CromGroup(click.Group):
         """
         listed = {name for _, names in _COMMAND_SECTIONS for name in names}
         leftover = tuple(n for n in self.list_commands(ctx) if n not in listed)
+        return (*_COMMAND_SECTIONS, ("Other", leftover))
 
-        for title, names in (*_COMMAND_SECTIONS, ("Other", leftover)):
+    def _write_sections(self, ctx, formatter, sections) -> None:
+        """Write titled groups of commands, each row a name beside its short help."""
+        for title, names in sections:
             rows = [
                 (name, self.get_command(ctx, name).get_short_help_str(limit=68))
                 for name in names
@@ -364,6 +481,10 @@ class CromGroup(click.Group):
             if rows:
                 with formatter.section(title):
                     formatter.write_dl(rows)
+
+    def format_commands(self, ctx, formatter) -> None:
+        """Render the command list in sections, and never omit a command."""
+        self._write_sections(ctx, formatter, self._sections(ctx))
 
 
 def _emit(as_json: bool, payload, lines: list[str]) -> None:
