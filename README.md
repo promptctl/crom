@@ -24,7 +24,7 @@ with `ps` and serializes its ledger with `flock`, so Windows is not supported.
 
 ```bash
 crom              # launch your default profile
-crom list         # what exists, and what's running
+crom list         # what exists, what's running, and what has drifted from its config
 crom down         # stop it
 ```
 
@@ -153,6 +153,15 @@ could not be resolved appears as `{"namespace", "profile", "ref", "error"}`, and
 is deliberate: one broken declaration is reported rather than sinking the whole listing,
 since `crom list` is what you run *because* something is wrong. Check for `error` before
 reading `port` and friends.
+
+Every element `crom list --json` resolves carries `drift` as well, and so does the
+`resolved` object in `crom config --json`: `{"verdict", "finding", "changes"}`. `verdict`
+is `matches`, `drifted`, `unmeasured` or `stopped`; `finding` is the sentence the human
+listing prints; and `changes` names each entry that moved — `{"subject", "launched",
+"resolves"}`, where the subject is a switch name, an `env NAME`, or `chrome binary`, and
+the side that does not carry the entry at all is `null`. `changes` is empty for every
+verdict but `drifted` — and under `drifted` when the flags differ only in order, so read
+`verdict` to tell drift from agreement, never the length of `changes`.
 
 `crom doctor --json` is neither shape. It answers with an object: `registry`, the path of
 crom's port ledger, `reservations`, the rows in it, and `staging`, the half-built profile
@@ -390,7 +399,8 @@ crom up [REF]                 launch, or report the running browser
 crom down [REF]               stop it
 crom restart [REF]            stop it and start it again on its current config
 crom show [REF]               bring its window to the front, launching it if needed
-crom list [--all]             profiles addressable from here; --all covers every namespace
+crom list [--all]             profiles addressable from here, and how each stands against
+                              its config; --all covers every namespace
 crom add NAME [--seed SEED]   declare a profile in the config governing this directory
 crom rm REF                   stop it if running, undeclare it, release its port, delete its data
 crom init [NS] [--seed SEED]  write a .crom.toml here
@@ -599,6 +609,15 @@ read back off the running process afterward. Chrome re-execs itself and rewrites
 argv, so what `ps` shows is Chrome's current invocation, not the one crom started. Each
 successful launch rewrites the file and a failed one leaves the previous record alone;
 `crom rm` takes it with the profile, `crom down` leaves it.
+
+That record is what lets crom answer whether a running browser is still the browser your
+config describes. `crom list` and `crom config` compare it against what the profile
+resolves to now and report one of four verdicts: `matches`, `drifted` naming the switches
+and variables that moved (or, when that is all that changed, their order), `unmeasured`
+when there is no record or none crom can read, and `stopped` when nothing is running to
+compare — a stopped profile is never drifted, since its next launch takes the current
+configuration anyway. Edit a flag under a running browser and `crom list` says so from
+that moment on.
 
 `XDG_CONFIG_HOME` and `XDG_STATE_HOME` are honored.
 
