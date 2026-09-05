@@ -168,6 +168,15 @@ class Reason(Enum):
     # for a human, and a script offered it as a path would try to open it.
     # [LAW:parse-dont-validate]
     PROFILE_UNKNOWN = ("profile_unknown", NotFound, ("source", "declared"))
+    # Nothing, where `namespace_unknown` beside it carries the names that do exist. The
+    # ledger's keys are already published whole by `crom doctor --json`, which is the
+    # command a caller reached this refusal from and the one the sentence sends them back
+    # to; listing them again here would be a second copy of a document crom already owns.
+    # [LAW:one-source-of-truth]
+    RESERVATION_UNKNOWN = ("reservation_unknown", NotFound)
+    # Nothing, for the reason above: `crom doctor --json` publishes every staging
+    # directory crom found, with its path spelled exactly as `crom clean` takes it.
+    STAGING_UNKNOWN = ("staging_unknown", NotFound)
 
     # Two claims on one resource, or a claim crom reserves for itself. (exit 4)
     # `namespace` here, where `namespace_unknown` refuses it, because this reason's loudest
@@ -196,6 +205,19 @@ class Reason(Enum):
     # are for a human deciding which one is right, and a script that acted on them would be
     # editing the user's config from the text of a refusal.
     DECLARATION_DIFFERS = ("declaration_differs", Conflict, ("settings",))
+    # Four `crom doctor` verdicts refuse a release and they land on three slugs, because a
+    # slug earns its place by separating next moves and only three moves are separable
+    # here: undeclare the profile, close the browser, or give crom the evidence it never
+    # got. `unchecked` and `unprobed` share the third — one is a config crom could not
+    # read and the other a port it could not probe, and the sentence says which, but a
+    # caller does the same thing about either.
+    #
+    # These two are conflicts because something has a live claim on the number: a profile
+    # that is still declared, or a browser that is still running. Neither carries a field
+    # — the reservation the caller named came out of its own argument, and everything crom
+    # looked up on the way to refusing is in `crom doctor`'s answer already.
+    RESERVATION_DECLARED = ("reservation_declared", Conflict)
+    RESERVATION_IN_USE = ("reservation_in_use", Conflict)
 
     # A config file crom cannot act on.
     CONFIG_INVALID = ("config_invalid", CromError)
@@ -213,6 +235,13 @@ class Reason(Enum):
     # `migrate._read_legacy` reads, which is a different file at a different path.
     REGISTRY_INVALID = ("registry_invalid", CromError)
     REGISTRY_UNSUPPORTED = ("registry_unsupported", CromError)
+    # The third of those, and the one that is no kind of conflict: crom could not
+    # establish who the reservation belongs to or who holds its port, so there is no
+    # claimant for it to be in conflict with. It sits with the ledger's own failures rather
+    # than with the two above because that is what it is about — a fact about crom's state
+    # that crom could not read. The sentence names which evidence was missing; a released
+    # port never comes back, so crom refuses rather than assuming the gap is empty.
+    RESERVATION_UNSETTLED = ("reservation_unsettled", CromError)
 
     # Launching, reaching, or stopping a browser. The distinctions the exit code cannot
     # draw and this ticket exists for: which of these you got decides whether retrying is
