@@ -183,9 +183,18 @@ class CliTest(unittest.TestCase):
         distinction is why this parses the "Did you mean" heading rather than searching
         the output for a command name: the map names every command, so `assertIn("mcp",
         ...)` would pass just as green on a run that suggested nothing at all.
+
+        Rows are found by their indent, not by taking the first word of every line.
+        `write_dl` writes a name at two spaces and wraps its help to the second column,
+        so in a terminal narrow enough to wrap — `COLUMNS=60` reaches it, and `config`'s
+        help clears the default width by one character — the first word of a continuation
+        line reads as a command crom never offered. This suite is green under `CliRunner`
+        only because it pins a width, which makes the developer's terminal an input to
+        the assertion. [LAW:no-ambient-temporal-coupling] Matching the row indent settles
+        it in the parse rather than by holding the width still.
         """
         offered = self.crom(*args, expect=2).partition("Did you mean:\n")[2]
-        return tuple(line.split()[0] for line in offered.splitlines() if line.strip())
+        return tuple(re.findall(r"^ {2}(\S+)", offered, flags=re.MULTILINE))
 
     # --- bootstrap ------------------------------------------------------------------
 
@@ -3968,14 +3977,47 @@ class CliTest(unittest.TestCase):
             with self.subTest(word=word):
                 self.assertEqual(self.suggestions(word), ())
 
-    def test_a_coincidental_substring_does_not_outrank_the_command_meant(self):
-        """`confirm` ends in `rm` by an accident of spelling. Scored on where a command
-        appears rather than where it begins, that accident was a perfect match — and it
-        put crom's one destructive command at the head of the list, above the `config`
-        a user typing `confirm` plausibly wanted. Ordering is the assertion: `rm`
-        present but second would still be the same bug half-fixed.
+    def test_a_coincidental_run_of_letters_is_not_a_command(self):
+        """crom's two-letter commands are a letter-run away from ordinary words, and a
+        perfect score handed to a coincidence outranks every real match beneath it.
+
+        Four words because this bug has been fixed twice in the wrong place. Scored on
+        where a command *appears*, `confirm` ended in `rm` and put crom's one destructive
+        command above the `config` the user meant. Scored on what the word *starts with*,
+        the same `rm` reappeared under `rmdir`, and `up` under `update` and `upload` —
+        the failure moved from the middle of the word to its front rather than leaving.
+        Only an exact name up to a word boundary answers all four, which is why all four
+        are here: `confirm` alone stays green while `rmdir` offers to delete a profile.
         """
-        self.assertEqual(self.suggestions("confirm"), ("config",))
+        for word, offered in (
+            ("confirm", ("config",)),
+            ("rmdir", ()),
+            ("update", ()),
+            ("upload", ()),
+        ):
+            with self.subTest(word=word):
+                self.assertEqual(self.suggestions(word), offered)
+
+    def test_the_suggestion_reader_is_not_fooled_by_a_wrapped_row(self):
+        """A guard on this file's own helper, because four tests above assert through it.
+
+        `write_dl` wraps a row's help to the second column in a narrow terminal, and
+        `config`'s help clears the default width by one character — so reading the first
+        word of every line reports `profile`, the first word of the continuation, as a
+        command crom offered. `CliRunner` pins a width, so the suite never meets the
+        wrap; that is what makes the developer's terminal an undeclared input rather
+        than what makes the helper safe. [LAW:no-ambient-temporal-coupling]
+
+        Narrowed through `terminal_width`, click's own context setting, because
+        `CliRunner` pins `FORCED_WIDTH` to 80 for the length of an invocation and
+        restores it after — so the width every other test here runs at is not one this
+        suite chose, and not one it can override the way a terminal would. The first
+        assertion is the load-bearing half: a render that stopped wrapping would leave
+        the second passing for the wrong reason.
+        """
+        with mock.patch.dict(cli.main.context_settings, {"terminal_width": 52}):
+            self.assertIn("\n          profile", self.crom("confirm", expect=2))
+            self.assertEqual(self.suggestions("confirm"), ("config",))
 
     def test_a_command_typed_in_the_wrong_case_still_routes_to_it(self):
         """`crom UP` is an exact match wearing a different case, and an unfolded

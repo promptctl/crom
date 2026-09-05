@@ -22,6 +22,7 @@ import json
 import shlex
 from collections.abc import Callable
 from difflib import SequenceMatcher
+from itertools import takewhile
 from pathlib import Path
 from typing import NamedTuple
 
@@ -258,24 +259,27 @@ def _closeness(typed: str, name: str) -> float:
     [LAW:dataflow-not-control-flow] `mcp-serve` reaching `mcp` and `confg` reaching
     `config` are then the same operation on two inputs, not two operations.
 
-    A shared beginning scores perfect because `crom mcp-serve` is not a misspelling of
-    `crom mcp` — it is the right command with an invented suffix, which difflib rates
-    0.5, under any cutoff loose enough to be worth having. It reads both directions:
-    `mcp-serve` starts with a command, and `conf` is what a command starts with.
+    A word whose first segment is exactly a command scores perfect, because `crom
+    mcp-serve` is not a misspelling of `crom mcp` — it is the right command with an
+    invented suffix, which difflib rates 0.5, under any cutoff loose enough to be worth
+    having.
 
-    Where a command *begins* and not merely where it appears, because appearing anywhere
-    is not evidence of anything. `confirm` ends in `rm` by an accident of spelling, and
-    scoring that pair perfect ranked crom's one destructive command above the `config`
-    the user meant. A command at the head of what you typed is a command you started
-    typing; one in the middle is a coincidence, and difflib is already the right judge of
-    coincidences — it rates `confirm` against `rm` at 0.44 and drops it.
+    The separator is what carries that, and nothing weaker does. A command merely
+    *contained* in the word matched `rm` inside `confirm`; a command the word merely
+    *starts with* matched `rm` inside `rmdir`, and `up` inside `update`, `upload` and
+    `uptime` — the same false positive twice, moved from the middle of the word to its
+    front, because a two-letter name is satisfied by any word that happens to open with
+    those letters. Demanding an exact name up to a word boundary answers the whole class
+    rather than one instance of it: `mcp` is a segment of `mcp-serve`, while `up` is only
+    the opening of `update`. Everything else is difflib's to judge, and it rates `rmdir`
+    against `rm` at 0.57 and `update` against `up` at 0.5, both under the cutoff.
 
     Case is folded because crom has no two commands that differ by it, so folding cannot
     cost a distinction that exists, and `crom UP` scores 0 against `up` without it.
     """
     typed, name = typed.casefold(), name.casefold()
-    begins = typed.startswith(name) or name.startswith(typed)
-    return 1.0 if begins else SequenceMatcher(None, typed, name).ratio()
+    stem = "".join(takewhile(str.isalnum, typed))
+    return 1.0 if stem == name else SequenceMatcher(None, typed, name).ratio()
 
 
 def _nearest(typed: str, known: tuple[str, ...]) -> tuple[str, ...]:
