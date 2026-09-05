@@ -712,7 +712,7 @@ def up_cmd(session: Session, ref: str, no_restart: bool, as_json: bool):
     _emit(
         as_json,
         {
-            **profile.describe(running=True, pids=ran.pids),
+            **profile.describe(chrome.health_of(profile, ran.pids)),
             # The verdict crom *found*, under a key that says so. `crom list` and `crom
             # config` publish `drift`, which is how a profile stands right now; this
             # command's answer is how the profile stood when this command reached it, and
@@ -749,7 +749,20 @@ def down_cmd(session: Session, ref: str, as_json: bool):
         if pids
         else f"{profile.ref} was not running"
     )
-    _emit(as_json, profile.describe(running=False, pids=pids), [message])
+    # `Stopped()` rather than a reading taken here: `chrome.kill` returns only once the
+    # process is gone *and* the port is free, or raises — so this command's own
+    # postcondition is what the state says, and probing to be told what crom has just
+    # established would be a second answer to a settled question. [LAW:one-source-of-truth]
+    #
+    # The pids ride alongside as `stopped`, the key `up` and `restart` already publish for
+    # what a run took down. They used to sit in the record's own `pids`, which every other
+    # command fills with processes a caller can attach to — one key, two meanings, and the
+    # meaning flipped on which command wrote it. [FRAMING:representation]
+    _emit(
+        as_json,
+        {**profile.describe(chrome.Stopped()), "stopped": list(pids)},
+        [message],
+    )
 
 
 @main.command("restart")
@@ -801,7 +814,7 @@ def restart_cmd(session: Session, ref: str, as_json: bool):
     # command exists to report. [LAW:one-source-of-truth] `describe()` stays canonical.
     _emit(
         as_json,
-        {**profile.describe(running=True, pids=pids), "stopped": list(stopped)},
+        {**profile.describe(chrome.health_of(profile, pids)), "stopped": list(stopped)},
         [message],
     )
 
@@ -854,7 +867,11 @@ def show_cmd(session: Session, ref: str, as_json: bool):
     # the prose. [FRAMING:representation] one result, and both maps of it say the same.
     _emit(
         as_json,
-        {**profile.describe(running=True, pids=pids), "started": started, "windows": windows},
+        {
+            **profile.describe(chrome.health_of(profile, pids)),
+            "started": started,
+            "windows": windows,
+        },
         [raised],
     )
 
@@ -888,13 +905,17 @@ def list_cmd(session: Session, everything: bool, as_json: bool):
                     # that there is nothing to compare — so the listing has no per-row
                     # branch asking whether this line has one. [LAW:dataflow-not-control-flow]
                     verdict = drift.of(entry, state.pids)
-                    record = entry.describe(running=state.running, pids=state.pids)
-                    records.append({**record, "drift": drift.describe(verdict)})
-                    # Still the two words this listing has always printed. `state` now
-                    # also separates a browser that answers from one that only exists;
-                    # rendering that third word is the next change, not this one.
-                    shown = f"running :{entry.port}" if state.running else f"stopped :{entry.port}"
-                    lines.append(f"  {str(entry.ref):28s}  {shown:15s}  {verdict.finding}")
+                    records.append({**entry.describe(state), "drift": drift.describe(verdict)})
+                    # The state's own word, so the line a human reads and the `state` a
+                    # script parses are one value rendered twice rather than two
+                    # descriptions someone has to keep in step. [LAW:one-source-of-truth]
+                    # The ternary this replaces could name only two of the three, and had
+                    # no third arm to add: `running` was the branch, and "running" was the
+                    # word that made a wedged browser read like a healthy one.
+                    shown = f"{state.slug} :{entry.port}"
+                    # Nineteen is the longest of these plus the two-space gutter every
+                    # other column here keeps: `unreachable :9240`.
+                    lines.append(f"  {str(entry.ref):28s}  {shown:19s}  {verdict.finding}")
                 case FailedProfile():
                     records.append(entry.describe())
                     lines.append(f"  {str(entry.ref):28s}  unresolved — {entry.error}")
@@ -1267,7 +1288,7 @@ def config_cmd(session: Session, ref: str | None, as_json: bool):
 
     if ref:
         profile = session.working(ref)
-        state = chrome.health([profile], chrome.scan())[profile.ref]
+        state = chrome.health_of(profile, chrome.find_pids(profile))
         verdict = drift.of(profile, state.pids)
         notes = _layer_notes(profile)
         # Measured over the annotated lines alone: the bare ones are the binary path and
@@ -1275,7 +1296,7 @@ def config_cmd(session: Session, ref: str | None, as_json: bool):
         # anything up with.
         width = min(max((len(arg) for arg in notes), default=0), _NOTE_COLUMN)
         payload["resolved"] = {
-            **profile.describe(running=state.running, pids=state.pids),
+            **profile.describe(state),
             "argv": list(profile.argv),
             # Beside `argv` rather than inside `describe()`, for the reason the seed is:
             # this is how the profile came to be what it is, which is `crom config`'s
