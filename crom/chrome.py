@@ -593,8 +593,8 @@ def _devtools_version(reply: bytes) -> _Version | None:
         return None
     if not websocket.startswith("ws://"):
         return None
-    return _Version(printable(str(document.get("Browser") or UNNAMED_BROWSER)),
-                    printable(websocket))
+    return _Version(_one_line(document.get("Browser") or UNNAMED_BROWSER),
+                    _one_line(websocket))
 
 
 def _names_a_browser(reply: bytes) -> bool:
@@ -632,7 +632,7 @@ def _tab_in(target: dict) -> Tab | None:
     a title is control of the listing exactly as an escape is control of the terminal.
     """
     match target:
-        case {"title": title, "url": url}:
+        case {"title": str() as title, "url": str() as url}:
             return Tab(_one_line(title), _one_line(url))
         case _:
             return None
@@ -641,6 +641,27 @@ def _tab_in(target: dict) -> Tab | None:
 def _one_line(text: object) -> str:
     """Foreign text as a single line, safe to print beside crom's own words."""
     return " ".join(printable(str(text)).split())
+
+
+def _listing_in(reply: bytes) -> list | None:
+    """The targets a reply names, or nothing while it is not yet a whole JSON array.
+
+    The read loop's question and only that: whether more bytes are coming. It is kept
+    apart from `_pages_in`'s question — whether the listing describes the pages in it —
+    because `_read_reply` takes this as its completeness predicate and must tell "still
+    arriving" from "arrived, and unreadable". Answered as one, a browser that sent a whole
+    listing crom cannot read looks exactly like one still sending, and the read waits out
+    the whole of `PORT_REPLY_SECONDS` for bytes that are already in hand.
+    [LAW:decomposition] two questions, cut apart at the joint the caller can feel.
+    """
+    try:
+        match json.loads(reply):
+            case [*targets]:
+                return targets
+            case _:
+                return None
+    except (ValueError, RecursionError):
+        return None
 
 
 def _pages_in(reply: bytes) -> tuple[Tab, ...] | None:
@@ -658,25 +679,25 @@ def _pages_in(reply: bytes) -> tuple[Tab, ...] | None:
     all told crom nothing. Collapsed, "no tabs" would be published for a browser whose
     reply crom could not read. [LAW:parse-dont-validate]
     """
-    try:
-        listing = json.loads(reply)
-    except (ValueError, RecursionError):
-        return None
-    match listing:
-        case [*targets]:
+    match _listing_in(reply):
+        case None:
+            return None
+        case targets:
             pages = tuple(
                 _tab_in(target)
                 for target in targets
                 if isinstance(target, dict) and target.get("type") == "page"
             )
             return None if any(tab is None for tab in pages) else pages
-        case _:
-            return None
 
 
 def _lists_targets(reply: bytes) -> bool:
-    """Whether a reply read this far is already a whole target listing."""
-    return _pages_in(_body_of(reply)) is not None
+    """Whether a reply read this far is already a whole target listing.
+
+    Asks `_listing_in` and not `_pages_in`: the loop wants to know whether to keep reading,
+    and a listing whose pages crom cannot describe has still arrived. [LAW:decomposition]
+    """
+    return _listing_in(_body_of(reply)) is not None
 
 
 def _body_of(reply: bytes) -> bytes:

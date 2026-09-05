@@ -2029,6 +2029,23 @@ class PortQuestionTest(unittest.TestCase):
         listener can call itself Chrome; only a websocket makes it drivable."""
         self.assertIsNone(chrome._devtools_version(b'{"Browser": "Chrome/152.0.7977.76"}'))
 
+    def test_what_the_endpoint_calls_itself_cannot_forge_a_line_either(self):
+        """`_browser_facts` renders `browser` and `websocket` one per line and `_emit`
+        joins those lines, so a newline in either writes a line of crom's own output. A
+        stranger squatting the port reaches `Ready` on any `ws://` URL, which is all it
+        takes to try. `printable` keeps newlines by design — they are the shape of the
+        multi-line messages it also sanitises — so these two fields take `_one_line`, the
+        same as a tab's."""
+        document = (
+            b'{"Browser": "Chrome/100\\nci  ready  :9228",'
+            b' "webSocketDebuggerUrl": "ws://x\\nconnect at ws://evil/"}'
+        )
+
+        version = chrome._devtools_version(document)
+        self.assertEqual(version.browser, "Chrome/100 ci ready :9228")
+        self.assertNotIn("\n", version.browser)
+        self.assertNotIn("\n", version.websocket)
+
     def test_what_the_endpoint_calls_itself_cannot_repaint_the_terminal(self):
         """A listener on the port is unvetted by definition, and `crom status` prints what
         it says it is. Sanitised where the document is parsed, so everything downstream
@@ -2110,6 +2127,32 @@ class TabListingTest(unittest.TestCase):
                 ).encode()
             )
         )
+
+    def test_a_page_that_names_a_field_as_something_other_than_text_is_undescribed(self):
+        """The mapping pattern asks each published field for a string and not merely for
+        the key: a target naming `"title": null` has said as little about the page as one
+        omitting it, and matching on presence alone would publish a tab titled with the
+        literal `None` — a page crom invented, in the shape of one the browser reported.
+        Both fields are walked because both are published, and a pattern that types one
+        and not the other reads as this test passing while half the promise is unkept."""
+        for field in ("title", "url"):
+            for value in (None, 7, []):
+                with self.subTest(field=field, value=value):
+                    page = {"type": "page", "title": "a tab", "url": "https://x/"}
+                    page[field] = value
+                    self.assertIsNone(chrome._pages_in(json.dumps([page]).encode()))
+
+    def test_a_listing_crom_cannot_read_has_still_arrived(self):
+        """`_read_reply` asks `_lists_targets` whether to keep reading, and that is a
+        different question from whether the listing describes its pages. Answered as one,
+        a browser that sent a whole listing crom cannot read looks exactly like one still
+        sending — and Chrome holds the socket open, so the read would wait out the whole
+        of `PORT_REPLY_SECONDS` for bytes already in hand."""
+        arrived = b'HTTP/1.1 200 OK\r\n\r\n[{"type": "page", "url": "https://x/"}]'
+
+        self.assertTrue(chrome._lists_targets(arrived))
+        self.assertIsNone(chrome._pages_in(chrome._body_of(arrived)))
+        self.assertFalse(chrome._lists_targets(b'HTTP/1.1 200 OK\r\n\r\n[{"type": "pa'))
 
     def test_a_page_title_cannot_repaint_the_terminal_or_forge_a_line(self):
         """`document.title` is set by whatever page is open, so it is attacker-controlled

@@ -1626,12 +1626,14 @@ class CliTest(unittest.TestCase):
         )
 
     def test_every_command_that_publishes_a_state_can_be_told_not_to_probe(self):
-        """All five, because the flag is only worth having if a caller can rely on it.
+        """Every one of them, because the flag is only worth having if a caller can rely
+        on it.
 
-        The one record shape crom publishes is emitted by six commands, five of which ask
-        the port for the state they put in it. A flag honoured by `crom list` alone would
-        be the epic's own failure in miniature: a caller reads `unprobed` from a listing,
-        reasonably assumes the others behave the same, and `crom up --json` connects.
+        The one record shape crom publishes is emitted by every command below, and the
+        ones carrying this flag ask the port for the state they put in it. A flag
+        honoured by `crom list` alone would be the epic's own failure in miniature: a
+        caller reads `unprobed` from a listing, reasonably assumes the others behave the
+        same, and `crom up --json` connects.
 
         `launch` refuses to be called rather than being allowed to succeed quietly. These
         profiles are already running, so a launch here would mean the command took the
@@ -1641,8 +1643,9 @@ class CliTest(unittest.TestCase):
 
         Which commands those are comes from click, and so does whether each takes a REF;
         where the record sits comes from the payload's own shape. Nothing here is keyed on
-        a command's name, so a sixth command gaining `@_probe_option` is covered the day it
-        is written rather than the day someone remembers this list. [LAW:one-source-of-truth]
+        a command's name, so the next command gaining `@_probe_option` is covered the day
+        it is written rather than the day someone remembers this list.
+        [LAW:one-source-of-truth]
         """
         self.crom("init")
         self.crom("add", "ci")
