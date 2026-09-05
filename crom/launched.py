@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import report
-from .model import ResolvedProfile
+from .model import Flag, ResolvedProfile
 
 # What the record is called inside the profile's user-data-dir. Prefixed for the reason
 # `chrome.STDERR_FILENAME` is: the directory is Chrome's, and an operator looking at it
@@ -158,6 +158,14 @@ def read(profile_dir: Path) -> Launch | Unknown:
     `env` are read bare, so a truncated or hand-edited record would otherwise surface as a
     `KeyError` or a `TypeError` — from a function whose whole contract is that it does not
     raise.
+
+    Naming each switch at most once is part of that shape and not an extra check. crom
+    composes a launch that emits every Chrome switch exactly once — `flags.layer` refuses a
+    stanza setting one twice — so a record naming one twice was never written by a launch,
+    and the type handed back must not say it was. `drift` keys its comparison by switch
+    name, and a duplicate collapsed quietly here would let two different launches read as
+    one and be explained wrongly. The invariant belongs to the type every consumer
+    receives, not to each consumer's assertion about it.
     """
     source = path(profile_dir)
     if not source.exists():
@@ -185,6 +193,13 @@ def read(profile_dir: Path) -> Launch | Unknown:
         return _damaged(source, "is missing an `argv`, or has one that is not a list of strings")
     if not (isinstance(env, dict) and all(isinstance(value, str) for value in env.values())):
         return _damaged(source, "is missing an `env`, or has one that is not a table of strings")
+    # `argv[1:]`, because `argv[0]` is the executable and answers no switch's question.
+    # Through `Flag.parse` so this and `drift` split a switch from its value identically.
+    switches = [Flag.parse(item).switch for item in argv[1:]]
+    if len(set(switches)) != len(switches):
+        return _damaged(
+            source, "names the same Chrome switch more than once, which no launch crom composes does"
+        )
 
     # Back to a tuple, because a `Launch` read from disk exists to be compared against one
     # built by `Launch.of`, and `["--foo"] != ("--foo",)`. Handing back the list would make

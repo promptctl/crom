@@ -32,6 +32,7 @@ from . import (
     config,
     configwrite,
     doctor,
+    drift,
     flags,
     mcp,
     migrate,
@@ -715,9 +716,14 @@ def list_cmd(session: _Session, everything: bool, as_json: bool):
             match entry:
                 case ResolvedProfile():
                     running, pids = _status(entry, live)
-                    records.append(entry.describe(running=running, pids=pids))
+                    # Every row carries a verdict, including the rows whose verdict is
+                    # that there is nothing to compare — so the listing has no per-row
+                    # branch asking whether this line has one. [LAW:dataflow-not-control-flow]
+                    verdict = drift.of(entry, pids)
+                    record = entry.describe(running=running, pids=pids)
+                    records.append({**record, "drift": drift.describe(verdict)})
                     state = f"running :{entry.port}" if running else f"stopped :{entry.port}"
-                    lines.append(f"  {str(entry.ref):28s}  {state}")
+                    lines.append(f"  {str(entry.ref):28s}  {state:15s}  {verdict.finding}")
                 case FailedProfile():
                     records.append(entry.describe())
                     lines.append(f"  {str(entry.ref):28s}  unresolved — {entry.error}")
@@ -1424,6 +1430,7 @@ def config_cmd(session: _Session, ref: str | None, as_json: bool):
     if ref:
         profile = session.working(ref)
         running, pids = _status(profile, chrome.scan())
+        verdict = drift.of(profile, pids)
         notes = {str(item.flag): _note(item) for item in profile.provenance.emitted}
         # Measured over the annotated lines alone: the bare ones are the binary path and
         # the profile directory, which are the longest things here and have nothing to line
@@ -1446,6 +1453,10 @@ def config_cmd(session: _Session, ref: str | None, as_json: bool):
             # where the data came from, and every other `describe()` consumer — `up`,
             # `list` — is reporting what the profile *is* right now.
             "seed": configwrite.render_seed(profile.seed, profile.config_dir),
+            # Last, because it is the only fact here about the *browser* rather than
+            # about the resolution: everything above says what `crom up` would launch,
+            # and this says how what is already running stands against it.
+            "drift": drift.describe(verdict),
         }
         lines += [
             "",
@@ -1484,6 +1495,13 @@ def config_cmd(session: _Session, ref: str | None, as_json: bool):
                 f"{_resolution(removal.what, named=False)} — removed by {removal.by})"
                 for removal in profile.provenance.dropped
             ),
+            # The verdict, then a line per entry that moved. Every line above is the
+            # *current* resolution, so a flag the user has since edited appears there as
+            # its new value with nothing saying the running browser never got it — and
+            # the old value has no other channel. [LAW:no-silent-failure]
+            "",
+            f"  {verdict.finding}",
+            *(f"    {change}" for change in verdict.changes),
         ]
 
     _emit(as_json, payload, lines)

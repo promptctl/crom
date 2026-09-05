@@ -23,7 +23,7 @@ from unittest import mock
 
 from click.testing import CliRunner
 
-from crom import cli, config, configwrite, doctor, mcp, migrate, registry
+from crom import cli, config, configwrite, doctor, launched, mcp, migrate, registry
 from crom.config import load_ambient
 from crom.model import USER_NAMESPACE, Conflict, CromError, ProfileRef, Reason
 from crom.paths import registry_file, state_home, user_config_file
@@ -1221,6 +1221,150 @@ class CliTest(unittest.TestCase):
         self.assertIn("myproj/default", refs)
         self.assertIn("myproj/ci", refs)
         self.assertIn("user/default", refs)  # still addressable from inside a project
+
+    # --- drift ----------------------------------------------------------------------
+
+    def _record_the_launch_of(self, ref: str, env: dict[str, str] | None = None) -> str:
+        """Leave the record a real launch of `ref` would leave, and name its directory.
+
+        Written through `launched.record` from the argv `crom config` reports, so what
+        these tests compare against is the file crom's own launch path writes rather than
+        one this suite hand-built to a schema it invented. Chrome is never launched here,
+        and this is the half of a launch that outlives the process.
+        [LAW:one-source-of-truth]
+
+        `env` is stated by the caller because it is the one half of a launch that
+        `crom config --json` does not publish. Every config written below declares none.
+        """
+        resolved = json.loads(self.crom("config", ref, "--json"))["resolved"]
+        directory = Path(resolved["profile_dir"])
+        # The directory first, because a real launch has already been through
+        # `seed.materialize_under_lock` by the time `chrome.launch` writes the record —
+        # the record lives *inside* the user-data-dir. Without this, `record` correctly
+        # reports that it could not write, and every verdict below is `unmeasured`.
+        # [LAW:no-ambient-temporal-coupling] the ordering is stated, not assumed.
+        directory.mkdir(parents=True, exist_ok=True)
+        launched.record(directory, launched.Launch(tuple(resolved["argv"]), env or {}))
+        return str(directory)
+
+    def _resize_ci(self) -> None:
+        """The config edit crom used to say nothing about: a flag changed under a browser."""
+        config_path = self.project / ".crom.toml"
+        config_path.write_text(config_path.read_text().replace("800,600", "1280,800", 1))
+
+    def test_list_reports_a_running_browser_whose_config_has_since_changed(self):
+        """The epic's whole complaint, at the surface a user actually reads.
+
+        Before this, an edited profile and an untouched one gave `crom list` the same row
+        — `running :<port>` — and the only way to find out the browser was launched from a
+        configuration that no longer exists was to remember having edited the file.
+        """
+        self.crom("init")
+        self.crom("add", "ci", "--flag", "--window-size=800,600")
+        directory = self._record_the_launch_of("ci")
+
+        with mock.patch("crom.chrome.scan", return_value={directory: (4242,)}):
+            before = self._ci_row(self.crom("list"))
+            self._resize_ci()
+            after = self._ci_row(self.crom("list"))
+
+        self.assertIn("running :", before)
+        self.assertIn("running with what this configuration resolves to", before)
+        self.assertIn("drifted — --window-size", after)
+
+    def test_list_leaves_a_stopped_profile_out_of_the_drift_it_could_not_have(self):
+        """The record outlives the browser, and a browser that is gone is not stale.
+
+        `crom down` deliberately leaves the launch record in the user-data-dir, so the
+        edit below has a record to disagree with. Reported as drifted, every stopped
+        profile whose config was ever touched would read as a browser running the wrong
+        flags — and `crom up` would be converging on something that is not there.
+        """
+        self.crom("init")
+        self.crom("add", "ci", "--flag", "--window-size=800,600")
+        self._record_the_launch_of("ci")
+        self._resize_ci()
+
+        row = self._ci_row(self.crom("list"))
+
+        self.assertIn("stopped :", row)
+        self.assertIn("not running, so its next launch takes this configuration", row)
+        self.assertNotIn("drifted", row)
+
+    def test_list_json_carries_the_verdict_and_what_moved_beside_the_record(self):
+        """A script watching for stale browsers reads the verdict, never the prose."""
+        self.crom("init")
+        self.crom("add", "ci", "--flag", "--window-size=800,600")
+        directory = self._record_the_launch_of("ci")
+        self._resize_ci()
+
+        with mock.patch("crom.chrome.scan", return_value={directory: (4242,)}):
+            records = json.loads(self.crom("list", "--json"))
+
+        row = next(record for record in records if record["ref"] == "myproj/ci")
+        self.assertEqual(row["drift"]["verdict"], "drifted")
+        self.assertEqual(
+            row["drift"]["changes"],
+            [
+                {
+                    "subject": "--window-size",
+                    "launched": "--window-size=800,600",
+                    "resolves": "--window-size=1280,800",
+                }
+            ],
+        )
+
+    def test_config_says_what_the_running_browser_was_launched_with_instead(self):
+        """`crom config` prints what a launch *would* be, which is what hides the drift.
+
+        Every line of the listing is the current resolution, so an edited `--window-size`
+        appears there as its new value with nothing saying the running browser never got
+        it. The old value has no other channel. [LAW:no-silent-failure]
+        """
+        self.crom("init")
+        self.crom("add", "ci", "--flag", "--window-size=800,600")
+        directory = self._record_the_launch_of("ci")
+        self._resize_ci()
+
+        with mock.patch("crom.chrome.scan", return_value={directory: (4242,)}):
+            output = self.crom("config", "ci")
+
+        self.assertIn("drifted — --window-size", output)
+        self.assertIn(
+            "--window-size: launched --window-size=800,600, now --window-size=1280,800", output
+        )
+
+    def test_config_json_carries_the_verdict_beside_the_resolution(self):
+        self.crom("init")
+        self.crom("add", "ci", "--flag", "--window-size=800,600")
+        directory = self._record_the_launch_of("ci")
+
+        with mock.patch("crom.chrome.scan", return_value={directory: (4242,)}):
+            resolved = json.loads(self.crom("config", "ci", "--json"))["resolved"]
+
+        self.assertEqual(resolved["drift"]["verdict"], "matches")
+        self.assertEqual(resolved["drift"]["changes"], [])
+
+    def test_a_running_browser_crom_has_no_record_of_is_not_reported_as_current(self):
+        """No record is "crom cannot tell". Answered `matches`, crom would be guessing.
+
+        Reachable on any browser a crom older than the launch record started, and on any
+        profile whose directory was cleaned out under a running Chrome.
+        """
+        self.crom("init")
+        self.crom("add", "ci")
+        directory = json.loads(self.crom("config", "ci", "--json"))["resolved"]["profile_dir"]
+
+        with mock.patch("crom.chrome.scan", return_value={directory: (4242,)}):
+            row = self._ci_row(self.crom("list"))
+
+        self.assertIn("crom has no record of how the browser in", row)
+        self.assertNotIn("running with what this configuration resolves to", row)
+
+    def _ci_row(self, listing: str) -> str:
+        """The one line of a listing that is about `myproj/ci`."""
+        (row,) = [line for line in listing.splitlines() if "myproj/ci" in line]
+        return row
 
     def test_mcp_wires_the_profile_port(self):
         self.crom("init")
