@@ -3954,30 +3954,63 @@ class CliTest(unittest.TestCase):
         for title, _names in cli._COMMAND_SECTIONS:
             self.assertIn(title, output)
 
-    def test_a_single_character_is_not_treated_as_a_fragment_of_anything(self):
-        """`o` sits inside five of crom's commands and names none of them. Containment
-        scores a perfect match, so without a floor on how wide the overlap must be, one
-        stray keystroke answers with five confident guesses — a map that does not match
-        its territory, where the map crom does have is the right answer.
+    def test_a_single_character_is_not_treated_as_a_word(self):
+        """One keystroke names no command, and crom's answer to it is the map.
+
+        Five characters because a floor on one arm of the measure is not a floor. `o`
+        begins nothing and reaches crom through difflib alone; `u` and `r` begin `up`
+        and `rm`, the two-letter commands; `m` and `p` end them, and difflib rates a
+        one-of-two-character match 0.667 — over the cutoff. A test holding only `o`
+        passes just as green while `crom u` answers "Did you mean: up", which is how
+        this shipped in the first place.
         """
-        self.assertEqual(self.suggestions("o"), ())
+        for word in ("o", "u", "r", "m", "p"):
+            with self.subTest(word=word):
+                self.assertEqual(self.suggestions(word), ())
+
+    def test_a_coincidental_substring_does_not_outrank_the_command_meant(self):
+        """`confirm` ends in `rm` by an accident of spelling. Scored on where a command
+        appears rather than where it begins, that accident was a perfect match — and it
+        put crom's one destructive command at the head of the list, above the `config`
+        a user typing `confirm` plausibly wanted. Ordering is the assertion: `rm`
+        present but second would still be the same bug half-fixed.
+        """
+        self.assertEqual(self.suggestions("confirm"), ("config",))
+
+    def test_a_command_typed_in_the_wrong_case_still_routes_to_it(self):
+        """`crom UP` is an exact match wearing a different case, and an unfolded
+        comparison scores it 0 — the whole map, for the one input crom knows most
+        certainly. Caps lock and shell history are how a user gets here."""
+        self.assertEqual(self.suggestions("UP"), ("up",))
 
     def test_completing_a_half_typed_command_is_not_a_refusal(self):
-        """`crom mcp-ser<TAB>` reaches the same lookup a typed command does, and click
+        """`crom mcp-ser <TAB>` reaches the same lookup a typed command does, and click
         answers it with no command rather than an error on purpose. Refusing there would
         put crom's new message on the user's terminal every time they pressed tab — a
         break no test that runs a command can see, because completion never runs one.
+
+        The word is complete and the cursor past it, which is what `args`/`incomplete`
+        below say: click resolves the words already typed and completes the one being
+        typed, so the half-word itself never reaches `resolve_command`.
         """
         completer = ShellComplete(cli.main, {}, "crom", "_CROM_COMPLETE")
         self.assertTrue(completer.get_completions(["mcp-ser"], ""))
 
     def test_an_unknown_option_still_gets_clicks_own_refusal(self):
         """A word crom can measure against its commands and a mistyped option are two
-        different failures. The group's parser answers the second before resolution ever
-        runs, which is what lets the suggestion path assume it is holding a word."""
-        output = self.crom("--nope", expect=2)
-        self.assertIn("No such option", output)
-        self.assertNotIn("Did you mean", output)
+        different failures, and crom answers only the first.
+
+        `--nope` is refused by the group's parser before resolution runs; `-- --nope`
+        puts the same token where a command goes and reaches resolution, which is the
+        one way an option-shaped word arrives. Both keep click's sentence, because
+        "No such option" is the true one — a map of sixteen commands, none of them
+        starting with a dash, would be crom answering a question it was not asked.
+        """
+        for argv in (("--nope",), ("--", "--nope")):
+            with self.subTest(argv=argv):
+                output = self.crom(*argv, expect=2)
+                self.assertIn("No such option", output)
+                self.assertNotIn("Did you mean", output)
 
     def test_every_config_key_the_parser_accepts_is_named_in_help(self):
         """crom's primary reader is an agent that gets one look at `--help` and then

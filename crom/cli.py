@@ -258,22 +258,43 @@ def _closeness(typed: str, name: str) -> float:
     [LAW:dataflow-not-control-flow] `mcp-serve` reaching `mcp` and `confg` reaching
     `config` are then the same operation on two inputs, not two operations.
 
-    Containment scores perfect because `crom mcp-serve` is not a misspelling of `crom
-    mcp` — it is the right command with an invented suffix, which difflib rates 0.5,
-    under any cutoff loose enough to be worth having. The overlap has to be more than one
-    character: a single letter sits inside five of crom's commands and names none of
-    them, and difflib already scores a one-letter word below the cutoff, so below that
-    width the honest answer is the whole map rather than a confident guess.
+    A shared beginning scores perfect because `crom mcp-serve` is not a misspelling of
+    `crom mcp` — it is the right command with an invented suffix, which difflib rates
+    0.5, under any cutoff loose enough to be worth having. It reads both directions:
+    `mcp-serve` starts with a command, and `conf` is what a command starts with.
+
+    Where a command *begins* and not merely where it appears, because appearing anywhere
+    is not evidence of anything. `confirm` ends in `rm` by an accident of spelling, and
+    scoring that pair perfect ranked crom's one destructive command above the `config`
+    the user meant. A command at the head of what you typed is a command you started
+    typing; one in the middle is a coincidence, and difflib is already the right judge of
+    coincidences — it rates `confirm` against `rm` at 0.44 and drops it.
+
+    Case is folded because crom has no two commands that differ by it, so folding cannot
+    cost a distinction that exists, and `crom UP` scores 0 against `up` without it.
     """
-    overlap = min(typed, name, key=len)
-    inside = len(overlap) > 1 and (name in typed or typed in name)
-    return 1.0 if inside else SequenceMatcher(None, typed, name).ratio()
+    typed, name = typed.casefold(), name.casefold()
+    begins = typed.startswith(name) or name.startswith(typed)
+    return 1.0 if begins else SequenceMatcher(None, typed, name).ratio()
 
 
 def _nearest(typed: str, known: tuple[str, ...]) -> tuple[str, ...]:
-    """The commands worth offering for a word that is not one, nearest first."""
+    """The commands worth offering for a word that is not one, nearest first.
+
+    A single character is not a word: it begins a third of crom's commands and names
+    none of them, so `crom u` answering "Did you mean: up" would be a guess wearing the
+    clothes of knowledge. Measured on the word here rather than inside `_closeness`,
+    because it is a fact about what was typed and not about any pairing of it with a
+    name — kept per-pair it floored one arm of the measure while the other let `u`
+    through at 0.667 anyway. [LAW:single-enforcer]
+
+    Carried as the set of candidates rather than as a branch around the search, so the
+    same operations run on every input and a word too short to mean anything is measured
+    against nothing. [LAW:dataflow-not-control-flow]
+    """
+    candidates = known if len(typed) > 1 else ()
     scored = sorted(
-        ((_closeness(typed, name), name) for name in known),
+        ((_closeness(typed, name), name) for name in candidates),
         key=lambda pair: (-pair[0], pair[1]),
     )
     return tuple(name for closeness, name in scored if closeness >= _NEARNESS)
@@ -390,16 +411,21 @@ class CromGroup(click.Group):
         [LAW:one-source-of-truth]
 
         `resilient_parsing` is the discriminator `parse_args` uses above, for the same
-        reason: `crom mcp-ser<TAB>` is shell completion resolving a half-typed word on
-        purpose, and click answers that with a `None` command rather than a refusal.
+        reason: `crom mcp-ser <TAB>` is shell completion resolving a word it will not run,
+        and click answers that with a `None` command rather than a refusal.
         [LAW:dataflow-not-control-flow]
 
-        An option-shaped word never reaches here — the group's parser answers `crom
-        --nope` with "No such option" before resolution — so `args[0]` is always a word
-        to be measured against command names.
+        crom answers for words, and only for words. `crom --nope` never reaches
+        resolution — the group's parser refuses it first — but `crom -- --nope` puts the
+        same token where a command goes, and there click is the better answer: "No such
+        option" is accurate, where a map of sixteen commands, none of them starting with
+        a dash, is noise. `isalnum` is click's own test for the same thing, in
+        `_split_opt`; restated rather than imported because that name is private.
         """
-        if self.get_command(ctx, args[0]) is None and not ctx.resilient_parsing:
-            raise self._unrecognised(ctx, args[0])
+        typed = args[0]
+        word = typed[:1].isalnum() and self.get_command(ctx, typed) is None
+        if word and not ctx.resilient_parsing:
+            raise self._unrecognised(ctx, typed)
         return super().resolve_command(ctx, args)
 
     def _unrecognised(self, ctx, typed: str) -> click.UsageError:
