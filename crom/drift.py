@@ -28,12 +28,20 @@ from . import launched
 from .launched import Launch
 from .model import Flag, ResolvedProfile
 
-# What the entry map calls the executable, which is `argv[0]` and answers no switch's
-# question. A key rather than a special case in the diff: `chrome_binary` is layered
-# configuration like everything else here, so a config that repoints it is drift, and it
-# has to be nameable in the same sentence as a switch. It cannot collide with the keys
-# beside it — a switch starts `--`, an environment entry is prefixed below.
-_BINARY = "chrome binary"
+# The three kinds of question a launch answers, and what an entry below is keyed by.
+# Keyed by kind and name rather than by the sentence a reader sees, because the sentences
+# share one string keyspace and two of them can be the same string: `flags.layer` refuses
+# blank, padded and interpolated switch names and nothing else, so a stanza may spell a
+# flag `chrome binary=x` or `env TZ=y` and address an entry it does not own. Discriminated,
+# that collision is unrepresentable rather than merely unlikely — the executable is not a
+# switch and no config can make it one. [LAW:types-are-the-program]
+#
+# The executable answers no switch's question, and is an entry rather than a special case
+# in the diff because `chrome_binary` is layered configuration like everything else here:
+# a config that repoints it is drift, and it has to be nameable in the same sentence as a
+# switch.
+_BINARY, _SWITCH, _ENV = "binary", "switch", "env"
+_Key = tuple[str, str]
 
 
 @dataclass(frozen=True)
@@ -137,7 +145,7 @@ class Drifted:
     deliberately does not — the order flags sit in on the command line. Two launches
     emitting the same switches in a different order are unequal and have no differing
     entry, so the sentence says so instead of trailing off after a dash — and that is the
-    only way here, since neither side can name a switch twice.
+    only way here, since neither side can name one question twice.
     """
 
     slug: ClassVar[str] = "drifted"
@@ -203,24 +211,26 @@ def _changes(recorded: Launch, current: Launch) -> tuple[Change, ...]:
     Sorted by subject rather than left in command-line order, because the two sides have
     two orders and a report built from either one would list a switch the other side puts
     somewhere else. Sorting is the only ordering that is a property of the comparison
-    rather than of one of its operands.
+    rather than of one of its operands. The key breaks its own ties, because two questions
+    may render to one subject and set iteration is not an order.
     """
     was, now = _entries(recorded), _entries(current)
     return tuple(
-        Change(subject, was.get(subject), now.get(subject))
-        for subject in sorted(was.keys() | now.keys())
-        if was.get(subject) != now.get(subject)
+        Change(_subject(key), was.get(key), now.get(key))
+        for key in sorted(was.keys() | now.keys(), key=lambda key: (_subject(key), key))
+        if was.get(key) != now.get(key)
     )
 
 
-def _entries(launch: Launch) -> dict[str, str]:
+def _entries(launch: Launch) -> dict[_Key, str]:
     """A launch as answers keyed by the questions they answer, which is what can be diffed.
 
-    Keyed by switch name and not by argv position: a config that changes `--window-size`
+    Keyed by question and not by argv position: a config that changes `--window-size`
     from `800,600` to `1280,800` moved one answer, and a positional diff would report it
-    as one switch removed and an unrelated one added. Sound on both sides because a name
-    cannot address two entries: `flags.layer` refuses a stanza that sets a switch twice, and
-    `launched.read` refuses a record that names one twice.
+    as one switch removed and an unrelated one added. Sound on both sides because a key
+    cannot address two entries: the kind separates the three, `flags.layer` refuses a
+    stanza that sets a switch twice, and `launched.read` refuses a record that names one
+    twice.
 
     `argv[:1]` rather than `argv[0]`: this is the one place a record that has been
     hand-edited down to nothing reaches, and a record with no executable in it should
@@ -228,14 +238,33 @@ def _entries(launch: Launch) -> dict[str, str]:
     empty slice produces. Total by construction, so no guard is needed to make it so.
     [LAW:no-defensive-null-guards]
 
-    `env` is prefixed rather than merged bare, so `crom config` can print a switch and a
-    variable in one list and a reader can tell which they are looking at. It is here at
-    all because `[defaults].env` and a profile's `env` are layered configuration exactly
-    as `flags` is: editing either changes the browser crom would launch, so leaving it out
-    would make an env edit a config change no verdict could ever report.
+    `env` is its own kind rather than merged in among the switches, so `crom config` can
+    print a switch and a variable in one list and a reader can tell which they are looking
+    at. It is here at all because `[defaults].env` and a profile's `env` are layered
+    configuration exactly as `flags` is: editing either changes the browser crom would
+    launch, so leaving it out would make an env edit a config change no verdict could ever
+    report.
     """
     return {
-        **{_BINARY: text for text in launch.argv[:1]},
-        **{Flag.parse(text).switch: text for text in launch.argv[1:]},
-        **{f"env {name}": value for name, value in launch.env.items()},
+        **{(_BINARY, ""): text for text in launch.argv[:1]},
+        **{(_SWITCH, Flag.parse(text).switch): text for text in launch.argv[1:]},
+        **{(_ENV, name): value for name, value in launch.env.items()},
     }
+
+
+def _subject(key: _Key) -> str:
+    """How a question reads in the report — the sole writer of the published `subject`.
+
+    A flag a config literally named `env TZ` renders here like the variable, and that is
+    display ambiguity rather than the collision the key rules out: the two are separate
+    entries carrying their own values, so neither masks the other and the pair a reader is
+    shown is the pair that actually moved. [LAW:one-source-of-truth] every `subject` a
+    human reads and every `subject` `--json` publishes is spelled here, so the two cannot
+    come to disagree.
+
+    A kind this does not know raises rather than rendering as an odd-looking subject: the
+    kinds are a closed set one file long, so an unknown one is a bug in this file and not
+    input. [LAW:no-silent-failure]
+    """
+    kind, name = key
+    return {_BINARY: "chrome binary", _SWITCH: name, _ENV: f"env {name}"}[kind]

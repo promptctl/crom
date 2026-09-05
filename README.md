@@ -613,10 +613,11 @@ successful launch rewrites the file and a failed one leaves the previous record 
 That record is what lets crom answer whether a running browser is still the browser your
 config describes. `crom list` and `crom config` compare it against what the profile
 resolves to now and report one of four verdicts: `matches`, `drifted` naming the switches
-and variables that moved, `unmeasured` when there is no record or none crom can read, and
-`stopped` when nothing is running to compare — a stopped profile is never drifted, since
-its next launch takes the current configuration anyway. Edit a flag under a running
-browser and `crom list` says so from that moment on.
+and variables that moved (or, when that is all that changed, their order), `unmeasured`
+when there is no record or none crom can read, and `stopped` when nothing is running to
+compare — a stopped profile is never drifted, since its next launch takes the current
+configuration anyway. Edit a flag under a running browser and `crom list` says so from
+that moment on.
 
 `XDG_CONFIG_HOME` and `XDG_STATE_HOME` are honored.
 

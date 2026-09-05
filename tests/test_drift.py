@@ -143,6 +143,23 @@ class VerdictTest(DriftTestCase):
         self.assertIsInstance(verdict, drift.Unmeasured)
         self.assertIn("more than once", verdict.finding)
 
+    def test_a_record_hand_edited_down_to_nothing_reports_the_executable_it_lost(self):
+        """`launched.read` permits `"argv": []`, so `_entries` has to survive it.
+
+        A list of strings is what that border checks, and `all()` over an empty list is
+        true — so an emptied `argv` arrives here as a `Launch` and not as an `Unknown`.
+        `argv[:1]` is the only reason it becomes an entry the config has and the record
+        does not, rather than an `IndexError` out of a function whose whole contract is
+        that it returns a verdict. Nothing else drives that slice.
+        """
+        launched.record(self.profile_dir, launched.Launch((), {}))
+
+        verdict = drift.of(profile(self.profile_dir, "--f=1"), RUNNING)
+
+        self.assertIsInstance(verdict, drift.Drifted)
+        (binary,) = [change for change in verdict.changes if change.subject == "chrome binary"]
+        self.assertEqual((binary.launched, binary.resolves), (None, "/chrome"))
+
 
 class NamingTest(DriftTestCase):
     """What a drifted verdict says, once the verdict itself is settled."""
@@ -201,6 +218,24 @@ class NamingTest(DriftTestCase):
         self.launched_with(binary="/old/Chrome")
 
         verdict = drift.of(profile(self.profile_dir, binary="/new/Chrome"), RUNNING)
+
+        (change,) = verdict.changes
+        self.assertEqual(change.subject, "chrome binary")
+        self.assertEqual((change.launched, change.resolves), ("/old/Chrome", "/new/Chrome"))
+
+    def test_a_flag_spelled_like_the_binary_subject_cannot_address_the_binary_entry(self):
+        """Entries are keyed by kind and name, so a switch can only ever be a switch.
+
+        Nothing makes a switch start `--`: `flags.layer` refuses blank, padded and
+        interpolated names and accepts `chrome binary=x`, whose `Flag.switch` is the very
+        word the executable's entry renders as. Keyed by that word, the flag overwrote the
+        executable and a repointed Chrome came out as `drifted — its flags are in a
+        different order` — the one sentence `launched.read`'s uniqueness check exists to
+        keep true. [LAW:types-are-the-program]
+        """
+        self.launched_with("chrome binary=x", binary="/old/Chrome")
+
+        verdict = drift.of(profile(self.profile_dir, "chrome binary=x", binary="/new/Chrome"), RUNNING)
 
         (change,) = verdict.changes
         self.assertEqual(change.subject, "chrome binary")
