@@ -565,11 +565,6 @@ def _moved(changes: tuple[drift.Change, ...], notes: dict[str, str]) -> list[str
     return [f"  {change}{_supplied(change, notes)}" for change in changes]
 
 
-def _status(profile: ResolvedProfile, live: dict[str, tuple[int, ...]]) -> tuple[bool, tuple[int, ...]]:
-    pids = live.get(str(profile.profile_dir), ())
-    return bool(pids), pids
-
-
 @click.group(cls=CromGroup)
 # The version is read from the installed distribution's metadata, which the build copies
 # out of pyproject.toml, so crom holds no second spelling of it to fall behind a release.
@@ -872,21 +867,34 @@ def list_cmd(session: Session, everything: bool, as_json: bool):
     """List the profiles addressable from here."""
     scopes, unavailable = _scopes_to_list(session, everything)
 
-    live = chrome.scan()
+    # Every row is resolved before any row is judged, because the probe behind
+    # `chrome.health` is only one round trip if it is handed the whole listing at once —
+    # asked a profile at a time it becomes twenty, and a listing of wedged browsers costs
+    # `PORT_REPLY_SECONDS` apiece. The rendering loop below then reads a decided value
+    # rather than reaching for the world mid-row.
+    listing = [(scope, list(resolver.resolve_all(scope))) for scope in scopes]
+    standing = chrome.health(
+        (entry for _, entries in listing for entry in entries if isinstance(entry, ResolvedProfile)),
+        chrome.scan(),
+    )
+
     records, lines = [], []
-    for scope in scopes:
-        for entry in resolver.resolve_all(scope):
+    for scope, entries in listing:
+        for entry in entries:
             match entry:
                 case ResolvedProfile():
-                    running, pids = _status(entry, live)
+                    state = standing[entry.ref]
                     # Every row carries a verdict, including the rows whose verdict is
                     # that there is nothing to compare — so the listing has no per-row
                     # branch asking whether this line has one. [LAW:dataflow-not-control-flow]
-                    verdict = drift.of(entry, pids)
-                    record = entry.describe(running=running, pids=pids)
+                    verdict = drift.of(entry, state.pids)
+                    record = entry.describe(running=state.running, pids=state.pids)
                     records.append({**record, "drift": drift.describe(verdict)})
-                    state = f"running :{entry.port}" if running else f"stopped :{entry.port}"
-                    lines.append(f"  {str(entry.ref):28s}  {state:15s}  {verdict.finding}")
+                    # Still the two words this listing has always printed. `state` now
+                    # also separates a browser that answers from one that only exists;
+                    # rendering that third word is the next change, not this one.
+                    shown = f"running :{entry.port}" if state.running else f"stopped :{entry.port}"
+                    lines.append(f"  {str(entry.ref):28s}  {shown:15s}  {verdict.finding}")
                 case FailedProfile():
                     records.append(entry.describe())
                     lines.append(f"  {str(entry.ref):28s}  unresolved — {entry.error}")
@@ -1259,15 +1267,15 @@ def config_cmd(session: Session, ref: str | None, as_json: bool):
 
     if ref:
         profile = session.working(ref)
-        running, pids = _status(profile, chrome.scan())
-        verdict = drift.of(profile, pids)
+        state = chrome.health([profile], chrome.scan())[profile.ref]
+        verdict = drift.of(profile, state.pids)
         notes = _layer_notes(profile)
         # Measured over the annotated lines alone: the bare ones are the binary path and
         # the profile directory, which are the longest things here and have nothing to line
         # anything up with.
         width = min(max((len(arg) for arg in notes), default=0), _NOTE_COLUMN)
         payload["resolved"] = {
-            **profile.describe(running=running, pids=pids),
+            **profile.describe(running=state.running, pids=state.pids),
             "argv": list(profile.argv),
             # Beside `argv` rather than inside `describe()`, for the reason the seed is:
             # this is how the profile came to be what it is, which is `crom config`'s

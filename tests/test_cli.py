@@ -97,8 +97,16 @@ class CliTest(unittest.TestCase):
         # way the tests about a running browser name the directory.
         self.ports = mock.patch("crom.chrome.port_is_free", return_value=True)
         self.ports.start()
+        # The third external system in this list: `crom list` and `crom config <ref>` ask
+        # every listed profile's CDP port whether a browser answers, which is a real
+        # loopback connect. Silence is what a suite whose `scan` returns `{}` should hear;
+        # a test that is *about* a browser that answers names that inline, the way the
+        # tests about a held port name the port.
+        self.probe = mock.patch("crom.chrome._probe_port", return_value=chrome._Silent())
+        self.probe.start()
 
     def tearDown(self):
+        self.probe.stop()
         self.ports.stop()
         self.scan.stop()
         self.env.stop()
