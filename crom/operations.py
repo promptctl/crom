@@ -6,11 +6,10 @@ the work and hand back what happened, leaving the sentence a user reads to be wr
 somewhere else.
 
 They take what is already resolved: a `ResolvedProfile`, never a `Session` and never a ref
-string, because parsing a reference is the caller's half of the job. `add` is the one
-exception the rule implies rather than admits — it is what *creates* a declaration for the
-others to resolve, so it takes the scope and the request instead. A future operation that
-mutates an existing profile takes the resolved profile; do not read `add`'s signature as
-licence otherwise.
+string, because parsing a reference is the caller's half of the job. What an operation
+*creates* has nothing resolved to take — so `add` takes the scope and the request, `init`
+the directory. A future operation that mutates an existing profile takes the resolved
+profile; do not read either signature as licence otherwise.
 
 What lives here rather than in a command body is the critical section. Seeding, the
 liveness read, the launch, and the replacement that may follow are one indivisible span,
@@ -730,9 +729,9 @@ def init(here: Path, namespace: str | None, seed_text: str | None) -> Init:
     # Taken from the same `target` the write uses, so no interleaving can put the parse
     # and the write in different directories. [LAW:one-source-of-truth]
     base = target.parent
-    # The one read of "is this project already initialised". `init_target` answers with
-    # the file it found, so asking the returned path is asking about that same file
-    # rather than repeating its search under a second name.
+    # Whether crom's guess can reach disk, and nothing else: create-or-converge is
+    # `write_default`'s `O_CREAT | O_EXCL`, and a reserved namespace in the file is
+    # `config.parse`'s to refuse. A message bought before the write, not an invariant.
     existing = target.is_file()
 
     # crom's guess, and the value that reaches disk when the user named nothing. Derived
