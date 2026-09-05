@@ -1593,6 +1593,43 @@ class CliTest(unittest.TestCase):
         # crom says such things and not into the answer a script parses.
         self.assertNotIn("replacing it", result.stdout)
 
+    def test_up_says_it_was_replacing_a_browser_when_either_half_fails(self):
+        """A relaunch that fails half-way leaves the user with no browser at all.
+
+        `restart` has the same hazard and the same guard, but here it bites harder: the
+        user asked for a browser, not for a restart, and crom went to replace the working
+        one on its own initiative because a config edit said so. Told only that stopping
+        or starting failed, they have no reason to connect it to the edit they made.
+
+        Both halves, because the line is emitted before either runs and only a test of
+        each says so. The stop half fails for real when a stranger holds the CDP port —
+        `chrome.kill` refuses rather than guessing — and that arm never reaches the second
+        read of the process table, which is why it offers only one.
+        """
+        self.crom("init")
+        self.crom("add", "ci", "--flag", "--window-size=800,600")
+        self._record_the_launch_of("ci")
+        self._resize_ci()
+        halves = (
+            ("the stop", [(4242,)], {"side_effect": Reason.CHROME_STOP_FAILED.error("port held")}),
+            ("the start", [(4242,), ()], {"return_value": (4242,)}),
+        )
+
+        for half, reads, killing in halves:
+            with self.subTest(half=half):
+                with (
+                    mock.patch("crom.cli.seed.materialize_under_lock"),
+                    mock.patch("crom.cli.chrome.find_pids", side_effect=reads),
+                    mock.patch("crom.cli.chrome.kill", **killing),
+                    mock.patch(
+                        "crom.cli.chrome.launch",
+                        side_effect=Reason.CHROME_STARTUP_FAILED.error("Chrome exited 1"),
+                    ),
+                ):
+                    result = self.invoke("up", "ci", expect=1)
+
+                self.assertIn("myproj/ci drifted — --window-size; replacing it", result.output)
+
     def test_mcp_wires_the_profile_port(self):
         self.crom("init")
         port = self.crom("port").strip()

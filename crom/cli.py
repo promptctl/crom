@@ -421,6 +421,24 @@ def _pid_list(pids: tuple[int, ...]) -> str:
     return ", ".join(map(str, pids))
 
 
+def _layer_notes(profile: ResolvedProfile) -> dict[str, str]:
+    """Where each switch this profile resolves to comes from, keyed by the text it emits.
+
+    The sole builder of that mapping, for the two commands that annotate a flag with its
+    provenance: `crom config` beside every line of the resolved command, and `crom up`
+    beside a switch a relaunch moved. [LAW:single-enforcer] spelled twice, the collision
+    rule `_supplied` documents would have to be changed in both places to stay true, with
+    nothing making them agree.
+
+    Keyed by the whole flag text rather than the switch name because that is the spelling
+    both readers already hold: `crom config` looks up lines of `profile.argv`, and a
+    `drift.Change.resolves` is one of those same strings. Keying by switch name would also
+    reintroduce the collision `drift` keys its own entries by kind to rule out — a config
+    may legally name a flag `env TZ`.
+    """
+    return {str(item.flag): _note(item) for item in profile.provenance.emitted}
+
+
 def _supplied(change: drift.Change, notes: dict[str, str]) -> str:
     """Which layers decided the current value of a changed switch, as a clause beside it.
 
@@ -604,10 +622,9 @@ def up_cmd(session: _Session, ref: str, as_json: bool):
     """
     profile = session.working(ref)
     where = f"{profile.ref} on {profile.cdp_url}"
-    # Which layers decided each switch the *current* resolution emits, keyed and phrased
-    # exactly as `crom config` keys and phrases it. Built out here because it is a fact
-    # about the resolution, and nothing the lock protects can change it.
-    notes = {str(item.flag): _note(item) for item in profile.provenance.emitted}
+    # Built out here because it is a fact about the resolution, and nothing the lock
+    # protects can change it.
+    notes = _layer_notes(profile)
     # Seeding, the liveness check, and the launch are one critical section. Split, two
     # concurrent `crom up` calls both see no running Chrome and both launch against the
     # same profile directory and port — and because Chrome binds the CDP port well before
@@ -1554,7 +1571,7 @@ def config_cmd(session: _Session, ref: str | None, as_json: bool):
         profile = session.working(ref)
         running, pids = _status(profile, chrome.scan())
         verdict = drift.of(profile, pids)
-        notes = {str(item.flag): _note(item) for item in profile.provenance.emitted}
+        notes = _layer_notes(profile)
         # Measured over the annotated lines alone: the bare ones are the binary path and
         # the profile directory, which are the longest things here and have nothing to line
         # anything up with.
