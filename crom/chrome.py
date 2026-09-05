@@ -214,10 +214,12 @@ def _ps(columns: str) -> str:
     indexing it cannot fail that way, and it is what `scan` has always done.
 
     [LAW:single-enforcer] the two ways `ps` can fail are answered here, once, for both
-    questions crom puts to it. `list`, `up`, `down`, `rm`, `config`, `status` and
-    migration all arrive here, so a raw `CalledProcessError` would escape the exit-code
-    contract from every one of them, and a missing `ps` would name the file and not the
-    reason. [LAW:no-silent-failure]
+    questions crom puts to it. Every command that asks whether a profile is running
+    arrives here — directly, or by way of `scan`, `find_pids`, `kill` or `launch` — so a
+    raw `CalledProcessError` would escape the exit-code contract from all of them, and a
+    missing `ps` would name the file and not the reason. Naming those commands here would
+    be a second copy of a list click already holds, and it would rot the first time one
+    of them learned to ask. [LAW:no-silent-failure] [LAW:one-source-of-truth]
 
     macOS BSD `pgrep` doesn't support -a (print cmdline), so this is the portable path and
     the one that gives us full argv to tell a main browser from a helper process.
@@ -620,7 +622,7 @@ def _tab_in(target: dict) -> Tab | None:
 
     A `page` target missing its title or its URL makes the whole listing unreadable rather
     than one page invisible — dropping it would publish a tab count that is quietly short,
-    which is the failure `TARGET_LIST_BYTES` refuses a few lines above, and a browser
+    which is the failure `TARGET_LIST_BYTES` refuses, and a browser
     would report "no tabs open" for pages it plainly has. A placeholder would be worse
     still: a `--json` consumer would read it as one of the browser's actual pages, and
     crom would have invented it. [LAW:no-silent-failure]

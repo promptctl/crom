@@ -1665,6 +1665,11 @@ class CliTest(unittest.TestCase):
                         "crom.cli.chrome.launch", side_effect=AssertionError("must not launch")
                     ),
                     mock.patch("crom.cli.window.raise_profile", return_value=1),
+                    # `status` reads the elapsed times too, and `uptimes_on` shells out to
+                    # a real `ps`. Named here for the reason `_status_of` names it: a test
+                    # that stubs every external system but one inherits the machine for
+                    # that one, silently, and only on the subtest that happens to read it.
+                    mock.patch("crom.chrome.uptimes_on", return_value={4242: timedelta(hours=3)}),
                     self._the_network_must_not_be_touched(),
                 ):
                     # `.stdout`, because `up`, `restart` and `show` narrate progress on

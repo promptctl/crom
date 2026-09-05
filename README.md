@@ -153,7 +153,9 @@ in a config and in your shell, and `CROM_REF` is the joined `namespace/name`.
 holds the profile's directory. `ready` means one does *and* a browser crom can drive
 answered on the port. `unreachable` means the process is there and the port is not — a
 browser still starting up, one shutting down, one wedged, or a port some other program has
-taken — `crom status` prints what the port did or said, which often tells those apart.
+taken — and `crom status` prints what the port did or said, which tells a stranger holding
+the port from plain silence. It does not separate starting up from shutting down from
+wedged: all three are silence, and silence reads the same whichever it is.
 `running` is the short answer, true wherever a process holds the directory, and it is read
 off `state`, so the two can never disagree. It is what crom used to publish alone, and
 alone it cannot tell you the one thing you need: an agent that connects to an `unreachable`
@@ -206,16 +208,19 @@ sentence saying what the port did or said, and it is always filled in. Only `bro
 and `websocket` is the browser websocket URL a client connects by,
 `ws://127.0.0.1:9228/devtools/browser/45e0cffe-…`. Both come out of the `/json/version`
 document the reachability probe already fetches, which crom used to read for a yes or no
-and throw away, and both are `null` when nothing answered. `tabs` is an array of
-`{"title", "url"}` objects, one per page the browser has open — CDP targets of type `page`
+and throw away, and both are `null` whenever no browser crom can drive answered — which
+includes a port some other program is listening on, where something did answer and none
+of it was a browser. `tabs` is an array of `{"title", "url"}` objects, one per page the
+browser has open — CDP targets of type `page`
 and nothing else, because a browser showing a single new tab also carries omnibox popups,
 extension background pages, iframes and service workers behind it, and counting those would
 report five tabs open on a browser nobody has touched.
 
-`tabs` is `null` when nothing answered, and `null` again when a browser answered the
-version request and then would not list its targets; an empty array is a browser that
-answered and has no pages open, so read `state` to tell those two apart. `processes` is an
-array of `{"pid", "uptime_seconds"}` objects, one per pid in `pids`, read from `ps`, where
+`tabs` is `null` whenever no drivable browser answered, and `null` again when a browser
+answered the version request and then would not list its targets; an empty array is a
+browser that answered and has no pages open, so read `state` to tell those two apart.
+`processes` is an array of `{"pid", "uptime_seconds"}` objects, one per pid in `pids`,
+read from `ps`, where
 `uptime_seconds` is `null` for a pid `ps` no longer knows — which happens when the browser
 exits between crom's two readings of the process table. A browser that will not answer
 costs you the port's half and none of the process table's: `state`, `pids` and `processes`
