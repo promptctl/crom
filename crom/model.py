@@ -807,11 +807,32 @@ class Unreachable:
 
 @dataclass(frozen=True)
 class Ready:
-    """A process holds the directory and a DevTools endpoint answered on the port."""
+    """A process holds the directory, and a DevTools endpoint answered on the port
+    calling itself `browser` and offering `websocket` as the way in.
+
+    The two fields are `Unreachable.heard` with the sign flipped: that state carries what
+    the port did wrong because it is the only one with a complaint to make, and this one
+    carries what the browser said because it is the only one that got an answer. Neither
+    is representable on a state that never heard from the port, which is the whole reason
+    they are fields here rather than optional keys on all four.
+    [LAW:types-are-the-program]
+
+    Free, and that is why they are kept: the probe fetches `/json/version` and parses it to
+    decide this state at all, then used to drop the document on the floor. Re-opening the
+    port to ask again would be a second reading of one fact, and the two could disagree.
+    [LAW:one-source-of-truth]
+
+    `websocket` is the browser-level `webSocketDebuggerUrl` — the handle a CDP client
+    connects by, and the thing crom exists to keep pointing at the same place. It changes
+    every time the browser restarts, which is exactly why it is read live and never
+    stored.
+    """
 
     slug: ClassVar[str] = "ready"
     running: ClassVar[bool] = True
     pids: tuple[int, ...]
+    browser: str
+    websocket: str
 
 
 @dataclass(frozen=True)

@@ -21,8 +21,9 @@ import errno
 import json
 import shlex
 from collections.abc import Callable
+from datetime import timedelta
 from difflib import SequenceMatcher
-from itertools import takewhile
+from itertools import dropwhile, takewhile
 from pathlib import Path
 from typing import NamedTuple
 
@@ -54,9 +55,13 @@ from .model import (
     NotFound,
     ProfileRef,
     ProfileSpec,
+    Ready,
     ResolvedProfile,
     Resolution,
     Scope,
+    Stopped,
+    Unprobed,
+    Unreachable,
     profile_stanza,
     validate_name,
 )
@@ -185,10 +190,10 @@ def _probe_option(command):
     """The `--no-probe` flag: one declaration, and the flag stops being a flag right here.
 
     The callback returns the `chrome.PortReading` the command will use rather than the
-    boolean the user typed, so what travels into the five commands carrying this option is
-    the reading itself. Each of them then calls `chrome.health`/`health_of` the same way
-    with a different value, instead of five copies of a rule turning a bool into a
-    behaviour — which is five places for the sixth command to be written without.
+    boolean the user typed, so what travels into the commands carrying this option is the
+    reading itself. Each of them then calls `chrome.health`/`health_of` the same way with a
+    different value, instead of one copy per command of a rule turning a bool into a
+    behaviour — which is one more place for the next command to be written without.
     [LAW:single-enforcer] the translation happens once, where click already parses.
 
     [LAW:dataflow-not-control-flow] and it is the same reason the reading is a value at
@@ -284,7 +289,7 @@ def _answer(ctx: click.Context, error: Exception, message: str) -> _Failure:
 # the third is not. [FRAMING:representation] a listing is a map of the CLI, and the CLI's
 # real structure is these jobs.
 _COMMAND_SECTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("Run a browser", ("up", "down", "restart", "show", "list")),
+    ("Run a browser", ("up", "down", "restart", "show", "list", "status")),
     ("Point tools at one", ("mcp", "env", "port")),
     ("Declare what exists", ("init", "add", "rm", "config", "forget")),
     ("Look after crom's own state", ("doctor", "release", "clean")),
@@ -922,6 +927,173 @@ def show_cmd(session: Session, ref: str, reading: chrome.PortReading, as_json: b
             "windows": windows,
         },
         [raised],
+    )
+
+
+def _since(elapsed: timedelta) -> str:
+    """A duration as a person reads one: the two largest units that carry it.
+
+    Contiguous units rather than the non-zero ones, so a browser up five days and
+    twenty-three minutes reads `5d 0h` and never `5d 23m` — which is the same string a
+    browser up five days and twenty-three *hours* would produce, off by a day.
+    [FRAMING:representation] the map drops precision, and it may not lie while doing it.
+    """
+    days, rest = divmod(int(elapsed.total_seconds()), 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes, seconds = divmod(rest, 60)
+    carried = dropwhile(
+        lambda part: part[0] == 0, ((days, "d"), (hours, "h"), (minutes, "m"), (seconds, "s"))
+    )
+    return " ".join(f"{value}{unit}" for value, unit in list(carried)[:2]) or "0s"
+
+
+def _process_line(pid: int, elapsed: timedelta | None) -> str:
+    """One of a profile's processes, and how long it has been there.
+
+    A pid the uptime reading does not know is said so outright rather than left off the
+    listing or timed at zero. The pids come from one reading of the process table and the
+    durations from the next, so a browser that exits between the two is a real outcome —
+    and a caller who sees a pid vanish silently learns nothing, where `no longer in the
+    process table` names exactly what happened. [LAW:no-silent-failure]
+    """
+    if elapsed is None:
+        return f"pid {pid}, no longer in the process table"
+    return f"pid {pid}, up {_since(elapsed)}"
+
+
+def _tab_lines(tabs: tuple[chrome.Tab, ...] | None) -> list[str]:
+    """A browser's open pages, headed by how many there are.
+
+    Three outcomes and three sentences, because `None` and `()` are different facts:
+    `chrome.tabs_on` returns nothing when the browser would not list its targets, and an
+    empty tuple when it listed none. Rendering both as "no tabs open" would report an
+    empty desktop for a browser crom could not read. [LAW:parse-dont-validate]
+    """
+    if tabs is None:
+        return ["crom could not read its tab list — the browser answered, then did not"]
+    headline = {0: "no tabs open", 1: "1 tab open"}.get(len(tabs), f"{len(tabs)} tabs open")
+    return [headline, *(f"  {tab.title} — {tab.url}" for tab in tabs)]
+
+
+def _nothing_heard(heard: str) -> tuple[dict, list[str]]:
+    """What `crom status` publishes for the three states no browser answered in.
+
+    One shape for all three, so the keys a script reads are the same document whatever the
+    state is: a consumer checks `state` and finds `browser`, `websocket` and `tabs`
+    present and null, rather than absent on some runs and present on others.
+    [LAW:types-are-the-program] a key that comes and goes is a shape every caller has to
+    guard; a key that is null is one it can read.
+    """
+    return {"heard": heard, "browser": None, "websocket": None, "tabs": None}, [heard]
+
+
+def _browser_facts(profile: ResolvedProfile, state) -> tuple[dict, list[str]]:
+    """What crom can say about the browser behind one state — the keys `crom status --json`
+    publishes and the lines a person reads, decided together.
+
+    One value behind both renderings, for the reason `crom list` renders `state.slug`
+    rather than a ternary of its own: a sentence and a key derived separately are two maps
+    of one fact, and they drift. [LAW:one-source-of-truth]
+
+    [LAW:dataflow-not-control-flow] the one branch here is `Health`'s own discriminator,
+    and it is the entire subject of the command — the states differ in what the browser was
+    able to say about itself. Everything around this folds values.
+
+    The tab listing is asked inside the `Ready` arm and nowhere else, which is what makes
+    `--no-probe` provable rather than promised: suppressing the probe yields `Unprobed`,
+    that arm is then unreachable, and no socket is opened anywhere in this command. The
+    flag's guarantee holds by the shape of the code rather than by a check that could be
+    forgotten. [LAW:parse-dont-validate] `Ready` is the stamp saying a browser answered,
+    and only a browser that answered can be asked what it has open.
+    """
+    match state:
+        case Ready(browser=browser, websocket=websocket):
+            tabs = chrome.tabs_on(profile.port)
+            return (
+                {
+                    "heard": f"{browser} answered on {profile.cdp_url}",
+                    "browser": browser,
+                    "websocket": websocket,
+                    "tabs": tabs if tabs is None else [
+                        {"title": tab.title, "url": tab.url} for tab in tabs
+                    ],
+                },
+                [f"{browser}, answering on {profile.cdp_url}", f"connect at {websocket}",
+                 *_tab_lines(tabs)],
+            )
+        case Unreachable(heard=heard):
+            return _nothing_heard(heard)
+        case Unprobed():
+            return _nothing_heard("its CDP port was not asked")
+        case Stopped():
+            return _nothing_heard("no process holds its profile directory")
+
+
+@main.command("status")
+@click.argument("ref", required=False, default="default")
+@_probe_option
+@_json_option
+@click.pass_obj
+def status_cmd(session: Session, ref: str, reading: chrome.PortReading, as_json: bool):
+    """Report what the browser on this profile's port actually is, right now.
+
+    `crom list` says whether a browser answers; this says what answered. Every fact
+    below is read live at the moment you ask — crom keeps no record of a running
+    browser, because a record of a browser is a second answer to a question the
+    machine can already be asked.
+
+    \b
+    What it reports
+      the state      stopped, ready, unreachable, or unprobed — the same word
+                     `crom list` prints and `--json` publishes everywhere
+      the processes  each pid holding the profile directory, and how long it has
+                     been up, read from `ps`
+      the browser    what the CDP endpoint calls itself, and the browser
+                     websocket a client connects by. Both come from the version
+                     document the reachability probe already fetches
+      the tabs       the pages the browser has open, by title and URL
+
+    A browser that does not answer costs you the last two and none of the first
+    two: the pids and their uptimes come from the process table, which has an
+    answer whatever CDP is doing. That is what "degrades honestly" means here —
+    fewer facts, never a guessed one.
+
+    The websocket URL changes every time the browser restarts, so read it at the
+    moment you connect rather than storing it. The port does not change, which is
+    the whole point of crom, and `crom port` is the stable handle.
+    """
+    profile = session.working(ref)
+    # The two process-table questions back to back, so the pids and their uptimes are as
+    # near one moment as two readings get; the probe, which owns a socket and a deadline,
+    # comes after both. A pid that dies in the gap is reported as gone rather than timed at
+    # zero — `_process_line`. [LAW:no-ambient-temporal-coupling]
+    pids = chrome.find_pids(profile)
+    timing = chrome.uptimes_on(profile.profile_dir)
+    state = chrome.health_of(profile, pids, reading)
+    published, said = _browser_facts(profile, state)
+    _emit(
+        as_json,
+        {
+            **profile.describe(state),
+            **published,
+            # Derived from `state.pids` rather than from the uptime reading, so this list
+            # and the `pids` `describe` publishes cannot come to disagree about which
+            # processes crom found. [LAW:one-source-of-truth]
+            "processes": [
+                {
+                    "pid": pid,
+                    "uptime_seconds": None if pid not in timing else int(
+                        timing[pid].total_seconds()
+                    ),
+                }
+                for pid in state.pids
+            ],
+        },
+        [
+            f"{profile.ref}  {state.slug}  :{profile.port}",
+            *(f"  {_process_line(pid, timing.get(pid))}" for pid in state.pids),
+            *(f"  {line}" for line in said),
+        ],
     )
 
 

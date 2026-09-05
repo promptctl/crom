@@ -18,6 +18,7 @@ import subprocess
 import tempfile
 import unittest
 from dataclasses import replace
+from datetime import timedelta
 from itertools import takewhile
 from pathlib import Path
 from unittest import mock
@@ -65,6 +66,12 @@ def _commands_offering_json() -> set[str]:
         for name in cli.main.list_commands(None)
         if any("--json" in option.opts for option in cli.main.get_command(None, name).params)
     }
+
+
+# What a browser that answers says about itself, for tests whose subject is not the
+# version crom reports. A test that *is* about it names its own strings inline.
+BROWSER = "Chrome/152.0.7977.76"
+BROWSER_WEBSOCKET = "ws://127.0.0.1:9401/devtools/browser/45e0cffe-114f-49ae-857b-531c7c06e1ad"
 
 
 def _commands_offering_no_probe() -> set[str]:
@@ -124,7 +131,7 @@ class CliTest(unittest.TestCase):
         `setUp` stubs the probe silent, so a row reading `ready` is a claim no test inherits:
         it is about the port, and the test making it says so here.
         """
-        return mock.patch("crom.chrome._probe_port", return_value=chrome._Answered())
+        return mock.patch("crom.chrome._probe_port", return_value=chrome._Answered(chrome._Version(BROWSER, BROWSER_WEBSOCKET)))
 
     def tearDown(self):
         self.probe.stop()
@@ -1473,7 +1480,7 @@ class CliTest(unittest.TestCase):
             # whole of what differs between these two rows.
             mock.patch(
                 "crom.chrome._probe_port",
-                side_effect=lambda port: chrome._Answered() if port == 9401 else chrome._Silent(),
+                side_effect=lambda port: chrome._Answered(chrome._Version(BROWSER, BROWSER_WEBSOCKET)) if port == 9401 else chrome._Silent(),
             ),
         ):
             listing = self.crom("list")
@@ -1619,12 +1626,14 @@ class CliTest(unittest.TestCase):
         )
 
     def test_every_command_that_publishes_a_state_can_be_told_not_to_probe(self):
-        """All five, because the flag is only worth having if a caller can rely on it.
+        """Every one of them, because the flag is only worth having if a caller can rely
+        on it.
 
-        The one record shape crom publishes is emitted by six commands, five of which ask
-        the port for the state they put in it. A flag honoured by `crom list` alone would
-        be the epic's own failure in miniature: a caller reads `unprobed` from a listing,
-        reasonably assumes the others behave the same, and `crom up --json` connects.
+        The one record shape crom publishes is emitted by every command below, and the
+        ones carrying this flag ask the port for the state they put in it. A flag
+        honoured by `crom list` alone would be the epic's own failure in miniature: a
+        caller reads `unprobed` from a listing, reasonably assumes the others behave the
+        same, and `crom up --json` connects.
 
         `launch` refuses to be called rather than being allowed to succeed quietly. These
         profiles are already running, so a launch here would mean the command took the
@@ -1634,8 +1643,9 @@ class CliTest(unittest.TestCase):
 
         Which commands those are comes from click, and so does whether each takes a REF;
         where the record sits comes from the payload's own shape. Nothing here is keyed on
-        a command's name, so a sixth command gaining `@_probe_option` is covered the day it
-        is written rather than the day someone remembers this list. [LAW:one-source-of-truth]
+        a command's name, so the next command gaining `@_probe_option` is covered the day
+        it is written rather than the day someone remembers this list.
+        [LAW:one-source-of-truth]
         """
         self.crom("init")
         self.crom("add", "ci")
@@ -1655,6 +1665,11 @@ class CliTest(unittest.TestCase):
                         "crom.cli.chrome.launch", side_effect=AssertionError("must not launch")
                     ),
                     mock.patch("crom.cli.window.raise_profile", return_value=1),
+                    # `status` reads the elapsed times too, and `uptimes_on` shells out to
+                    # a real `ps`. Named here for the reason `_status_of` names it: a test
+                    # that stubs every external system but one inherits the machine for
+                    # that one, silently, and only on the subtest that happens to read it.
+                    mock.patch("crom.chrome.uptimes_on", return_value={4242: timedelta(hours=3)}),
                     self._the_network_must_not_be_touched(),
                 ):
                     # `.stdout`, because `up`, `restart` and `show` narrate progress on
@@ -1823,6 +1838,143 @@ class CliTest(unittest.TestCase):
             with self.subTest(command=command[0]):
                 self.assertEqual(state_of(command, answering=False), "unreachable")
                 self.assertEqual(state_of(command, answering=True), "ready")
+
+    # --- what the browser actually is ---------------------------------------------------
+
+    def _status_of(self, ref: str, *args, directory: str, pids=(4242,), **stubs):
+        """`crom status <ref>` against a browser this suite decides the shape of.
+
+        The three external systems it reads — the process table, its elapsed times, and the
+        CDP port — are stubbed together here because a test that named only two of them
+        would inherit whatever `setUp` left for the third, and inherit it silently.
+        """
+        with (
+            mock.patch("crom.chrome.scan", return_value={directory: pids} if pids else {}),
+            mock.patch("crom.chrome.uptimes_on", return_value=stubs.get("uptimes", {4242: timedelta(hours=3, minutes=12)})),
+            stubs["port"],
+        ):
+            return self.crom("status", ref, *args)
+
+    def test_status_names_the_browser_the_tabs_and_how_long_it_has_been_up(self):
+        """The ticket's done-when, in the output a person reads.
+
+        `crom list` says whether a browser answers; this says what answered. All three
+        facts come from readings crom was already taking — the version document the probe
+        fetches, and the process table `crom list` scans — so what is under test is that
+        they survive to the surface rather than being parsed and dropped.
+        """
+        self.crom("init")
+        self.crom("add", "ci")
+        directory = json.loads(self.crom("config", "ci", "--json"))["resolved"]["profile_dir"]
+
+        with mock.patch(
+            "crom.chrome.tabs_on",
+            return_value=(chrome.Tab("Example Domain", "https://example.com/"),),
+        ):
+            said = self._status_of("ci", directory=directory, port=self._a_browser_that_answers())
+
+        self.assertIn("ready", said)
+        self.assertIn(BROWSER, said)
+        self.assertIn(BROWSER_WEBSOCKET, said)
+        self.assertIn("pid 4242, up 3h 12m", said)
+        self.assertIn("1 tab open", said)
+        self.assertIn("Example Domain — https://example.com/", said)
+
+    def test_status_degrades_to_the_process_facts_when_cdp_does_not_answer(self):
+        """The other half of the done-when, and the half that is easy to get wrong.
+
+        A wedged browser must cost the reader the browser's half of the answer and none of
+        the process table's — and must not be filled in from anywhere. A version crom
+        cannot read is absent, never the last one it saw or a plausible default.
+        [LAW:no-silent-failure]
+        """
+        self.crom("init")
+        self.crom("add", "ci")
+        directory = json.loads(self.crom("config", "ci", "--json"))["resolved"]["profile_dir"]
+
+        with mock.patch("crom.chrome.tabs_on", side_effect=AssertionError("a silent port was asked for tabs")):
+            said = self._status_of(
+                "ci", "--json", directory=directory, port=mock.patch(
+                    "crom.chrome._probe_port", return_value=chrome._Silent()
+                )
+            )
+        record = json.loads(said)
+
+        self.assertEqual(record["state"], "unreachable")
+        self.assertEqual(record["heard"], "nothing answered on its CDP port")
+        self.assertIsNone(record["browser"])
+        self.assertIsNone(record["websocket"])
+        self.assertIsNone(record["tabs"])
+        # The process table had an answer the whole time, and it is unchanged.
+        self.assertTrue(record["running"])
+        self.assertEqual(record["pids"], [4242])
+        self.assertEqual(record["processes"], [{"pid": 4242, "uptime_seconds": 11520}])
+
+    def test_status_on_a_profile_nothing_is_running_invents_no_browser(self):
+        """A stopped profile has no port worth asking, so nothing about a browser is
+        reported and nothing about one is guessed."""
+        self.crom("init")
+        self.crom("add", "ci")
+
+        with mock.patch("crom.chrome.tabs_on", side_effect=AssertionError("a stopped profile was asked for tabs")):
+            record = json.loads(
+                self._status_of(
+                    "ci", "--json", directory="", pids=(), port=self._a_browser_that_answers()
+                )
+            )
+
+        self.assertEqual(record["state"], "stopped")
+        self.assertEqual(record["processes"], [])
+        self.assertIsNone(record["tabs"])
+
+    def test_a_browser_that_answers_and_then_will_not_list_is_not_an_empty_desktop(self):
+        """`tabs: null` and `tabs: []` are different facts and stay different.
+
+        The browser answered `/json/version` and then would not list its targets — a real
+        outcome, since the two are separate round trips. Reported as an empty array it
+        would say the browser has nothing open, which is a claim crom has no evidence for.
+        [LAW:parse-dont-validate]
+        """
+        self.crom("init")
+        self.crom("add", "ci")
+        directory = json.loads(self.crom("config", "ci", "--json"))["resolved"]["profile_dir"]
+
+        with mock.patch("crom.chrome.tabs_on", return_value=None):
+            result = self._status_of(
+                "ci", "--json", directory=directory, port=self._a_browser_that_answers()
+            )
+            said = self._status_of("ci", directory=directory, port=self._a_browser_that_answers())
+
+        self.assertEqual(json.loads(result)["state"], "ready")
+        self.assertIsNone(json.loads(result)["tabs"])
+        self.assertIn("could not read its tab list", said)
+        self.assertNotIn("no tabs open", said)
+
+    def test_a_pid_gone_between_the_two_process_readings_is_named_rather_than_timed_at_zero(self):
+        """The pids and their uptimes are two readings of the process table, and a browser
+        can exit between them. A pid missing from the second is said to be gone; timed at
+        zero it would read as a browser that had just started."""
+        self.crom("init")
+        self.crom("add", "ci")
+        directory = json.loads(self.crom("config", "ci", "--json"))["resolved"]["profile_dir"]
+
+        with mock.patch("crom.chrome.tabs_on", return_value=()):
+            said = self._status_of(
+                "ci", directory=directory, uptimes={}, port=self._a_browser_that_answers()
+            )
+
+        self.assertIn("pid 4242, no longer in the process table", said)
+        self.assertNotIn("up 0s", said)
+
+    def test_a_duration_drops_precision_without_lying(self):
+        """Two units, and contiguous ones. A browser up five days and twenty-three minutes
+        rendered as `5d 23m` is the same string one up five days and twenty-three *hours*
+        would produce — a day out, from a rendering choice nobody would look at again."""
+        self.assertEqual(cli._since(timedelta(days=5, minutes=23, seconds=43)), "5d 0h")
+        self.assertEqual(cli._since(timedelta(days=5, hours=23, minutes=1)), "5d 23h")
+        self.assertEqual(cli._since(timedelta(hours=3, minutes=12, seconds=4)), "3h 12m")
+        self.assertEqual(cli._since(timedelta(seconds=28)), "28s")
+        self.assertEqual(cli._since(timedelta(0)), "0s")
 
     # --- every source a drift can come from, and one thing that is not one -------------
 
