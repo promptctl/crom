@@ -22,6 +22,7 @@ import json
 import shlex
 import shutil
 from collections.abc import Callable
+from enum import Enum, auto
 from pathlib import Path
 from typing import NamedTuple
 
@@ -463,6 +464,24 @@ def _supplied(change: drift.Change, notes: dict[str, str]) -> str:
     return f" ({supplies})" * bool(supplies)
 
 
+def _moved(verdict: drift.Drifted, notes: dict[str, str]) -> list[str]:
+    """The switches a drift names, one indented line each, beside the layer supplying the
+    new value.
+
+    One spelling for the two answers `crom up` gives a drifted browser — the relaunch that
+    applied the drift and the `--no-restart` report that declined to. Spelled twice, a
+    change to how a moved switch reads lands in one and not the other, and the two outputs
+    a user compares to decide whether to relaunch disagree about what moved.
+    [LAW:single-enforcer]
+
+    A comprehension over a tuple that is empty exactly when the flags moved only in order —
+    a real drifted state `Drifted.finding` already spells out on the line above — so the
+    section appears when it has something to say and no branch decides whether it exists.
+    [LAW:dataflow-not-control-flow]
+    """
+    return [f"  {change}{_supplied(change, notes)}" for change in verdict.changes]
+
+
 def _status(profile: ResolvedProfile, live: dict[str, tuple[int, ...]]) -> tuple[bool, tuple[int, ...]]:
     pids = live.get(str(profile.profile_dir), ())
     return bool(pids), pids
@@ -607,11 +626,40 @@ def _start_under_lock(profile: ResolvedProfile) -> tuple[drift.Verdict, tuple[in
     return drift.of(profile, running), running or chrome.launch(profile)
 
 
+class _OnDrift(Enum):
+    """What `crom up` does about a browser its config has moved on from — the whole of
+    what `--no-restart` selects between.
+
+    A named pair rather than the flag's own boolean, because the arms below match on it.
+    `case drift.Drifted(), False` asks every reader to hold which way round the negation
+    in `--no-restart` runs, at the one site in crom where reading it backwards kills a
+    browser the user asked crom to leave alone. Named, the arm states which policy it is
+    and the pairing cannot be read wrong. [LAW:types-are-the-program]
+
+    Two values and not three: `--no-restart` withholds the stop, never the start. A
+    profile with nothing running still launches under it, because launching costs no one
+    the tabs this flag exists to protect — so "do not converge at all" is a policy nothing
+    here offers and `crom list` already answers.
+
+    `auto()` because these are identities and not text: the flag is the only writer and
+    the JSON publishes the verdict crom found, never the policy it found it under. A slug
+    would be a published contract that nothing publishes. [LAW:one-source-of-truth]
+    """
+
+    REPLACE = auto()
+    REPORT = auto()
+
+
 @main.command("up")
 @click.argument("ref", required=False, default="default")
+@click.option(
+    "--no-restart",
+    is_flag=True,
+    help="Name a drifted browser's changes instead of replacing it, keeping its session.",
+)
 @_json_option
 @click.pass_obj
-def up_cmd(session: _Session, ref: str, as_json: bool):
+def up_cmd(session: _Session, ref: str, no_restart: bool, as_json: bool):
     """Bring a profile up on its current config, whatever is running.
 
     Idempotent: a browser already running what this config resolves to is reported, not
@@ -619,12 +667,21 @@ def up_cmd(session: _Session, ref: str, as_json: bool):
     config, with what moved named before anything stops. A browser crom holds no launch
     record for is left running and reported as unmeasured — crom cannot tell what it was
     started with, which is no grounds to kill a browser that may already match.
+
+    --no-restart takes only the stop off the table: a drifted browser is named and left
+    running, tabs and logins intact, and a profile with nothing running still launches. It
+    is how a script keeps a profile up without ever costing its user a session, and the
+    one way `crom up` exits 0 on a browser it did not bring onto the current config.
     """
     profile = session.working(ref)
     where = f"{profile.ref} on {profile.cdp_url}"
     # Built out here because it is a fact about the resolution, and nothing the lock
     # protects can change it.
     notes = _layer_notes(profile)
+    # A boolean is click's spelling of this flag and not the domain's, so the crossing
+    # happens once, here, and nothing past this line holds a `no_restart` whose negation a
+    # reader has to run backwards. [LAW:types-are-the-program]
+    on_drift = _OnDrift.REPORT if no_restart else _OnDrift.REPLACE
     # Seeding, the liveness check, and the launch are one critical section. Split, two
     # concurrent `crom up` calls both see no running Chrome and both launch against the
     # same profile directory and port — and because Chrome binds the CDP port well before
@@ -639,14 +696,22 @@ def up_cmd(session: _Session, ref: str, as_json: bool):
     # about to launch against. [LAW:no-ambient-temporal-coupling]
     with seed.profile_lock(profile):
         verdict, running = _start_under_lock(profile)
-        # The browser this call found is the browser it keeps, and only one verdict says
-        # otherwise. Stated once as the standing answer rather than repeated in the three
-        # arms that agree with it. [LAW:polishing-by-subtraction]
+        # The browser this call found is the browser it keeps, and exactly one arm below
+        # says otherwise. Stated once as the standing answer rather than repeated in the
+        # four that agree with it. [LAW:polishing-by-subtraction]
         stopped, pids = (), running
-        # Four verdicts, four answers, decided and worded together: the verb is a function
-        # of the verdict only because the policy is, and split across two matches the pair
-        # could come apart — an arm saying "Relaunched" with no arm that stopped anything.
+        # Five outcomes, five arms, each deciding AND wording one of them: the verb is a
+        # function of the pair only because the policy is, and split across two matches —
+        # or across a match and an `if no_restart` nested in an arm — the pair could come
+        # apart, leaving an arm that says "Relaunched" with no arm that stopped anything.
         # [LAW:one-source-of-truth]
+        #
+        # Matched as a pair, the way `drift.of` matches the process table against the
+        # record, so the policy arrives as a value the arms read rather than as a branch
+        # wrapped around them. Five and not eight because `--no-restart` withholds exactly
+        # one action and only one verdict has that action to withhold: the three arms that
+        # answer `_` say so themselves. No arm's correctness depends on the order the arms
+        # sit in. [LAW:dataflow-not-control-flow]
         #
         # `Unmeasured` is emphatically not a quiet `Drifted`. It says crom cannot tell what
         # the running browser was launched with — no record, or none it can read — which is
@@ -654,18 +719,30 @@ def up_cmd(session: _Session, ref: str, as_json: bool):
         # browser that may already match, and take the user's tabs with it, on the evidence
         # of a crom upgrade. It is not a quiet `Matches` either, which is why it says so
         # out loud below. [LAW:no-silent-failure]
-        match verdict:
-            case drift.Stopped():
+        match verdict, on_drift:
+            case drift.Stopped(), _:
                 lines = [f"Started {where}"]
-            case drift.Matches():
+            case drift.Matches(), _:
                 lines = [f"Already running {where}"]
-            case drift.Unmeasured():
+            case drift.Unmeasured(), _:
                 # Said rather than swallowed: a bare "Already running" here would be crom
                 # reporting an agreement it never established, and is how a browser goes on
                 # running flags its config stopped asking for with crom appearing to have
                 # checked.
                 lines = [f"Already running {where}", f"  {verdict.finding}"]
-            case drift.Drifted():
+            case drift.Drifted(), _OnDrift.REPORT:
+                # The one outcome where `crom up` exits 0 without having converged, so it
+                # reports in the shape `Unmeasured` reports in — "running, and here is what
+                # crom will not act on" — and adds the switches, which is the whole of what
+                # this policy has over the `drift` `crom list` already publishes. Claiming
+                # "Already running" alone would be the stale-browser silence this epic
+                # exists to end, from the command that ended it. [LAW:no-silent-failure]
+                lines = [
+                    f"Already running {where}",
+                    f"  {verdict.finding}",
+                    *_moved(verdict, notes),
+                ]
+            case drift.Drifted(), _OnDrift.REPLACE:
                 # Said before acting, so the reason survives a relaunch whose start half
                 # fails: that user is left with no browser at all, and an error naming only
                 # the start would hide that crom stopped the working one they had. It
@@ -682,12 +759,7 @@ def up_cmd(session: _Session, ref: str, as_json: bool):
                 lines = [
                     f"Relaunched {where} (was pid {_pid_list(stopped)}, "
                     f"now pid {_pid_list(pids)})",
-                    # A generator over a tuple that is empty exactly when the flags moved
-                    # only in order — a real drifted state `Drifted.finding` already spells
-                    # out on the line above, so the section appears when it has something
-                    # to say and no branch decides whether it exists.
-                    # [LAW:dataflow-not-control-flow]
-                    *(f"  {change}{_supplied(change, notes)}" for change in verdict.changes),
+                    *_moved(verdict, notes),
                 ]
 
     _emit(
@@ -696,13 +768,19 @@ def up_cmd(session: _Session, ref: str, as_json: bool):
             **profile.describe(running=True, pids=pids),
             # The verdict crom *found*, under a key that says so. `crom list` and `crom
             # config` publish `drift`, which is how a profile stands right now; this
-            # command's answer is how it stood before this command fixed it, and reusing
-            # the name would have one key meaning two things across the JSON surface.
+            # command's answer is how the profile stood when this command reached it, and
+            # reusing the name would have one key meaning two things across the JSON
+            # surface. Deliberately not "what crom acted on" either — under `--no-restart`
+            # crom acts on none of it, and a key that narrowed to the acted-on cases would
+            # go silent on the drift in exactly the run that was asked to report it.
             # [FRAMING:representation]
             "found": drift.describe(verdict),
-            # What the convergence replaced, the way `restart` carries it: empty unless the
-            # verdict was `drifted`, and the only thing separating a browser this command
-            # left alone from one it swapped out under the same "running" record.
+            # What the convergence replaced, the way `restart` carries it: empty unless
+            # this run relaunched, and the only thing separating a browser this command
+            # left alone from one it swapped out under the same "running" record. So a
+            # `drifted` found beside an empty `stopped` is the published shape of
+            # `--no-restart`, and no key echoes the flag back to the caller that passed it.
+            # [LAW:one-source-of-truth]
             "stopped": list(stopped),
         },
         lines,

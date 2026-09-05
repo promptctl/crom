@@ -110,7 +110,11 @@ overrides discovery entirely.
 `crom up` is idempotent: it launches if nothing is running and reports the live port
 either way, so a script can call it unconditionally. Calling it after editing `.crom.toml`
 applies the edit — a browser running something other than what the config now resolves to
-is stopped and started again on the current command line, port included.
+is stopped and started again on the current command line, port included. That stop takes
+the tabs, logins and unsaved work of whoever was using the browser, none of which any
+config file describes, so `crom up --no-restart` names a drifted browser's changes and
+leaves it running instead. What you trade away is the convergence: the browser stays on
+the command line it was launched with until something else restarts it.
 
 ```bash
 eval "$(crom env dev)"        # see below for what it exports
@@ -148,15 +152,23 @@ command exists to report, and the record alone cannot carry it because the recor
 describes the profile rather than the act. `crom show --json` adds `started`, whether it
 had to launch the browser first, and `windows`, how many came forward — zero for a
 headless profile, which is raised successfully and simply has no window to show for it.
-`crom up --json` adds two: `found`, the drift verdict it acted on, and `stopped`, the pids
+`crom up --json` adds two: `found`, the drift verdict it reached, and `stopped`, the pids
 its relaunch replaced — the same key `crom restart` publishes, with the same meaning, and
-empty unless `found.verdict` was `drifted`.
+empty unless this run actually relaunched.
 
 `found` carries the `{"verdict", "finding", "changes"}` object described below, the one
 `crom list` and `crom config` publish under the key `drift`, and it is spelled differently
 on purpose. `drift` there is how a profile stands right now; `found` here is how it stood
-before this command put it right. One key meaning both is how a caller ends up alerting on
-a browser crom had already fixed.
+when this command reached it. One key meaning both is how a caller ends up alerting on a
+browser crom had already fixed.
+
+`found` is the verdict crom found, never the verdict crom acted on, and `--no-restart` is
+the run where those come apart: it acts on none of it, so a key that meant "acted on"
+would go silent in exactly the run that was asked to report drift. `"found":
+{"verdict": "drifted", …}` beside `"stopped": []` is the published shape of a
+`--no-restart` run that found drift, and that pair is how a consumer tells a convergence
+crom declined from one it carried out. No key echoes the flag back: a caller already knows
+which flags it passed, and those two describe the outcome without it.
 
 `crom list --json` gives an array, but not every element has that shape. A profile that
 could not be resolved appears as `{"namespace", "profile", "ref", "error"}`, and with
@@ -406,7 +418,9 @@ is only English.
 
 ```
 crom                          launch the default profile
-crom up [REF]                 launch it, or bring a running browser onto its current config
+crom up [REF] [--no-restart]  launch it, or bring a running browser onto its current
+                              config; --no-restart names a drifted browser's changes
+                              instead of replacing it
 crom down [REF]               stop it
 crom restart [REF]            stop it and start it again on its current config
 crom show [REF]               bring its window to the front, launching it if needed
@@ -485,9 +499,10 @@ reports the seed, port, and directory `ci` resolves to and exits 0 the same way.
 `crom up` on a browser already running what its config resolves to, and `crom down` on a
 stopped one, always behaved like this, and now every command does. A browser running
 something else is not a state you are already in, so `crom up` stops it and starts it
-again on the current config, naming what moved as it goes. Reporting it as already
-running would leave the edit unapplied and leave you to work out that `crom down` was the
-missing step.
+again on the current config, naming what moved as it goes — unless you pass
+`--no-restart`, which asks crom to name the drift and keep the session. Reporting it as
+already running would leave the edit unapplied and leave you to work out that `crom down`
+was the missing step.
 
 But converging is not ignoring. crom compares the facts you actually state — so a bare
 `crom add ci` states only the name and always converges — and any stated fact that
@@ -645,6 +660,27 @@ is left running, with the reason crom could not check printed beside it. A brows
 by a crom older than the launch record reads `unmeasured` until its next launch writes
 one, which is why the first `crom up` after upgrading says crom has no record of how
 that browser was launched, once.
+
+`crom up --no-restart` extends that same tab-preserving reasoning to `drifted`, at your
+request rather than on crom's own judgment. The concern is identical — a running browser
+holds tabs, logins and unsaved work that no config file describes — and the only
+difference is who decides it outweighs the drift. Under the flag a drifted browser is not
+stopped: crom prints `Already running`, then the drift finding, then the same indented
+per-switch lines the relaunch prints, and exits 0. The browser goes on running the command
+line it was launched with.
+
+The other three verdicts are untouched, and one consequence of that is worth stating
+flatly: `--no-restart` withholds the stop, never the start. `crom up --no-restart` on a
+profile with nothing running launches the browser exactly as a bare `crom up` does, since
+there is no session to protect and so nothing to withhold. It is not a dry run and not a
+read-only inspection — `crom list` is where you look at drift without touching anything.
+
+It is, though, the one way `crom up` exits 0 on a browser it did not bring onto the
+current config. Every other crom command names an end state and converges to it; this flag
+declines half of that because you asked it to, and says which half in its output rather
+than claiming a bare `Already running`. What it buys is a third option a script never had:
+keeping a profile up without choosing between an unconditional `crom up` that may take a
+live session and no `crom up` at all.
 
 `XDG_CONFIG_HOME` and `XDG_STATE_HOME` are honored.
 

@@ -1554,6 +1554,105 @@ class CliTest(unittest.TestCase):
         self.assertIn("env TZ: launched UTC, now America/Denver", output)
         self.assertNotIn("(from", output)
 
+    # --- reporting drift without acting on it -------------------------------------------
+
+    def test_up_no_restart_names_the_drift_and_leaves_the_browser_standing(self):
+        """The flag's whole promise: the drift is named and the session survives it.
+
+        A browser holds tabs, logins and unsaved work that no config file describes, so the
+        converging `crom up` this epic built is the wrong command for a caller who wants
+        the profile up but will not spend a session to have it current. That caller could
+        previously only choose between an unconditional `crom up` and not running one.
+
+        The process table is asserted whole, before and after, because that is the claim —
+        the message says the browser was left, and only the table can say it was. The
+        stubbed `kill` empties it and the stubbed `launch` refills it with `RELAUNCHED`, so
+        an unchanged table is the one observation neither effect could have run.
+        """
+        self.crom("init")
+        self.crom("add", "ci", "--flag", "--window-size=800,600")
+        directory = self._record_the_launch_of("ci")
+        self._resize_ci()
+
+        table = {directory: (4242,)}
+        with self._process_table_that(table):
+            output = self.crom("up", "ci", "--no-restart")
+            settled = self._ci_row(self.crom("list"))
+
+        self.assertEqual(table, {directory: (4242,)})
+        self.assertIn("Already running myproj/ci", output)
+        self.assertNotIn("Relaunched", output)
+        # Named to the same depth the relaunch names it — the finding, the switch with both
+        # of its values, and the layer supplying the new one. A report that said only
+        # "drifted" would leave its reader running `crom config` to find out what moved,
+        # which is the command they used this flag to avoid having to know about.
+        self.assertIn("drifted — --window-size", output)
+        self.assertIn(
+            "--window-size: launched --window-size=800,600, now --window-size=1280,800", output
+        )
+        self.assertIn("(from [profiles.ci])", output)
+        # And the state crom left behind, read back through the surface that reports it:
+        # still drifted. `crom up --no-restart` reporting drift and quietly converging
+        # anyway would satisfy every assertion above.
+        self.assertIn("drifted — --window-size", settled)
+
+    def test_up_no_restart_json_publishes_the_drift_it_declined_to_act_on(self):
+        """The published shape of a run that found drift and spent nothing on it.
+
+        `found` is the verdict crom reached, not the verdict crom acted on — this is the
+        run where those differ, and the key has to keep meaning the first. Narrowed to the
+        second it would go quiet exactly here, leaving a `--json` caller that asked crom to
+        report drift with a record that reports none. [LAW:no-silent-failure]
+
+        `stopped` is what separates the two runs: empty here and `[4242]` under a plain
+        `crom up`, from the same `found`, under the same `running` record. So no key echoes
+        the flag back — a caller already knows which one it passed, and the outcome is
+        fully described without it.
+        """
+        self.crom("init")
+        self.crom("add", "ci", "--flag", "--window-size=800,600")
+        directory = self._record_the_launch_of("ci")
+        self._resize_ci()
+
+        with self._process_table_that({directory: (4242,)}):
+            record = json.loads(self.crom("up", "ci", "--no-restart", "--json"))
+
+        self.assertEqual(record["found"]["verdict"], "drifted")
+        self.assertEqual(
+            record["found"]["changes"],
+            [
+                {
+                    "subject": "--window-size",
+                    "launched": "--window-size=800,600",
+                    "resolves": "--window-size=1280,800",
+                }
+            ],
+        )
+        self.assertEqual(record["stopped"], [])
+        # The pids of the browser that was already there, and not `RELAUNCHED`. A caller
+        # reading `running: true` off a record whose pids crom had silently replaced would
+        # be holding the right shape and the wrong browser.
+        self.assertEqual(record["pids"], [4242])
+
+    def test_up_no_restart_still_starts_a_profile_with_nothing_running(self):
+        """`--no-restart` withholds the stop, never the start — the flag is not `--dry-run`.
+
+        Read as "do not act", it would turn `crom up --no-restart` into a slower `crom
+        list`, and the scripts this flag exists for — keep the profile up, never cost a
+        user a session — would silently stop launching anything. There is no session to
+        protect on a profile with no browser running, so there is nothing here to withhold.
+        """
+        self.crom("init")
+        self.crom("add", "ci", "--flag", "--window-size=800,600")
+        directory = json.loads(self.crom("config", "ci", "--json"))["resolved"]["profile_dir"]
+
+        table: dict[str, tuple[int, ...]] = {}
+        with self._process_table_that(table):
+            output = self.crom("up", "ci", "--no-restart")
+
+        self.assertIn("Started myproj/ci", output)
+        self.assertEqual(table, {directory: self.RELAUNCHED})
+
     def test_show_raises_a_drifted_window_rather_than_replacing_it(self):
         """Converging is `crom up`'s job, and it is the whole difference between the two
         commands now that they share a start path.
