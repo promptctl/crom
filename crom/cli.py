@@ -181,6 +181,50 @@ def _json_option(command):
     )(command)
 
 
+def _probe_option(command):
+    """The `--no-probe` flag: one declaration, and the flag stops being a flag right here.
+
+    The callback returns the `chrome.PortReading` the command will use rather than the
+    boolean the user typed, so what travels into the five commands carrying this option is
+    the reading itself. Each of them then calls `chrome.health`/`health_of` the same way
+    with a different value, instead of five copies of a rule turning a bool into a
+    behaviour — which is five places for the sixth command to be written without.
+    [LAW:single-enforcer] the translation happens once, where click already parses.
+
+    [LAW:dataflow-not-control-flow] and it is the same reason the reading is a value at
+    all: no command has an arm asking whether to probe, so what differs between a probed
+    run and a suppressed one is which answers come back, never which code ran.
+
+    [LAW:no-mode-explosion] which is also this flag's cap. It multiplies with nothing:
+    selecting a value inside one fold, it cannot interact with `--json` or `--all` or
+    `--no-restart`, because none of them reaches the same decision. There is no deletion
+    date because it is published CLI surface rather than an internal toggle — what a
+    reviewer should hold it to is that it stays one axis, which it does for exactly as
+    long as the suppression stays a reading and never becomes a branch.
+
+    `crom down` does not carry this. It publishes `Stopped()` outright, because
+    `chrome.kill` returns only once the process is gone and the port is free, so there is
+    no probe there to suppress and the flag would only imply one.
+    """
+
+    def chosen(
+        ctx: click.Context, param: click.Parameter, suppressed: bool
+    ) -> chrome.PortReading:
+        return chrome.unasked_ports if suppressed else chrome.probe_ports
+
+    return click.option(
+        "--no-probe",
+        "reading",
+        is_flag=True,
+        callback=chosen,
+        help=(
+            "Report what the process table says and leave the CDP port unasked. A running "
+            "profile's state comes back as 'unprobed' rather than 'ready' or 'unreachable' "
+            "— crom did not check, and says so instead of guessing."
+        ),
+    )(command)
+
+
 def _json_text(payload) -> str:
     """How crom spells JSON, for the one reader who cannot tell a result from a failure
     until it has parsed one: both are the same document format, indented the same way."""
@@ -641,9 +685,12 @@ def main():
     is_flag=True,
     help="Name a drifted browser's changes instead of replacing it, keeping its session.",
 )
+@_probe_option
 @_json_option
 @click.pass_obj
-def up_cmd(session: Session, ref: str, no_restart: bool, as_json: bool):
+def up_cmd(
+    session: Session, ref: str, no_restart: bool, reading: chrome.PortReading, as_json: bool
+):
     """Bring a profile up on its current config, whatever is running.
 
     Idempotent: a browser already running what this config resolves to is reported, not
@@ -712,7 +759,7 @@ def up_cmd(session: Session, ref: str, no_restart: bool, as_json: bool):
     _emit(
         as_json,
         {
-            **profile.describe(chrome.health_of(profile, ran.pids)),
+            **profile.describe(chrome.health_of(profile, ran.pids, reading)),
             # The verdict crom *found*, under a key that says so. `crom list` and `crom
             # config` publish `drift`, which is how a profile stands right now; this
             # command's answer is how the profile stood when this command reached it, and
@@ -767,9 +814,10 @@ def down_cmd(session: Session, ref: str, as_json: bool):
 
 @main.command("restart")
 @click.argument("ref", required=False, default="default")
+@_probe_option
 @_json_option
 @click.pass_obj
-def restart_cmd(session: Session, ref: str, as_json: bool):
+def restart_cmd(session: Session, ref: str, reading: chrome.PortReading, as_json: bool):
     """Stop a profile and start it again on its current config."""
     profile = session.working(ref)
     # Both halves under one hold of the lock, which is the whole of what this command adds
@@ -814,16 +862,17 @@ def restart_cmd(session: Session, ref: str, as_json: bool):
     # command exists to report. [LAW:one-source-of-truth] `describe()` stays canonical.
     _emit(
         as_json,
-        {**profile.describe(chrome.health_of(profile, pids)), "stopped": list(stopped)},
+        {**profile.describe(chrome.health_of(profile, pids, reading)), "stopped": list(stopped)},
         [message],
     )
 
 
 @main.command("show")
 @click.argument("ref", required=False, default="default")
+@_probe_option
 @_json_option
 @click.pass_obj
-def show_cmd(session: Session, ref: str, as_json: bool):
+def show_cmd(session: Session, ref: str, reading: chrome.PortReading, as_json: bool):
     """Bring a profile's window to the front, launching it if it is not running."""
     profile = session.working(ref)
     # Starting and raising under one hold, so the PIDs raised are the PIDs observed. A
@@ -868,7 +917,7 @@ def show_cmd(session: Session, ref: str, as_json: bool):
     _emit(
         as_json,
         {
-            **profile.describe(chrome.health_of(profile, pids)),
+            **profile.describe(chrome.health_of(profile, pids, reading)),
             "started": started,
             "windows": windows,
         },
@@ -878,9 +927,10 @@ def show_cmd(session: Session, ref: str, as_json: bool):
 
 @main.command("list")
 @click.option("--all", "everything", is_flag=True, help="Include every namespace crom knows.")
+@_probe_option
 @_json_option
 @click.pass_obj
-def list_cmd(session: Session, everything: bool, as_json: bool):
+def list_cmd(session: Session, everything: bool, reading: chrome.PortReading, as_json: bool):
     """List the profiles addressable from here."""
     scopes, unavailable = _scopes_to_list(session, everything)
 
@@ -893,6 +943,7 @@ def list_cmd(session: Session, everything: bool, as_json: bool):
     standing = chrome.health(
         (entry for _, entries in listing for entry in entries if isinstance(entry, ResolvedProfile)),
         chrome.scan(),
+        reading,
     )
 
     records, lines = [], []
@@ -1147,9 +1198,10 @@ def init_cmd(namespace: str | None, seed_text: str | None):
 
 @main.command("config")
 @click.argument("ref", required=False)
+@_probe_option
 @_json_option
 @click.pass_obj
-def config_cmd(session: Session, ref: str | None, as_json: bool):
+def config_cmd(session: Session, ref: str | None, reading: chrome.PortReading, as_json: bool):
     """Show the config in effect, and how a profile resolves flag by flag.
 
     With a REF, every flag of the launch command is printed with the layer that
@@ -1288,7 +1340,7 @@ def config_cmd(session: Session, ref: str | None, as_json: bool):
 
     if ref:
         profile = session.working(ref)
-        state = chrome.health_of(profile, chrome.find_pids(profile))
+        state = chrome.health_of(profile, chrome.find_pids(profile), reading)
         verdict = drift.of(profile, state.pids)
         notes = _layer_notes(profile)
         # Measured over the annotated lines alone: the bare ones are the binary path and

@@ -759,17 +759,24 @@ class Scope:
 # hung. [FRAMING:representation] a process holding a directory is not a map of "I can
 # drive this browser"; only the port is, so only the port is asked.
 #
-# Here rather than beside the socket that measures it, because these three are a stage's
+# Here rather than beside the socket that measures it, because these four are a stage's
 # output type the way `ResolvedProfile` below is resolution's, and `describe` publishes
 # one. `model` imports nothing from crom and everything imports `model`, so a state
 # defined upstream of that could not be named in the record that carries it.
 # [LAW:one-way-deps] the vocabulary sits downhill of every module that speaks it.
 #
-# `running` and `pids` are on all three states, so a caller renders one without first
+# `slug`, `running` and `pids` are on every state, so a caller renders one without first
 # asking which it holds — the same reason `drift`'s four verdicts all carry `changes`.
-# [LAW:dataflow-not-control-flow] Only `Unreachable` has anything to say about why, so
-# on the other two `pids` is a class attribute rather than a field where it is fixed: a
-# `Stopped` carrying pids is unrepresentable rather than merely never built.
+# [LAW:dataflow-not-control-flow] What a state adds beyond those three is what only it has
+# to say: `Unreachable` alone carries `heard`, being the only one with a reason to give.
+# And where one of the three is fixed by the state itself it is a class attribute rather
+# than a field: a `Stopped` carrying pids is unrepresentable rather than merely never
+# built.
+#
+# Three of them answer "can I drive this browser". `Unprobed` answers that crom was not
+# asked to find out — a state of crom's knowledge rather than of the browser, which is
+# exactly why it needs a word of its own: folded into any of the other three it would
+# publish a reading nobody took.
 
 
 @dataclass(frozen=True)
@@ -807,7 +814,39 @@ class Ready:
     pids: tuple[int, ...]
 
 
-Health = Stopped | Unreachable | Ready
+@dataclass(frozen=True)
+class Unprobed:
+    """A process holds the directory, and crom was told not to ask the port.
+
+    The state `--no-probe` produces, and the reason that flag needed a fourth word rather
+    than one of the three above: crom did not ask, so `Unreachable` would report a port
+    that failed a question nobody put, and `Ready` would promise a browser nobody checked.
+    [FRAMING:representation] a reading crom declined to take is not a reading that came
+    back empty, and the two only stay distinguishable while the vocabulary keeps them
+    apart. A consumer that sees this knows the port is still an open question, and that
+    what it is holding is the answer to a narrower one — is anything running at all.
+
+    `doctor.Unprobed` shares this name and slug deliberately: both say crom has no probe
+    result for a port, one because it could not get one and this one because it was told
+    not to ask. They stay two classes because they are variants of different unions —
+    `Liveness` answers who holds a port, `Health` whether a browser can be driven — and
+    the why has always lived in a sentence rather than a slug here, as `Unreachable.heard`
+    and `doctor.Unprobed.finding` both do. Merging them would put a doctor verdict in
+    `describe()`; renaming either spends a published word on what the sentences say.
+
+    `pids` is a field and `running` a ClassVar, the same shape `Ready` has, because a
+    profile nothing is running is `Stopped` whether or not the port was asked: the pids
+    come from the process table, and `_reachability` answers `Stopped` on an empty reading
+    before it ever looks at the port. Suppressing the probe costs a caller the port's half
+    of the answer and none of the process table's.
+    """
+
+    slug: ClassVar[str] = "unprobed"
+    running: ClassVar[bool] = True
+    pids: tuple[int, ...]
+
+
+Health = Stopped | Unreachable | Ready | Unprobed
 
 
 # --- the stamped type --------------------------------------------------------------

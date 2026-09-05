@@ -67,6 +67,18 @@ def _commands_offering_json() -> set[str]:
     }
 
 
+def _commands_offering_no_probe() -> set[str]:
+    """Read from click for the reason the `--json` set is: a list of names written into
+    this file is a second copy of a fact the CLI already holds, green for exactly as long
+    as nobody adds a command. [LAW:one-source-of-truth]
+    """
+    return {
+        name
+        for name in cli.main.list_commands(None)
+        if any("--no-probe" in option.opts for option in cli.main.get_command(None, name).params)
+    }
+
+
 class CliTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -1501,6 +1513,200 @@ class CliTest(unittest.TestCase):
 
         self.assertIn("stopped :", row)
         self.assertNotIn("ready :", row)
+
+    # --- the fourth state, and the flag that produces it --------------------------------
+
+    @contextlib.contextmanager
+    def _the_network_must_not_be_touched(self):
+        """The real probe, over a socket layer that fails the test instead of connecting.
+
+        `setUp` stubs `_probe_port`, which is what keeps the rest of this file off the
+        loopback — and which would also let a `--no-probe` run that still probed pass
+        every assertion below, states included. So the stub comes off and the socket goes
+        underneath it: any route to the network fails, whatever it is named, which is the
+        claim the flag actually makes to a caller who has to honour it.
+        """
+        self.probe.stop()
+        try:
+            with mock.patch.object(
+                chrome.socket,
+                "create_connection",
+                side_effect=AssertionError("the CDP port was asked"),
+            ):
+                yield
+        finally:
+            self.probe.start()
+
+    def test_the_network_check_itself_catches_a_command_that_probes(self):
+        """The control, and the reason to trust every assertion under that helper.
+
+        A harness that cannot fail proves nothing about the runs it passes: without this,
+        a `--no-probe` that quietly kept probing and a socket patch that silently missed
+        the real call site are the same green suite. So one unflagged run has to blow up.
+        """
+        self.crom("init")
+        self.crom("add", "ci")
+        directory = json.loads(self.crom("config", "ci", "--json"))["resolved"]["profile_dir"]
+
+        with (
+            mock.patch("crom.chrome.scan", return_value={directory: (4242,)}),
+            self._the_network_must_not_be_touched(),
+            self.assertRaises(AssertionError),
+        ):
+            self.crom("list")
+
+    def test_no_probe_reports_the_process_table_without_asking_the_port(self):
+        """The ticket's done-when: process-level facts only, and the network untouched.
+
+        The row still tells running from stopped, because the process table answers that
+        and it was never the port's question. What it no longer claims is anything about
+        connecting.
+        """
+        self.crom("init")
+        self.crom("add", "ci")
+        directory = json.loads(self.crom("config", "ci", "--json"))["resolved"]["profile_dir"]
+
+        with (
+            mock.patch("crom.chrome.scan", return_value={directory: (4242,)}),
+            self._the_network_must_not_be_touched(),
+        ):
+            row = self._ci_row(self.crom("list", "--no-probe"))
+
+        self.assertIn("unprobed :", row)
+        self.assertNotIn("ready :", row)
+        self.assertNotIn("unreachable :", row)
+
+    def test_no_probe_still_says_stopped_when_nothing_is_running(self):
+        """Suppressing the probe costs the port's half of the answer and none of the
+        process table's. A profile nothing holds was never decided by the port, so it
+        keeps the word it already had instead of going vague along with the rest.
+        """
+        self.crom("init")
+        self.crom("add", "ci")
+
+        with self._the_network_must_not_be_touched():
+            row = self._ci_row(self.crom("list", "--no-probe"))
+
+        self.assertIn("stopped :", row)
+        self.assertNotIn("unprobed :", row)
+
+    def test_no_probe_keeps_the_listing_a_table(self):
+        """`unprobed` is a fourth word in a column sized for three.
+
+        The state column absorbs the widest of them; one too narrow spends the difference
+        on the next column and pushes a row's finding out of line with every other row's.
+        Measured rather than compared to a literal, so the claim is the alignment and not
+        the number that currently achieves it.
+        """
+        self.crom("init")
+        self.crom("add", "up", "--port", "9401")
+        self.crom("add", "off", "--port", "9402")
+        running = json.loads(self.crom("config", "up", "--json"))["resolved"]["profile_dir"]
+
+        with (
+            mock.patch("crom.chrome.scan", return_value={running: (4242,)}),
+            self._the_network_must_not_be_touched(),
+        ):
+            listing = self.crom("list", "--no-probe")
+
+        def finding_column(row: str, state: str) -> int:
+            after = row[row.index(state) + len(state) :]
+            return len(row) - len(after.lstrip())
+
+        self.assertEqual(
+            finding_column(self._row(listing, "myproj/up"), "unprobed :9401"),
+            finding_column(self._row(listing, "myproj/off"), "stopped :9402"),
+        )
+
+    def test_every_command_that_publishes_a_state_can_be_told_not_to_probe(self):
+        """All five, because the flag is only worth having if a caller can rely on it.
+
+        The one record shape crom publishes is emitted by six commands, five of which ask
+        the port for the state they put in it. A flag honoured by `crom list` alone would
+        be the epic's own failure in miniature: a caller reads `unprobed` from a listing,
+        reasonably assumes the others behave the same, and `crom up --json` connects.
+
+        `launch` refuses to be called rather than being allowed to succeed quietly. These
+        profiles are already running, so a launch here would mean the command took the
+        wrong path entirely — and it would reach the network legitimately, through
+        `_await_startup`, which would read as the flag leaking rather than as the fixture
+        being wrong.
+
+        Which commands those are comes from click, and so does whether each takes a REF;
+        where the record sits comes from the payload's own shape. Nothing here is keyed on
+        a command's name, so a sixth command gaining `@_probe_option` is covered the day it
+        is written rather than the day someone remembers this list. [LAW:one-source-of-truth]
+        """
+        self.crom("init")
+        self.crom("add", "ci")
+        directory = json.loads(self.crom("config", "ci", "--json"))["resolved"]["profile_dir"]
+
+        self.assertTrue(_commands_offering_no_probe(), "no command declares --no-probe")
+        for name in sorted(_commands_offering_no_probe()):
+            takes_ref = any(param.name == "ref" for param in cli.main.get_command(None, name).params)
+            command = (name, "ci") if takes_ref else (name,)
+            with self.subTest(command=name):
+                with (
+                    mock.patch("crom.cli.seed.materialize_under_lock"),
+                    mock.patch("crom.chrome.scan", return_value={directory: (4242,)}),
+                    mock.patch("crom.cli.chrome.find_pids", return_value=(4242,)),
+                    mock.patch("crom.cli.chrome.kill", return_value=(4242,)),
+                    mock.patch(
+                        "crom.cli.chrome.launch", side_effect=AssertionError("must not launch")
+                    ),
+                    mock.patch("crom.cli.window.raise_profile", return_value=1),
+                    self._the_network_must_not_be_touched(),
+                ):
+                    # `.stdout`, because `up`, `restart` and `show` narrate progress on
+                    # stderr and the merged stream `crom()` returns is not a document.
+                    payload = json.loads(self.invoke(*command, "--no-probe", "--json").stdout)
+
+                # By shape, not by name: a listing is an array of records, `crom config`
+                # nests its one under `resolved`, and the rest publish it at the top level.
+                if isinstance(payload, list):
+                    (record,) = [row for row in payload if row.get("ref") == "myproj/ci"]
+                else:
+                    record = payload.get("resolved", payload)
+                self.assertEqual(record["state"], "unprobed")
+                # The process table's half of the answer, unchanged. This is what
+                # "process-level facts only" means: not less information about the
+                # process, only nothing claimed about the port.
+                self.assertTrue(record["running"])
+                self.assertEqual(record["pids"], [4242])
+
+    def test_no_probe_does_not_reach_into_a_launch(self):
+        """The boundary of what the flag suppresses, which is narrower than "no sockets".
+
+        A command that has to launch waits for CDP to answer, and that wait is how it
+        knows the launch worked at all. Suppressing it would make `crom up` report a
+        browser that never came up — the epic's original lie, reintroduced by the flag
+        meant to keep crom honest. So `--no-probe` governs the state crom *reports*, and a
+        launch it performs still waits.
+        """
+        self.crom("init")
+        self.crom("add", "ci")
+
+        with (
+            mock.patch("crom.cli.seed.materialize_under_lock"),
+            mock.patch("crom.cli.chrome.find_pids", return_value=()),
+            mock.patch("crom.cli.chrome.launch", return_value=(1234,)) as launched,
+        ):
+            record = json.loads(self.invoke("up", "ci", "--no-probe", "--json").stdout)
+
+        self.assertEqual(launched.call_count, 1)
+        # And the state it publishes is still the suppressed one: crom launched, heard the
+        # port as part of launching, and does not recycle that into a health reading it
+        # was told not to take. The two questions stay two questions.
+        self.assertEqual(record["state"], "unprobed")
+        self.assertEqual(record["pids"], [1234])
+
+    def test_down_offers_no_probe_flag_because_it_takes_no_reading(self):
+        """A flag there would advertise a probe to suppress, and there is none: `chrome.kill`
+        returns only once the process is gone and the port is free, so `down` publishes
+        `Stopped()` from what it established rather than from anything it asked.
+        """
+        self.assertNotIn("--no-probe", self.crom("down", "--help"))
+        self.assertIn("--no-probe", self.crom("list", "--help"))
 
     def test_list_json_carries_the_state_beside_the_running_it_refines(self):
         """What `running` alone cannot tell a machine, which is the consumer that acts.

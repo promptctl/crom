@@ -148,14 +148,31 @@ in a config and in your shell, and `CROM_REF` is the joined `namespace/name`.
 }
 ```
 
-`state` is `stopped`, `unreachable` or `ready`, and it is the key to read before you
-connect. `stopped` means no process holds the profile's directory. `ready` means one does
-*and* a browser crom can drive answered on the port. `unreachable` means the process is
-there and the port is not — a browser still starting up, one shutting down, one wedged, or
-a port some other program has taken. `running` is the short answer, true for the last two,
-and it is read off `state`, so the two can never disagree. It is what crom used to publish
-alone, and alone it cannot tell you the one thing you need: an agent that connects to an
+`state` is `stopped`, `unreachable` or `ready` — or `unprobed`, when you pass
+`--no-probe` — and it is the key to read before you connect. `stopped` means no process
+holds the profile's directory. `ready` means one does *and* a browser crom can drive
+answered on the port. `unreachable` means the process is there and the port is not — a
+browser still starting up, one shutting down, one wedged, or a port some other program has
+taken. `running` is the short answer, true wherever a process holds the directory, and it
+is read off `state`, so the two can never disagree. It is what crom used to publish alone,
+and alone it cannot tell you the one thing you need: an agent that connects to an
 `unreachable` profile hangs.
+
+`--no-probe` reports what the process table says and leaves the CDP port unasked, for a
+caller that must not touch the network and for anyone who wants a listing to stay purely
+local. A wedged browser is what makes that more than a preference: its port costs the full
+reply timeout before crom can call it `unreachable`, and that is the wait the flag skips.
+A running profile then reads `unprobed`, which needed a word of its own — `unreachable`
+would report a port that failed a question crom never put, and `ready` would promise a
+browser nobody checked. `running` is still `true` and `pids` is still populated, so what
+the flag costs you is the port's half of the answer and none of the process table's.
+
+Two things the flag does not do. A profile nothing is running still reads `stopped` under
+it rather than `unprobed`, since the process table settles that one alone and there is no
+probe to skip. And a command that has to launch a browser still waits for CDP to answer,
+because that wait is how it knows the launch worked: `crom up --no-probe` on a stopped
+profile launches, waits, and then reports `unprobed`. The flag governs the state crom
+reports, not the launch handshake.
 
 Four commands add keys to that record. `crom restart --json` and `crom down --json` add
 `stopped`, the pids they killed, empty when the profile was not running — what a run took
@@ -254,6 +271,12 @@ answered `idle` whatever else crom could not work out, because settling that nee
 profile directory at all, so a hand-edited ledger key with nothing on its port still gets
 a real answer. `liveness_finding` is where the reason lives, and for `unprobed` it is the
 only place it appears, since no slug can carry it.
+
+`state` on a profile record spells `unprobed` too, and it means the same thing there: crom
+has no probe result for that port. What differs is the reason, which no slug carries in
+either place — on a profile record crom was told not to ask, with `--no-probe`; on a
+doctor row it could not get an answer. The two are different keys on different commands'
+records, so nothing ever has to tell one from the other by value.
 
 `crom release KEY` is what you do about an orphaned row, and it acts on exactly one: the
 port that single reservation holds goes back, and every other reservation in the
@@ -462,6 +485,13 @@ and a directory path, each spelled the way `crom doctor` printed it.
 `crom restart` holds one profile lock across both halves, so a concurrent `crom up` or
 `crom rm` lands wholly before it or wholly after rather than in the gap between the stop
 and the start. Typing `crom down && crom up` leaves that gap open.
+
+`crom up`, `crom restart`, `crom show`, `crom list` and `crom config` each take
+`--no-probe`, which reports a running profile as `unprobed` — read off the process table,
+with its CDP port left unasked — instead of `ready` or `unreachable`. `crom down` does not
+take it, because there is no probe there to suppress: `down` reports `stopped` from what
+it established itself, its kill having returned only once the process was gone and the
+port free.
 
 `crom show` is the one macOS-only command. Every crom-managed Chrome is the same
 application bundle, so `activate` cannot pick between them — it raises whichever instance

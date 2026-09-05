@@ -43,6 +43,7 @@ from .model import (
     Ready,
     ResolvedProfile,
     Stopped,
+    Unprobed,
     Unreachable,
 )
 
@@ -354,6 +355,25 @@ class _AnsweredByStranger:
 
 
 @dataclass(frozen=True)
+class _Unasked:
+    """crom did not put the question — what `--no-probe` leaves behind.
+
+    A variant rather than an absent entry, because `health` indexes the reading it is
+    handed and a missing key is a `KeyError` in the middle of a listing. It is also the
+    honest shape: this union is what crom *knows* about a port, and "never asked" is one
+    of the things it can know — distinct from `_Silent`, which is a question that came
+    back empty. [LAW:parse-dont-validate] the difference is settled once, here, so
+    `_reachability` reads it off the type rather than re-deriving it from which flag was
+    passed.
+
+    In `_PortKnowledge` only, and deliberately not in `_PortAnswer`: nothing crom asks a
+    port can come back this way, and a launch that never asked its own port is not an
+    ending `_LaunchOutcome` has either, because `_await_startup` puts the question
+    unconditionally.
+    """
+
+
+@dataclass(frozen=True)
 class _Exited:
     """The child process was gone before CDP ever replied."""
 
@@ -378,6 +398,13 @@ class _NeverAnswered:
 # 20ms got reported 30 seconds later as a port that had not opened, and a foreign server
 # on the port got reported as a successful launch.
 _PortAnswer = _Silent | _Answered | _AnsweredByStranger
+# What crom holds for a port, which is the answer it got or the fact that it did not ask.
+# Separate from `_PortAnswer` because `_probe_port` and `_classify` can only ever produce
+# an answer, and folding `_Unasked` into their return type would overstate them and cost
+# `_await_startup`'s three-arm match its provable totality. [LAW:types-are-the-program]
+# each signature says exactly what that function can return; this wider one is named only
+# where something genuinely holds both, which is `_reachability` and the readings feeding it.
+_PortKnowledge = _PortAnswer | _Unasked
 _LaunchOutcome = _Answered | _AnsweredByStranger | _Exited | _NeverAnswered
 
 
@@ -575,7 +602,22 @@ def _probe_port(port: int) -> _PortAnswer:
 _PROBE_WORKERS = 32
 
 
-def _probe_all(ports: Iterable[int]) -> dict[int, _PortAnswer]:
+# How a round of ports gets read. Two readings satisfy it — `probe_ports` asks them and
+# `unasked_ports` does not — and which one a command holds is the whole of what
+# `--no-probe` decides. [LAW:dataflow-not-control-flow] the reading is a value crossing one
+# boundary rather than an arm inside `health` deciding whether to open a socket: the set of
+# operations `health` performs is the same either way, and only what flows through them
+# differs. The practical difference is visible in the two bodies below — one contains the
+# network and the other cannot — which is a claim a caller can check by reading rather than
+# one a flag asks it to believe.
+# `Mapping` rather than `dict` in the result, because it is covariant in its value type:
+# each reading below can then be annotated with exactly what it produces — answers from one
+# and `_Unasked` from the other — and both still satisfy this one contract. An invariant
+# `dict` here would force both to claim they might return either.
+PortReading = Callable[[Iterable[int]], Mapping[int, _PortKnowledge]]
+
+
+def probe_ports(ports: Iterable[int]) -> dict[int, _PortAnswer]:
     """Every port asked at once, as answers keyed by the port that gave them.
 
     Keyed from the start rather than zipped against the input afterwards, so no ordering
@@ -600,8 +642,25 @@ def _probe_all(ports: Iterable[int]) -> dict[int, _PortAnswer]:
     return {port: answer.result() for port, answer in answers.items()}
 
 
+def unasked_ports(ports: Iterable[int]) -> dict[int, _Unasked]:
+    """The same reading, taken by not asking — the `PortReading` `--no-probe` supplies.
+
+    Total over `ports` exactly as `probe_ports` is, because that totality is what `health`
+    depends on, and a reading that left out its stopped profiles would fail there rather
+    than here. `dict.fromkeys` for the same reason: two profiles on one port are one entry
+    in either reading. [LAW:one-source-of-truth]
+
+    There is no socket in this function, and that is the whole of why it exists beside the
+    other rather than as a flag inside it: a caller that must not touch the network gets a
+    guarantee it can read, not a branch it has to trust.
+    """
+    return {port: _Unasked() for port in dict.fromkeys(ports)}
+
+
 def health(
-    profiles: Iterable[ResolvedProfile], live: Mapping[str, tuple[int, ...]]
+    profiles: Iterable[ResolvedProfile],
+    live: Mapping[str, tuple[int, ...]],
+    read: PortReading = probe_ports,
 ) -> dict[ProfileRef, Health]:
     """What each profile's browser is doing, from one process-table reading and one
     round of port probes.
@@ -620,21 +679,29 @@ def health(
     this is keyed on. The pids it returns are still one moment's reading, which is why
     they travel on as evidence rather than as the answer.
 
-    Every listed port is asked, including the ports of profiles nothing is running for.
-    That is one refused connect each — ~0.1ms measured on loopback, and concurrent — and
-    it buys a probe with no arm that decides whether to run, so what varies between two
-    listings is which answers come back and never which questions were put.
-    [LAW:dataflow-not-control-flow]
+    Every listed port is read the same way, including the ports of profiles nothing is
+    running for. Under `probe_ports` that is one refused connect each — ~0.1ms measured on
+    loopback, and concurrent — and it buys a probe with no arm that decides whether to run,
+    so what varies between two listings is which answers come back and never which
+    questions were put. [LAW:dataflow-not-control-flow]
+
+    `read` is that same principle one level up. A caller that must not touch the network
+    hands `unasked_ports` instead, and every line below runs unchanged: the reading is
+    still total, still one entry per port, and `_reachability` still folds it against the
+    process table. What changes is the value folded in, which is why the states this can
+    produce grow by one rather than the code growing an arm.
 
     Total over `profiles`, so a caller indexes the result rather than defaulting a
     lookup: a ref that is missing is a crom bug and should read like one.
     """
     standing = [(p.ref, p.port, live.get(str(p.profile_dir), ())) for p in profiles]
-    heard = _probe_all(port for _, port, _ in standing)
+    heard = read(port for _, port, _ in standing)
     return {ref: _reachability(pids, heard[port]) for ref, port, pids in standing}
 
 
-def health_of(profile: ResolvedProfile, pids: tuple[int, ...]) -> Health:
+def health_of(
+    profile: ResolvedProfile, pids: tuple[int, ...], read: PortReading = probe_ports
+) -> Health:
     """One profile's state, for a caller that has already read the process table.
 
     The `pids` a command is holding — what `operations.up` launched, what `find_pids`
@@ -648,10 +715,10 @@ def health_of(profile: ResolvedProfile, pids: tuple[int, ...]) -> Health:
     keeping it there is the whole of what this adds: a command spelling the key for itself
     is a copy of that rule, and there would be one per command. [LAW:single-enforcer]
     """
-    return health([profile], {str(profile.profile_dir): pids})[profile.ref]
+    return health([profile], {str(profile.profile_dir): pids}, read)[profile.ref]
 
 
-def _reachability(pids: tuple[int, ...], heard: _PortAnswer) -> Health:
+def _reachability(pids: tuple[int, ...], heard: _PortKnowledge) -> Health:
     """The two readings folded into the one state a consumer acts on.
 
     [LAW:types-are-the-program] one match over both facts, so every combination is
@@ -661,11 +728,16 @@ def _reachability(pids: tuple[int, ...], heard: _PortAnswer) -> Health:
     A stopped profile's port answer is not read. Something may well be listening on a
     port crom has assigned, and that is a fact about the port rather than about this
     profile's browser — `_require_port_available` is where a launch meets it, and says so
-    there with `lsof_hint`.
+    there with `lsof_hint`. That arm coming first is also why `Unprobed` never carries an
+    empty pid tuple: an unread port cannot make a profile with no process look like
+    anything but `Stopped`, so suppressing the probe costs a caller the port's half of the
+    answer and leaves the process table's half exactly as it was.
     """
     match pids, heard:
         case (), _:
             return Stopped()
+        case _, _Unasked():
+            return Unprobed(pids)
         case _, _Answered():
             return Ready(pids)
         case _, _AnsweredByStranger(served=served):
@@ -673,12 +745,17 @@ def _reachability(pids: tuple[int, ...], heard: _PortAnswer) -> Health:
                 pids, f"its CDP port answered, but not as a browser crom can drive: {served}"
             )
         case _:
-            # `_Silent`, and deliberately the residue arm rather than a fourth named one.
-            # An unnamed answer leaving the match would return `None` and surface far from
+            # `_Silent`, and deliberately the residue arm rather than a named one. An
+            # unnamed answer leaving the match would return `None` and surface far from
             # here as an attribute error; landing in `Unreachable` is both the honest
             # reading of "crom cannot name what is on this port" and the safe direction —
             # a state crom has no name for is never reported as ready.
             # [LAW:no-silent-failure]
+            #
+            # Which is why `_Unasked` is named above rather than left to fall in here. It
+            # would land somewhere safe and still be wrong: `Unreachable` would report a
+            # port that failed a question crom never put, and the one reading this state
+            # exists to distinguish would be gone.
             return Unreachable(pids, "nothing answered on its CDP port")
 
 
