@@ -1903,7 +1903,7 @@ def health_profile(port: int, name: str = "dev", directory: str | None = None) -
 
 
 class ReachabilityTest(unittest.TestCase):
-    """Two readings, six combinations, folded into the state a consumer acts on.
+    """Two readings, eight combinations, folded into the state a consumer acts on.
 
     Written as the whole table rather than as the interesting rows, because the fold's
     only job is to be total: a combination it answers nowhere returns `None` and surfaces
@@ -1917,7 +1917,17 @@ class ReachabilityTest(unittest.TestCase):
         profile's holds is somebody else's browser — reporting it as this profile's
         `ready` would send a consumer to drive a Chrome crom does not manage.
         """
-        for heard in (chrome._Silent(), chrome._Answered(), chrome._AnsweredByStranger("nginx")):
+        answers = (
+            chrome._Silent(),
+            chrome._Answered(),
+            chrome._AnsweredByStranger("nginx"),
+            # Including the reading `--no-probe` supplies. A profile with no process is
+            # `stopped` whether or not crom asked its port, because the port was never
+            # what decided that — which is why suppressing the probe costs a caller
+            # nothing here, and why `Unprobed` can never carry an empty pid tuple.
+            chrome._Unasked(),
+        )
+        for heard in answers:
             with self.subTest(heard=heard):
                 state = chrome._reachability((), heard)
 
@@ -1935,6 +1945,32 @@ class ReachabilityTest(unittest.TestCase):
         self.assertEqual(state, chrome.Ready((4242,)))
         self.assertTrue(state.running)
         self.assertEqual(state.pids, (4242,))
+
+    def test_a_process_whose_port_was_never_asked_is_unprobed(self):
+        """The fourth word, and the reason the flag could not reuse one of the other three.
+
+        `Unreachable` would report a port that failed a question crom never put, and
+        `Ready` would promise a browser nobody checked. The process table's half of the
+        answer survives intact, because that half never needed the port.
+        """
+        state = chrome._reachability((4242,), chrome._Unasked())
+
+        self.assertEqual(state, chrome.Unprobed((4242,)))
+        self.assertEqual(state.slug, "unprobed")
+        self.assertTrue(state.running)
+        self.assertEqual(state.pids, (4242,))
+
+    def test_an_unasked_port_is_not_folded_into_unreachable(self):
+        """The arm above the residue, pinned.
+
+        `_reachability` ends in a catch-all that answers `Unreachable`, so deleting
+        `_Unasked`'s arm leaves a suite that still passes everywhere except here: every
+        state stays a state, `running` stays true, and the one reading this variant exists
+        to keep would be silently gone.
+        """
+        state = chrome._reachability((4242,), chrome._Unasked())
+
+        self.assertNotIsInstance(state, chrome.Unreachable)
 
     def test_a_process_whose_port_says_nothing_is_running_but_unreachable(self):
         """The whole point of the epic: this used to be indistinguishable from healthy."""
@@ -2046,7 +2082,7 @@ class HealthTest(unittest.TestCase):
 
         Every probe waits on a barrier that only opens once all twenty have arrived, so a
         sequential implementation cannot reach the second one and the barrier breaks —
-        which `_probe_all` re-raises. No sleeps, and nothing that passes because the
+        which `probe_ports` re-raises. No sleeps, and nothing that passes because the
         machine happened to be fast. [LAW:no-ambient-temporal-coupling]
         """
         profiles = [health_profile(9300 + n, f"p{n}") for n in range(20)]
@@ -2081,6 +2117,83 @@ class HealthTest(unittest.TestCase):
 
         self.assertEqual(asked, [9300])
         self.assertIsInstance(standing[first.ref], chrome.Ready)
+
+
+class PortReadingTest(unittest.TestCase):
+    """The two readings `health` folds against the process table, and what picking one costs.
+
+    `--no-probe` is a value handed in here, not an arm inside `health`, so what these
+    assert is that the two readings are interchangeable everywhere `health` uses one:
+    same shape, same totality, same keying. The only difference is whether a socket opens.
+    """
+
+    def _no_network(self):
+        """A socket layer that fails the test rather than the connection.
+
+        The claim `--no-probe` makes to a caller is about the network, so the check has to
+        be about the network too. A stub returning `_Silent` would let a suppressed run
+        that still called `_probe_port` pass, and the states would even look right.
+        """
+        def poisoned(*args, **kwargs):
+            self.fail("the port was asked despite the reading that says it was not")
+
+        return mock.patch.object(chrome.socket, "create_connection", poisoned)
+
+    def test_unasked_ports_answers_every_port_it_is_given(self):
+        """Total, because `health` indexes it: a reading with a port missing is a
+        `KeyError` in the middle of a listing rather than a state.
+        """
+        reading = chrome.unasked_ports([9300, 9301, 9302])
+
+        self.assertEqual(set(reading), {9300, 9301, 9302})
+        for port, answer in reading.items():
+            with self.subTest(port=port):
+                self.assertIsInstance(answer, chrome._Unasked)
+
+    def test_unasked_ports_collapses_a_shared_port_the_way_probing_does(self):
+        """The same keying as `probe_ports`, so two profiles on one port are one entry in
+        either reading and a caller cannot tell them apart by shape.
+        """
+        self.assertEqual(list(chrome.unasked_ports([9300, 9300, 9301])), [9300, 9301])
+
+    def test_a_suppressed_listing_opens_no_socket_and_still_tells_running_from_stopped(self):
+        """The whole of what the flag buys, in one call: the port's half of the answer is
+        gone, the process table's half is untouched, and nothing reached the network.
+        """
+        running, stopped = health_profile(9300, "running"), health_profile(9301, "off")
+
+        with self._no_network():
+            standing = chrome.health(
+                [running, stopped], {str(running.profile_dir): (11,)}, chrome.unasked_ports
+            )
+
+        self.assertEqual(standing[running.ref], chrome.Unprobed((11,)))
+        self.assertEqual(standing[stopped.ref], chrome.Stopped())
+
+    def test_health_of_carries_the_reading_it_is_handed(self):
+        """The single-profile form is the one four of the five commands call, so a reading
+        that stopped at `health` would leave `crom list` honest and the rest probing.
+        """
+        profile = health_profile(9300)
+
+        with self._no_network():
+            state = chrome.health_of(profile, (11,), chrome.unasked_ports)
+
+        self.assertEqual(state, chrome.Unprobed((11,)))
+
+    def test_probing_is_what_a_caller_that_says_nothing_gets(self):
+        """The default, pinned. Suppression is the exception a caller asks for; a default
+        that flipped would turn every unflagged command into one that reports `unprobed`
+        while a browser sits there answering.
+        """
+        profile = health_profile(9300)
+
+        with mock.patch.object(chrome, "_probe_port", return_value=chrome._Answered()):
+            self.assertEqual(chrome.health_of(profile, (11,)), chrome.Ready((11,)))
+            self.assertEqual(
+                chrome.health([profile], {str(profile.profile_dir): (11,)})[profile.ref],
+                chrome.Ready((11,)),
+            )
 
 
 if __name__ == "__main__":
