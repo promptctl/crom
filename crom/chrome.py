@@ -27,14 +27,15 @@ import socket
 import subprocess
 import textwrap
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import IO
+from typing import IO, ClassVar
 
 from . import launched
-from .model import CromError, Reason, ResolvedProfile
+from .model import CromError, ProfileRef, Reason, ResolvedProfile
 
 LAUNCH_TIMEOUT_SECONDS = 30.0
 SHUTDOWN_TIMEOUT_SECONDS = 5.0
@@ -548,6 +549,158 @@ def _probe_port(port: int) -> _PortAnswer:
             # a stranger is terminal, which makes this the difference between a loaded
             # machine costing another 100ms round and a launch that fails for good.
             return _Silent()
+
+
+# --- what a profile's browser is actually doing --------------------------------------
+# Two facts crom used to report as one. `scan` says a process holds the user-data-dir;
+# `_probe_port` says something drivable answers on the port. A browser that is wedged,
+# still shutting down, or whose debugging port has died passes the first and fails the
+# second, and while "running" was derived from the process table alone it read exactly
+# like a healthy one — so a consumer read `running :9240`, connected, and hung.
+# [FRAMING:representation] a process holding a directory is not a map of "I can drive
+# this browser"; only the port is, so only the port is asked.
+#
+# `running` and `pids` are on all three states, so a caller renders one without first
+# asking which it holds — the same reason `drift`'s four verdicts all carry `changes`.
+# [LAW:dataflow-not-control-flow] Only `Unreachable` has anything to say about why, so
+# on the other two `pids` is a class attribute rather than a field where it is fixed: a
+# `Stopped` carrying pids is unrepresentable rather than merely never built.
+
+
+@dataclass(frozen=True)
+class Stopped:
+    """No process holds this profile's user-data-dir."""
+
+    slug: ClassVar[str] = "stopped"
+    running: ClassVar[bool] = False
+    pids: ClassVar[tuple[int, ...]] = ()
+
+
+@dataclass(frozen=True)
+class Unreachable:
+    """A process holds the directory, and nothing crom can drive answers on the port.
+
+    `heard` is what the port did, kept because it is the only thing that tells an
+    operator where to go: a silent port is a browser to restart, and a port answered by
+    something else is a port to go and reclaim. Nothing *acts* on the difference, which
+    is why it is one state and not two — for the reason `_advertises_devtools` folds
+    every way of not being a DevTools document into one answer.
+    """
+
+    slug: ClassVar[str] = "unreachable"
+    running: ClassVar[bool] = True
+    pids: tuple[int, ...]
+    heard: str
+
+
+@dataclass(frozen=True)
+class Ready:
+    """A process holds the directory and a DevTools endpoint answered on the port."""
+
+    slug: ClassVar[str] = "ready"
+    running: ClassVar[bool] = True
+    pids: tuple[int, ...]
+
+
+Health = Stopped | Unreachable | Ready
+
+# Enough that the profiles one person lists are asked in a single round. The cap is for
+# the ports that *answer*, not the ones that do not: measured on loopback, a refused
+# connect costs ~0.1ms and gains nothing from a thread, while a healthy Chrome takes up
+# to 282ms to finish its version document (see `PORT_RECV_SECONDS`) and a wedged port
+# costs the whole of `PORT_REPLY_SECONDS`. Twenty wedged profiles in sequence is forty
+# seconds of `crom list`; in one round it is two.
+_PROBE_WORKERS = 32
+
+
+def _probe_all(ports: Iterable[int]) -> dict[int, _PortAnswer]:
+    """Every port asked at once, as answers keyed by the port that gave them.
+
+    Keyed from the start rather than zipped against the input afterwards, so no ordering
+    between two sequences has to hold for an answer to belong to the port that gave it.
+
+    Asked once per port, which is what `dict.fromkeys` is doing: two profiles pointed at
+    one port are one question, and asking it twice both wastes a probe and lets the two
+    rows disagree about a port they share, since the second answer is a second reading and
+    only one of them can be kept. [LAW:one-source-of-truth]
+
+    The pool bounds nothing and owns no clock: `_probe_port` already holds its whole
+    exchange to `PORT_REPLY_SECONDS` and cannot exceed it here.
+    [LAW:no-ambient-temporal-coupling] the deadline stays where it was, and threads only
+    stop the deadlines queueing behind one another.
+    """
+    with ThreadPoolExecutor(max_workers=_PROBE_WORKERS) as pool:
+        answers = {port: pool.submit(_probe_port, port) for port in dict.fromkeys(ports)}
+    # Outside the `with`, so every probe has finished and `.result()` cannot block. It
+    # re-raises rather than defaulting: `_probe_port` answers `_Silent` for every way a
+    # socket can fail, so anything reaching here is a crom bug and should read like one.
+    # [LAW:no-silent-failure]
+    return {port: answer.result() for port, answer in answers.items()}
+
+
+def health(
+    profiles: Iterable[ResolvedProfile], live: Mapping[str, tuple[int, ...]]
+) -> dict[ProfileRef, Health]:
+    """What each profile's browser is doing, from one process-table reading and one
+    round of port probes.
+
+    `live` is the evidence, taken as an argument for the reason `drift.of` takes `pids`:
+    the process table is an external system, the caller has already read it once for
+    every profile it is reporting, and re-asking per profile would let a browser that
+    started between two reads be stopped in one half of a row and running in the other.
+    [LAW:effects-at-boundaries] the reading happens at the command; this decides.
+
+    Nothing here carries a pid from the scan into the probe. Chrome re-execs itself on
+    `chrome://restart` and comes back as a *different* pid on the same user-data-dir and
+    the same port — observed live, 97805 -> 819, with its argv rewritten — so a probe
+    addressed by a pid can report a dead process for a browser that is answering
+    perfectly. The port and the directory are what survive that gap, and they are what
+    this is keyed on. The pids it returns are still one moment's reading, which is why
+    they travel on as evidence rather than as the answer.
+
+    Every listed port is asked, including the ports of profiles nothing is running for.
+    That is one refused connect each — ~0.1ms measured on loopback, and concurrent — and
+    it buys a probe with no arm that decides whether to run, so what varies between two
+    listings is which answers come back and never which questions were put.
+    [LAW:dataflow-not-control-flow]
+
+    Total over `profiles`, so a caller indexes the result rather than defaulting a
+    lookup: a ref that is missing is a crom bug and should read like one.
+    """
+    standing = [(p.ref, p.port, live.get(str(p.profile_dir), ())) for p in profiles]
+    heard = _probe_all(port for _, port, _ in standing)
+    return {ref: _reachability(pids, heard[port]) for ref, port, pids in standing}
+
+
+def _reachability(pids: tuple[int, ...], heard: _PortAnswer) -> Health:
+    """The two readings folded into the one state a consumer acts on.
+
+    [LAW:types-are-the-program] one match over both facts, so every combination is
+    answered here rather than some of them here and the rest at a call site that thought
+    it knew the others.
+
+    A stopped profile's port answer is not read. Something may well be listening on a
+    port crom has assigned, and that is a fact about the port rather than about this
+    profile's browser — `_require_port_available` is where a launch meets it, and says so
+    there with `lsof_hint`.
+    """
+    match pids, heard:
+        case (), _:
+            return Stopped()
+        case _, _Answered():
+            return Ready(pids)
+        case _, _AnsweredByStranger(served=served):
+            return Unreachable(
+                pids, f"its CDP port answered, but not as a browser crom can drive: {served}"
+            )
+        case _:
+            # `_Silent`, and deliberately the residue arm rather than a fourth named one.
+            # An unnamed answer leaving the match would return `None` and surface far from
+            # here as an attribute error; landing in `Unreachable` is both the honest
+            # reading of "crom cannot name what is on this port" and the safe direction —
+            # a state crom has no name for is never reported as ready.
+            # [LAW:no-silent-failure]
+            return Unreachable(pids, "nothing answered on its CDP port")
 
 
 def port_is_free(port: int) -> bool:

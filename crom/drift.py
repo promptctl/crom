@@ -184,9 +184,9 @@ def of(profile: ResolvedProfile, pids: tuple[int, ...]) -> Verdict:
     reads be running in one half of a row and stopped in the other.
     [LAW:effects-at-boundaries] the reading happens at the command; this decides.
 
-    An empty `pids` is the whole of "nothing is running", which is the same thing
-    `cli._status` derives `running` from — so this takes the evidence itself rather than
-    a boolean somebody else already reduced it to. [LAW:one-source-of-truth]
+    An empty `pids` is the whole of "nothing is running", so this takes the evidence
+    itself rather than a boolean somebody else already reduced it to.
+    [LAW:one-source-of-truth]
     """
     current = Launch.of(profile)
     match pids, launched.read(profile.profile_dir):
