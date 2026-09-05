@@ -368,7 +368,7 @@ Seed = SeedFresh | SeedChrome | SeedPath
 # Where a profile's data comes from when nothing says otherwise.
 #
 # [LAW:one-source-of-truth] This question used to be answered in five places, and two of
-# the answers disagreed: `cli._bootstrap_user_config` seeded `user/default` from the real
+# the answers disagreed: `session._bootstrap_user_config` seeded `user/default` from the real
 # browser while `configwrite.PROJECT_CONFIG_TEMPLATE` wrote `fresh`. So the word `default`
 # meant "your Chrome, with your logins" outside a project and "an empty browser" inside
 # one, with nothing in any output marking the difference — someone who ran `crom init` and

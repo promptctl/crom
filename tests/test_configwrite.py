@@ -437,7 +437,7 @@ class WriteFailureTest(unittest.TestCase):
     def test_the_template_records_the_seed_it_was_given(self):
         """`[defaults].seed` is written from the caller's value, never a literal.
 
-        The template used to spell `fresh` itself while `cli._bootstrap_user_config`
+        The template used to spell `fresh` itself while `session._bootstrap_user_config`
         spelled `SeedChrome()`, so the same word `default` meant a copy of the user's
         real browser outside a project and an empty one inside it. Rendering whatever it
         is handed is what keeps the two templates from disagreeing again.

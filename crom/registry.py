@@ -266,7 +266,7 @@ def forget_mapping(namespace: str) -> None:
     pointing at the old numbers breaks with no way to recover them.
 
     Dropping only the mapping costs nothing and heals itself: the moment the project is
-    reachable again, `_Session.scope` re-records it and every profile resolves to the
+    reachable again, `Session.scope` re-records it and every profile resolves to the
     port it always had. Releasing ports stays where it belongs — behind `crom forget`,
     which a person runs deliberately about a project they know is gone.
     """
