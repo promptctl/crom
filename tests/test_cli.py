@@ -14,6 +14,7 @@ import os
 import re
 import shlex
 import shutil
+import subprocess
 import tempfile
 import unittest
 from dataclasses import replace
@@ -23,7 +24,7 @@ from unittest import mock
 
 from click.testing import CliRunner
 
-from crom import cli, config, configwrite, doctor, launched, mcp, migrate, registry
+from crom import chrome, cli, config, configwrite, doctor, launched, mcp, migrate, registry
 from crom.config import load_ambient
 from crom.model import USER_NAMESPACE, Conflict, CromError, ProfileRef, Reason
 from crom.paths import registry_file, state_home, user_config_file
@@ -32,6 +33,11 @@ from crom.paths import registry_file, state_home, user_config_file
 # holds two enumerations the code owns. Located from this file rather than from the
 # working directory, so the suite reads the same README wherever it is run from.
 _README = Path(__file__).resolve().parent.parent / "README.md"
+
+# `chrome.scan` before `CliTest.setUp` stubs it, held so one test can put it back.
+# Bound at import rather than reached for during a test, because by then the name is
+# the stub and the real function is only recoverable from mock's own bookkeeping.
+_REAL_SCAN = chrome.scan
 
 
 def _readme_names(fragment: str) -> tuple[str, ...]:
@@ -1361,10 +1367,224 @@ class CliTest(unittest.TestCase):
         self.assertIn("crom has no record of how the browser in", row)
         self.assertNotIn("running with what this configuration resolves to", row)
 
-    def _ci_row(self, listing: str) -> str:
-        """The one line of a listing that is about `myproj/ci`."""
-        (row,) = [line for line in listing.splitlines() if "myproj/ci" in line]
+    def _row(self, listing: str, ref: str) -> str:
+        """The one line of a listing that is about `ref`."""
+        (row,) = [line for line in listing.splitlines() if ref in line]
         return row
+
+    def _ci_row(self, listing: str) -> str:
+        return self._row(listing, "myproj/ci")
+
+    # --- every source a drift can come from, and one thing that is not one -------------
+
+    def _profiles_declaring(self, body: str) -> None:
+        """Write the project config whole, rather than editing the template in place.
+
+        The three drift sources are three different stanza keys and `crom add` writes only
+        `flags`, so the other two have no command to reach them. Writing the file is also
+        what makes the second call in each test below an edit of the shape a user actually
+        makes — text changed in a stanza — rather than a command crom offers.
+        """
+        (self.project / ".crom.toml").write_text(f'namespace = "myproj"\n\n{body}')
+
+    def _drift_of(self, ref: str, directory: str) -> dict:
+        """The verdict `crom list --json` publishes for one profile, with a browser running.
+
+        Through `--json` rather than the human row because these tests assert *which*
+        switches moved and what each one's two values are; the human line names only the
+        subjects. [FRAMING:representation] the published record is the map a script reads,
+        so it is the one worth pinning.
+        """
+        with mock.patch("crom.chrome.scan", return_value={directory: (4242,)}):
+            records = json.loads(self.crom("list", "--json"))
+        return next(record for record in records if record["ref"] == ref)["drift"]
+
+    def _subjects(self, verdict: dict) -> list[str]:
+        return [change["subject"] for change in verdict["changes"]]
+
+    def test_a_features_edit_drifts_though_neither_side_has_a_flags_list(self):
+        """`features` is layered configuration that no `flags` list mentions.
+
+        A comparison made over the config's `flags` stanzas would read this profile as
+        current — neither side has one. The two sides differ only after `flags.features`
+        has folded every layer's table into the two switches Chrome is actually given,
+        which is why the comparison is made on the composed argv and never on the config.
+
+        Flipping one feature moves two switches, because a feature that stops being
+        disabled starts being enabled. That is the shape a diff taken per `flags` entry
+        has no vocabulary to report, and it is what makes `features` its own drift source
+        rather than a spelling of the first one.
+        """
+        self.crom("init")
+        self._profiles_declaring("[profiles.ci]\nfeatures = { PictureInPicture = false }\n")
+        directory = self._record_the_launch_of("ci")
+        self._profiles_declaring("[profiles.ci]\nfeatures = { PictureInPicture = true }\n")
+
+        verdict = self._drift_of("myproj/ci", directory)
+
+        self.assertEqual(verdict["verdict"], "drifted")
+        self.assertEqual(self._subjects(verdict), ["--disable-features", "--enable-features"])
+        disabled, enabled = verdict["changes"]
+        self.assertEqual(
+            enabled,
+            {
+                "subject": "--enable-features",
+                "launched": None,
+                "resolves": "--enable-features=PictureInPicture",
+            },
+        )
+        # The name left the disable switch and nothing else did. Stated against the
+        # switch's own current value rather than against a literal, because the rest of
+        # that list is crom's launch policy — real, and not this test's claim to make.
+        self.assertEqual(disabled["launched"], f"{disabled['resolves']},PictureInPicture")
+
+    def test_a_drop_flags_edit_drifts_though_it_only_takes_a_switch_away(self):
+        """A drop is the one edit that leaves nothing on the current side to compare.
+
+        `drop_flags` removes a switch a lower layer set, so the drifted resolution is the
+        recorded one minus an entry — no value moved anywhere, and nothing new appeared.
+        Absent from argv, a dropped switch is indistinguishable from one nobody ever set,
+        so this drift is reportable only by naming the side that has nothing: `Change`
+        keeps `None` apart from `""` precisely so this reads as a switch withdrawn rather
+        than as one set to empty.
+        """
+        self.crom("init")
+        self._profiles_declaring('[defaults]\nflags = ["--window-size=800,600"]\n\n[profiles.ci]\n')
+        directory = self._record_the_launch_of("ci")
+        self._profiles_declaring(
+            '[defaults]\nflags = ["--window-size=800,600"]\n\n'
+            '[profiles.ci]\ndrop_flags = ["--window-size"]\n'
+        )
+
+        verdict = self._drift_of("myproj/ci", directory)
+
+        self.assertEqual(verdict["verdict"], "drifted")
+        self.assertEqual(
+            verdict["changes"],
+            [{"subject": "--window-size", "launched": "--window-size=800,600", "resolves": None}],
+        )
+
+    def test_a_config_that_moved_three_ways_at_once_names_every_switch_that_moved(self):
+        """All three sources drifted under one browser, reported in one run.
+
+        A test per source builds a machine with one thing wrong, and no number of those
+        can catch a source that shadows another: the three resolve through one layered
+        composition, so a fold that loses a layer only when a second one is populated
+        reads correctly on every single-source machine and wrongly on this one.
+
+        The set of subjects is asserted by equality rather than by membership, because a
+        comparison that drops an entry or reports one twice satisfies an `assertIn` — the
+        assertion that would have passed is exactly the bug worth catching here.
+        """
+        self.crom("init")
+        self._profiles_declaring(
+            '[defaults]\nflags = ["--window-size=800,600", "--no-pings"]\n\n'
+            "[profiles.ci]\nfeatures = { PictureInPicture = false }\n"
+        )
+        directory = self._record_the_launch_of("ci")
+        self._profiles_declaring(
+            '[defaults]\nflags = ["--window-size=1280,800", "--no-pings"]\n\n'
+            "[profiles.ci]\nfeatures = { PictureInPicture = true }\n"
+            'drop_flags = ["--no-pings"]\n'
+        )
+
+        verdict = self._drift_of("myproj/ci", directory)
+
+        self.assertEqual(verdict["verdict"], "drifted")
+        self.assertEqual(
+            self._subjects(verdict),
+            ["--disable-features", "--enable-features", "--no-pings", "--window-size"],
+        )
+        _, enabled, dropped, resized = verdict["changes"]
+        self.assertEqual(enabled["resolves"], "--enable-features=PictureInPicture")
+        self.assertEqual((dropped["launched"], dropped["resolves"]), ("--no-pings", None))
+        self.assertEqual(
+            (resized["launched"], resized["resolves"]),
+            ("--window-size=800,600", "--window-size=1280,800"),
+        )
+
+    @contextlib.contextmanager
+    def _a_process_table_reading(self, *processes: tuple[int, str]):
+        """The real `chrome.scan`, over `ps` output the caller wrote.
+
+        Every other test in this file stubs `scan` itself, which hands crom a
+        directory-to-pids map that is already parsed. That is the right seam for a test
+        about what crom does with the answer and the wrong one for a test about the answer
+        itself: `_USER_DATA_DIR_RE` is the only code the argv rewrite is visible to, and a
+        stub above it asserts a parse that never ran. So the stub moves down to the
+        external system crom actually reads — `ps` — and everything above it is the
+        shipping code. [LAW:effects-at-boundaries] the boundary is where the process table
+        is read, not where the verdict is decided.
+        """
+        output = "".join(f"{pid} {command}\n" for pid, command in processes)
+        completed = subprocess.CompletedProcess(["ps"], 0, stdout=output, stderr="")
+        with (
+            mock.patch.object(chrome, "scan", _REAL_SCAN),
+            mock.patch("crom.chrome.subprocess.run", return_value=completed),
+        ):
+            yield
+
+    def _running_under_a_rewritten_argv(self, ref: str) -> str:
+        """Record `ref`'s launch, and hand back the command line `ps` shows once Chrome
+        has re-exec'd and rewritten it.
+
+        Chrome relaunches itself for something as ordinary as loading profile data, and
+        the argv it writes then is its own, not crom's: every switch comes back in
+        alphabetical order with `--restart` appended, which leaves `--user-data-dir`
+        somewhere in the middle of the line rather than second from the end where
+        `resolve.build_argv` put it. Built from the argv crom really recorded — read back
+        through `launched.read`, the same parser the verdict uses — so the reordering is
+        the only invented part.
+
+        Measured rather than imagined: a real crom-launched Chrome 152 was driven to
+        `chrome://restart` and its new command line read back whole. Modelling the sort
+        and not just the appended switch is what makes this fixture worth having — the
+        sort is the half that would make any check built on the live command line report
+        every restarted browser as reordered. See `chrome._USER_DATA_DIR_RE`.
+        """
+        record = launched.read(Path(self._record_the_launch_of(ref)))
+        return " ".join([record.argv[0], *sorted(record.argv[1:]), "--restart"])
+
+    def test_a_browser_that_rewrote_its_own_argv_is_neither_drifted_nor_missing(self):
+        """Chrome's re-exec must move no verdict — asserted beside a browser that did drift.
+
+        This is the failure mode that makes diffing the live command line wrong, and the
+        whole reason crom writes down its own launch instead. Both profiles below are
+        running under a rewritten argv and only one has had its config edited, asserted in
+        the same run: a check that fired on every rewritten browser could otherwise pass
+        by being pointed only at the edited one.
+
+        `matches` and not merely "not drifted", because the rewrite's real cost lands
+        upstream of the verdict, in the pattern that finds the browser at all. Unmatched,
+        `scan` returns nothing, both rows read `stopped` — no drift reported anywhere, and
+        `crom up` starts a second Chrome on a directory that already has one.
+        [LAW:no-silent-failure] the quiet answer here is the dangerous one.
+        """
+        self.crom("init")
+        self._profiles_declaring(
+            '[profiles.steady]\nflags = ["--window-size=800,600"]\n\n'
+            '[profiles.edited]\nflags = ["--window-size=800,600"]\n'
+        )
+        steady = self._running_under_a_rewritten_argv("steady")
+        edited = self._running_under_a_rewritten_argv("edited")
+        self._profiles_declaring(
+            '[profiles.steady]\nflags = ["--window-size=800,600"]\n\n'
+            '[profiles.edited]\nflags = ["--window-size=1280,800"]\n'
+        )
+
+        with self._a_process_table_reading((4242, steady), (4243, edited)):
+            listing = self.crom("list")
+
+        self.assertIn("--restart", steady)
+        for ref, finding in (
+            ("myproj/steady", "running with what this configuration resolves to"),
+            ("myproj/edited", "drifted — --window-size"),
+        ):
+            with self.subTest(ref=ref):
+                row = self._row(listing, ref)
+                # Found at all, which is the half a verdict cannot report on its own.
+                self.assertIn("running :", row)
+                self.assertIn(finding, row)
 
     # --- converging on drift ------------------------------------------------------------
 
