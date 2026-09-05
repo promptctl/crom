@@ -3785,7 +3785,7 @@ class CliTest(unittest.TestCase):
         profile_dir.mkdir(parents=True)
 
         events: list[str] = []
-        real_lock = cli.seed.profile_lock
+        real_lock = operations.seed.profile_lock
 
         @contextlib.contextmanager
         def tracking_lock(profile):
@@ -3794,10 +3794,14 @@ class CliTest(unittest.TestCase):
                 yield
             events.append("unlock")
 
+        # Patched on `operations`, which is where the removal now performs all three
+        # steps. Reaching through `cli` still worked for two of them — the module objects
+        # are shared — and would have gone on passing while naming a module that no longer
+        # takes the lock. [FRAMING:representation]
         with (
-            mock.patch("crom.cli.seed.profile_lock", tracking_lock),
-            mock.patch("crom.cli.chrome.kill", lambda _p: events.append("kill") or ()),
-            mock.patch("crom.cli.shutil.rmtree", lambda _p: events.append("rmtree")),
+            mock.patch("crom.operations.seed.profile_lock", tracking_lock),
+            mock.patch("crom.operations.chrome.kill", lambda _p: events.append("kill") or ()),
+            mock.patch("crom.operations.shutil.rmtree", lambda _p: events.append("rmtree")),
         ):
             self.crom("rm", "ci", "--yes")
 
@@ -3840,7 +3844,9 @@ class CliTest(unittest.TestCase):
         before = json.loads(self.crom("config", "ci", "--json"))["resolved"]
         Path(before["profile_dir"]).mkdir(parents=True)
 
-        with mock.patch("crom.cli.shutil.rmtree", side_effect=OSError(66, "Directory not empty")):
+        with mock.patch(
+            "crom.operations.shutil.rmtree", side_effect=OSError(66, "Directory not empty")
+        ):
             error = self.failure("rm", "ci", "--yes")
 
         # `rm` carries no `--json`, so this slug reaches no envelope and the rendered
