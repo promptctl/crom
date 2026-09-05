@@ -198,6 +198,13 @@ def _group_by_user_data_dir(ps_output: str) -> dict[str, tuple[int, ...]]:
     return {directory: tuple(pids) for directory, pids in found.items()}
 
 
+# One column list for every reading, so the two questions crom puts to `ps` are answered
+# from rows of the same shape and a caller can run both parsers over one reading instead of
+# taking two. `etime` is carried even where only the directory is wanted, because a second
+# format would be a second thing to keep in step. [LAW:one-source-of-truth]
+_PS_COLUMNS = "pid=,etime=,command="
+
+
 def _ps(columns: str) -> str:
     """One reading of the whole process table, in the columns the caller asks for.
 
@@ -242,10 +249,10 @@ def scan() -> dict[str, tuple[int, ...]]:
     One `ps` call answers the liveness question for every profile at once, so listing
     twenty profiles costs one process scan rather than twenty.
     [LAW:one-source-of-truth] this is the only place crom reads the process table for
-    *which browsers exist*; `uptimes` below reads it for how long one has been up, which
+    *which browsers exist*; `uptimes_on` below reads it for how long one has been up, which
     is a second question and not a second authority.
     """
-    return _group_by_user_data_dir(_ps("pid=,command="))
+    return _group_by_user_data_dir(_ps(_PS_COLUMNS))
 
 
 # `ps` prints elapsed time as `[[DD-]HH:]MM:SS`, and the two leading fields drop out
@@ -271,36 +278,53 @@ def _elapsed(text: str) -> timedelta | None:
 
 
 def _group_elapsed(ps_output: str) -> dict[int, timedelta]:
-    """Parse `pid=,etime=` output into durations keyed by pid.
+    """Parse a `ps` reading into durations keyed by pid.
 
     Pure and separate from the `ps` call for the reason `_group_by_user_data_dir` is: the
     parsing is the part with the edge cases. [LAW:effects-at-boundaries]
 
+    Reads the elapsed column and ignores whatever follows it, so this and
+    `_group_by_user_data_dir` take their two different facts from rows of one shape. Split
+    on whitespace rather than on one space: `ps` right-aligns the pid column, so the gap
+    before the elapsed time is as wide as the widest pid on the machine.
+
     A line that does not parse is dropped rather than defaulted. `ps` prints a header-less
-    two-column table here and every line of it is a process, so a line crom cannot read is
-    a process crom cannot time — and a zero would be a duration-shaped void, published as
-    "up 0s" beside a browser that has been running for days.
+    table here and every line of it is a process, so a line crom cannot read is a process
+    crom cannot time — and a zero would be a duration-shaped void, published as "up 0s"
+    beside a browser that has been running for days.
     """
     timed = {}
     for line in ps_output.splitlines():
-        pid, _, etime = line.strip().partition(" ")
-        elapsed = _elapsed(etime) if pid.isdigit() else None
-        if elapsed is not None:
-            timed[int(pid)] = elapsed
+        match line.split(maxsplit=2):
+            case [pid, etime, *_] if pid.isdigit() and (up := _elapsed(etime)) is not None:
+                timed[int(pid)] = up
     return timed
 
 
-def uptimes() -> dict[int, timedelta]:
-    """How long every running process has been up, keyed by pid.
+def uptimes_on(profile_dir: Path) -> dict[int, timedelta]:
+    """How long each main Chrome on this user-data-dir has been up, keyed by pid.
 
     The second question crom puts to the process table, and a separate reading because it
     is a separate question: `scan` asks which browsers exist and this asks how long one of
-    them has been there. Total over the table rather than over a caller's pids, so a
-    caller indexes it and a pid that is missing means the process is gone — the same shape
-    `scan` has, and the honest one, since these are two moments and a pid can die between
+    them has been there. A caller indexes it, and a pid that is missing means the process
+    is gone — the honest shape, since these are two moments and a browser can exit between
     them. [FRAMING:representation] a pid absent from this reading is a fact, not a gap.
+
+    Scoped to the directory rather than to the whole process table, because a bare pid is
+    not a stable name for a process. Pids are reused, and nothing holds crom's two readings
+    to one moment — a machine that suspends between them puts hours in the gap and a
+    wrapped pid counter on the far side of it. Asked for the whole table, a pid handed on
+    to some unrelated process answers with a stranger's uptime under the browser's name;
+    asked this way it is simply absent, which `cli._process_line` already reports as a
+    process no longer there.
+
+    Both parsers run over one reading, so which processes are this profile's and how long
+    they have been up are read at the same moment and cannot disagree.
+    [LAW:one-source-of-truth]
     """
-    return _group_elapsed(_ps("pid=,etime="))
+    reading = _ps(_PS_COLUMNS)
+    mine = set(_group_by_user_data_dir(reading).get(str(profile_dir), ()))
+    return {pid: up for pid, up in _group_elapsed(reading).items() if pid in mine}
 
 
 def find_pids_for_dir(profile_dir: Path) -> tuple[int, ...]:
@@ -569,7 +593,8 @@ def _devtools_version(reply: bytes) -> _Version | None:
         return None
     if not websocket.startswith("ws://"):
         return None
-    return _Version(str(document.get("Browser") or UNNAMED_BROWSER), websocket)
+    return _Version(printable(str(document.get("Browser") or UNNAMED_BROWSER)),
+                    printable(websocket))
 
 
 def _names_a_browser(reply: bytes) -> bool:
@@ -587,6 +612,35 @@ class Tab:
 
     title: str
     url: str
+
+
+def _tab_in(target: dict) -> Tab | None:
+    """One open page as a listing named it, or nothing when it would not say what the
+    page is.
+
+    A `page` target missing its title or its URL makes the whole listing unreadable rather
+    than one page invisible — dropping it would publish a tab count that is quietly short,
+    which is the failure `TARGET_LIST_BYTES` refuses a few lines above, and a browser
+    would report "no tabs open" for pages it plainly has. A placeholder would be worse
+    still: a `--json` consumer would read it as one of the browser's actual pages, and
+    crom would have invented it. [LAW:no-silent-failure]
+
+    Sanitised here because this is where the text enters. `title` is `document.title` from
+    whatever page is open — attacker-controlled, and bound for a terminal — so a listing
+    parses into strings a terminal will only ever display. [LAW:parse-dont-validate]
+    Whitespace collapses with it: these two are rendered as one line each, so a newline in
+    a title is control of the listing exactly as an escape is control of the terminal.
+    """
+    match target:
+        case {"title": title, "url": url}:
+            return Tab(_one_line(title), _one_line(url))
+        case _:
+            return None
+
+
+def _one_line(text: object) -> str:
+    """Foreign text as a single line, safe to print beside crom's own words."""
+    return " ".join(printable(str(text)).split())
 
 
 def _pages_in(reply: bytes) -> tuple[Tab, ...] | None:
@@ -610,14 +664,12 @@ def _pages_in(reply: bytes) -> tuple[Tab, ...] | None:
         return None
     match listing:
         case [*targets]:
-            return tuple(
-                Tab(str(target["title"]), str(target["url"]))
+            pages = tuple(
+                _tab_in(target)
                 for target in targets
-                if isinstance(target, dict)
-                and target.get("type") == "page"
-                and "title" in target
-                and "url" in target
+                if isinstance(target, dict) and target.get("type") == "page"
             )
+            return None if any(tab is None for tab in pages) else pages
         case _:
             return None
 

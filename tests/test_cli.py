@@ -1842,7 +1842,7 @@ class CliTest(unittest.TestCase):
         """
         with (
             mock.patch("crom.chrome.scan", return_value={directory: pids} if pids else {}),
-            mock.patch("crom.chrome.uptimes", return_value=stubs.get("uptimes", {4242: timedelta(hours=3, minutes=12)})),
+            mock.patch("crom.chrome.uptimes_on", return_value=stubs.get("uptimes", {4242: timedelta(hours=3, minutes=12)})),
             stubs["port"],
         ):
             return self.crom("status", ref, *args)

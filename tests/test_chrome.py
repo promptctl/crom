@@ -47,7 +47,11 @@ def ready_state(pids: tuple[int, ...], browser: str = BROWSER, websocket: str = 
 
 
 def ps_line(pid: int, argv) -> str:
-    """Render argv the way `ps -Ao pid=,command=` does: space-joined, boundaries lost."""
+    """Render argv the way `ps` does: space-joined, boundaries lost.
+
+    Without the elapsed column `_PS_COLUMNS` also asks for, deliberately: this parser
+    searches for `--user-data-dir` and ignores everything before it, so these tests are
+    about argv and not about which columns precede it."""
     return f"{pid} {' '.join(argv)}"
 
 
@@ -2025,6 +2029,16 @@ class PortQuestionTest(unittest.TestCase):
         listener can call itself Chrome; only a websocket makes it drivable."""
         self.assertIsNone(chrome._devtools_version(b'{"Browser": "Chrome/152.0.7977.76"}'))
 
+    def test_what_the_endpoint_calls_itself_cannot_repaint_the_terminal(self):
+        """A listener on the port is unvetted by definition, and `crom status` prints what
+        it says it is. Sanitised where the document is parsed, so everything downstream
+        holds a printable string by construction rather than by remembering to."""
+        document = b'{"Browser": "Chrome\\u001b[2J/152", "webSocketDebuggerUrl": "ws://127.0.0.1:1/x"}'
+
+        version = chrome._devtools_version(document)
+        self.assertEqual(version.browser, "Chrome[2J/152")
+        self.assertNotIn("\x1b", version.browser)
+
 
 class TabListingTest(unittest.TestCase):
     """The second question crom puts to a port, and the three answers it can get."""
@@ -2081,6 +2095,82 @@ class TabListingTest(unittest.TestCase):
 
         self.assertIsNone(chrome.tabs_on(port))
 
+    def test_a_page_the_listing_will_not_describe_makes_the_whole_listing_unreadable(self):
+        """The same failure the cap above refuses, arriving by another road: a `page` crom
+        drops for want of a title is a tab the browser has and crom does not report, and
+        the count that reaches the user is wrong and looks right. Unreadable is the honest
+        answer, and `_tab_lines` already has words for it."""
+        self.assertIsNone(
+            chrome._pages_in(
+                json.dumps(
+                    [
+                        target("page", "Example Domain", "https://example.com/"),
+                        {"type": "page", "url": "https://example.com/nameless"},
+                    ]
+                ).encode()
+            )
+        )
+
+    def test_a_page_title_cannot_repaint_the_terminal_or_forge_a_line(self):
+        """`document.title` is set by whatever page is open, so it is attacker-controlled
+        text that `crom status` prints to a terminal. Escapes are dropped by `printable`,
+        and the newline goes with them because a tab is rendered as one line — a title
+        holding one would otherwise write a line of crom's output itself."""
+        listing = json.dumps(
+            [target("page", "Bank\u001b[2J\u001b[H\n  Trusted — https://bank.example", "https://evil.example/")]
+        ).encode()
+
+        (tab,) = chrome._pages_in(listing)
+        self.assertEqual(tab.title, "Bank[2J[H Trusted — https://bank.example")
+        self.assertNotIn("\x1b", tab.title)
+        self.assertNotIn("\n", tab.title)
+
+
+class UptimeScopeTest(unittest.TestCase):
+    """Whose uptimes the second reading of the process table is about.
+
+    A bare pid is not a stable name for a process: pids are reused, and nothing holds
+    crom's two readings to one moment — a machine that suspends between them puts hours in
+    the gap and a wrapped pid counter on the far side of it.
+    """
+
+    def test_a_pid_handed_to_another_process_is_absent_rather_than_timed(self):
+        """The reading answers for this profile's browser, not for whatever now holds its
+        number. Asked across the whole table, pid 4242 below would report the uptime of a
+        web server under the browser's name — a duration that is wrong and looks right.
+        Absent, it reaches `cli._process_line`, which says the process is no longer there.
+        """
+        reading = (
+            " 4242 00:00:09 /usr/bin/python3 -m http.server\n"
+            " 4243 01:02:03 /Applications/Chrome.app/Contents/MacOS/Chrome --user-data-dir=/tmp/mine\n"
+        )
+        with mock.patch.object(chrome, "_ps", return_value=reading):
+            self.assertEqual(
+                chrome.uptimes_on(Path("/tmp/mine")),
+                {4243: timedelta(hours=1, minutes=2, seconds=3)},
+            )
+
+    def test_another_profiles_browser_is_not_this_profiles_uptime(self):
+        """Two crom profiles are two user-data-dirs and two browsers. The directory is the
+        identity `scan` groups by, and this reading is keyed on the same one so a status
+        line cannot borrow a sibling profile's clock."""
+        reading = (
+            " 4243 01:02:03 /Applications/Chrome.app/Contents/MacOS/Chrome --user-data-dir=/tmp/mine\n"
+            " 4244 05:00:00 /Applications/Chrome.app/Contents/MacOS/Chrome --user-data-dir=/tmp/theirs\n"
+        )
+        with mock.patch.object(chrome, "_ps", return_value=reading):
+            self.assertEqual(list(chrome.uptimes_on(Path("/tmp/mine"))), [4243])
+
+    def test_the_directory_and_the_clock_are_read_from_one_reading(self):
+        """Both parsers run over one `ps` call, so which processes are this profile's and
+        how long they have been up are read at the same moment. Two calls would put a third
+        gap between two facts this command reports as one. [LAW:one-source-of-truth]"""
+        reading = " 4243 01:02:03 /Applications/Chrome --user-data-dir=/tmp/mine\n"
+        with mock.patch.object(chrome, "_ps", return_value=reading) as ps:
+            chrome.uptimes_on(Path("/tmp/mine"))
+
+        ps.assert_called_once_with(chrome._PS_COLUMNS)
+
 
 class ElapsedTest(unittest.TestCase):
     """How long `ps` says a process has been up, parsed into something a reader can use."""
@@ -2101,11 +2191,25 @@ class ElapsedTest(unittest.TestCase):
         self.assertIsNone(chrome._elapsed("not-a-duration"))
         self.assertEqual(chrome._group_elapsed("4242 00:28\n4243 whenever\nnonsense\n"), {4242: timedelta(seconds=28)})
 
+    def test_the_elapsed_column_is_read_out_of_the_row_crom_actually_asks_for(self):
+        """`_PS_COLUMNS` puts the command after the elapsed time, and this parser takes the
+        second field and stops. Reading to the end of the line instead would hand `_elapsed`
+        a whole argv and drop every process on the machine."""
+        self.assertEqual(
+            chrome._group_elapsed("4242 00:28 /Applications/Chrome --user-data-dir=/x\n"),
+            {4242: timedelta(seconds=28)},
+        )
+
     def test_every_elapsed_time_this_machine_prints_is_one_crom_can_read(self):
         """The parser against its actual producer, on one reading so the table cannot move
         between the two halves. A format `ps` uses and crom does not know would drop real
         processes out of the answer, silently, and only here would anyone find out.
         [LAW:verifiable-goals]
+
+        Asked without the command column, which is the only shape where one line is one
+        process: an argv may itself contain a newline, so a reading crom takes for real
+        holds more lines than the machine has processes and the count below would be
+        measuring `ps` formatting rather than this parser's vocabulary.
         """
         reading = subprocess.run(
             ["ps", "-Ao", "pid=,etime="], capture_output=True, text=True, check=True

@@ -190,10 +190,10 @@ def _probe_option(command):
     """The `--no-probe` flag: one declaration, and the flag stops being a flag right here.
 
     The callback returns the `chrome.PortReading` the command will use rather than the
-    boolean the user typed, so what travels into the six commands carrying this option is
-    the reading itself. Each of them then calls `chrome.health`/`health_of` the same way
-    with a different value, instead of five copies of a rule turning a bool into a
-    behaviour — which is five places for the sixth command to be written without.
+    boolean the user typed, so what travels into the commands carrying this option is the
+    reading itself. Each of them then calls `chrome.health`/`health_of` the same way with a
+    different value, instead of one copy per command of a rule turning a bool into a
+    behaviour — which is one more place for the next command to be written without.
     [LAW:single-enforcer] the translation happens once, where click already parses.
 
     [LAW:dataflow-not-control-flow] and it is the same reason the reading is a value at
@@ -1068,7 +1068,7 @@ def status_cmd(session: Session, ref: str, reading: chrome.PortReading, as_json:
     # comes after both. A pid that dies in the gap is reported as gone rather than timed at
     # zero — `_process_line`. [LAW:no-ambient-temporal-coupling]
     pids = chrome.find_pids(profile)
-    timing = chrome.uptimes()
+    timing = chrome.uptimes_on(profile.profile_dir)
     state = chrome.health_of(profile, pids, reading)
     published, said = _browser_facts(profile, state)
     _emit(

@@ -200,8 +200,9 @@ crom declined from one it carried out. No key echoes the flag back: a caller alr
 which flags it passed, and those two describe the outcome without it.
 
 `crom status` asks a profile's port what is on it and reports the answer. `heard` is one
-sentence saying what the port did or said, and it is the only one of the five that is
-always filled in. `browser` is what the CDP endpoint calls itself, `Chrome/152.0.7977.76`,
+sentence saying what the port did or said, and it is always filled in. Only `browser`,
+`websocket` and `tabs` go `null`; `processes` is an array, empty when nothing is running.
+`browser` is what the CDP endpoint calls itself, `Chrome/152.0.7977.76`,
 and `websocket` is the browser websocket URL a client connects by,
 `ws://127.0.0.1:9228/devtools/browser/45e0cffe-…`. Both come out of the `/json/version`
 document the reachability probe already fetches, which crom used to read for a yes or no
