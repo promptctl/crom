@@ -110,7 +110,7 @@ overrides discovery entirely.
 `crom up` is idempotent: it launches if nothing is running and reports the live port
 either way, so a script can call it unconditionally. Calling it after editing `.crom.toml`
 applies the edit — a browser running something other than what the config now resolves to
-is stopped and started again on the current command line, on the same port.
+is stopped and started again on the current command line, port included.
 
 ```bash
 eval "$(crom env dev)"        # see below for what it exports
