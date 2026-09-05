@@ -122,6 +122,27 @@ class VerdictTest(DriftTestCase):
         self.assertIsInstance(verdict, drift.Unmeasured)
         self.assertEqual(verdict.finding, launched.read(self.profile_dir).why)
 
+    def test_a_record_naming_a_switch_twice_is_unmeasured_not_called_a_reordering(self):
+        """The border check is what makes the reordering sentence true rather than usual.
+
+        A record naming `--f` twice is unequal to a clean resolution by `==` and collapses
+        to the same entry map, so with nothing refusing it this printed `drifted — its
+        flags are in a different order` about a record that was corrupt, not reordered —
+        a sentence saying something untrue about the file it describes.
+        [FRAMING:representation] `launched.read` refuses it, so the only way to reach that
+        sentence really is a reordering.
+        """
+        current = profile(self.profile_dir, "--f=2")
+        launched.record(
+            self.profile_dir,
+            launched.Launch(argv=(current.argv[0], "--f=1", *current.argv[1:]), env={}),
+        )
+
+        verdict = drift.of(current, RUNNING)
+
+        self.assertIsInstance(verdict, drift.Unmeasured)
+        self.assertIn("more than once", verdict.finding)
+
 
 class NamingTest(DriftTestCase):
     """What a drifted verdict says, once the verdict itself is settled."""

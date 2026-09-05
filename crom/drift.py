@@ -136,7 +136,8 @@ class Drifted:
     `Launch` values is what decides drift, and it sees one thing the entry map below
     deliberately does not — the order flags sit in on the command line. Two launches
     emitting the same switches in a different order are unequal and have no differing
-    entry, so the sentence says so instead of trailing off after a dash.
+    entry, so the sentence says so instead of trailing off after a dash — and that is the
+    only way here, since neither side can name a switch twice.
     """
 
     slug: ClassVar[str] = "drifted"
@@ -217,9 +218,9 @@ def _entries(launch: Launch) -> dict[str, str]:
 
     Keyed by switch name and not by argv position: a config that changes `--window-size`
     from `800,600` to `1280,800` moved one answer, and a positional diff would report it
-    as one switch removed and an unrelated one added. Sound because crom emits each Chrome
-    switch exactly once — `flags.layer` refuses a stanza that sets one twice and
-    `flags.compose` resolves the layers per switch — so a name cannot address two entries.
+    as one switch removed and an unrelated one added. Sound on both sides because a name
+    cannot address two entries: `flags.layer` refuses a stanza that sets a switch twice, and
+    `launched.read` refuses a record that names one twice.
 
     `argv[:1]` rather than `argv[0]`: this is the one place a record that has been
     hand-edited down to nothing reaches, and a record with no executable in it should

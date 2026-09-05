@@ -130,6 +130,8 @@ class UnusableRecordTest(unittest.TestCase):
             "missing its env": json.dumps({k: v for k, v in good.items() if k != "env"}),
             "carrying an env that is not a table": json.dumps({**good, "env": []}),
             "carrying a non-string env value": json.dumps({**good, "env": {"PORT": 9300}}),
+            "naming one switch twice": json.dumps({**good, "argv": ["/chrome", "--f=1", "--f=2"]}),
+            "repeating a valueless switch": json.dumps({**good, "argv": ["/chrome", "--x", "--x"]}),
         }
         for described, content in damaged.items():
             with self.subTest(described):
@@ -139,6 +141,45 @@ class UnusableRecordTest(unittest.TestCase):
 
                 self.assertIsInstance(answer, launched.Unknown)
                 self.assertIn(str(self.record), answer.why)
+
+    def test_a_switch_named_twice_is_refused_rather_than_quietly_collapsed(self):
+        """A duplicate is not a launch crom composed, and a consumer keying by switch
+        cannot see it: `drift` compares by switch name, so a collapsed duplicate would let
+        two different launches read as one — and be explained as a reordering, which is a
+        sentence about a file that was corrupt, not reordered. The invariant is the
+        type's, so no consumer has to assert it. [LAW:parse-dont-validate]
+        """
+        self.record.write_text(
+            json.dumps(
+                {"version": launched.SCHEMA_VERSION, "argv": ["/chrome", "--f=1", "--f=2"], "env": {}}
+            )
+        )
+
+        answer = launched.read(self.profile_dir)
+
+        self.assertIsInstance(answer, launched.Unknown)
+        self.assertIn("more than once", answer.why)
+
+    def test_two_switches_sharing_a_prefix_are_not_one_switch_named_twice(self):
+        """Split at the first `=`, which is `Flag`'s rule — so `--f` and `--f-g` are two.
+
+        Read through the same parser the comparison uses, so the border and the consumer
+        cannot come to disagree about where a switch ends. [LAW:one-source-of-truth]
+        """
+        launched.record(self.profile_dir, launched.Launch(("/chrome", "--f=1", "--f-g=2"), {}))
+
+        self.assertIsInstance(launched.read(self.profile_dir), launched.Launch)
+
+    def test_a_record_with_no_argv_at_all_is_not_read_as_a_repeated_switch(self):
+        """The uniqueness check spans `argv[1:]`, which is empty here rather than negative.
+
+        Hand-edited down to nothing is a shape `drift` handles — it reports an executable
+        the current side has and the record does not — so this must not be diverted into
+        the duplicate arm on the way. Total by construction, not by a guard.
+        """
+        launched.record(self.profile_dir, launched.Launch((), {}))
+
+        self.assertEqual(launched.read(self.profile_dir), launched.Launch((), {}))
 
     def test_a_record_crom_cannot_open_is_not_a_traceback(self):
         """`read` promises not to raise, and the filesystem is the half it does not author."""
