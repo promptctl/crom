@@ -153,10 +153,13 @@ in a config and in your shell, and `CROM_REF` is the joined `namespace/name`.
 holds the profile's directory. `ready` means one does *and* a browser crom can drive
 answered on the port. `unreachable` means the process is there and the port is not — a
 browser still starting up, one shutting down, one wedged, or a port some other program has
-taken. `running` is the short answer, true wherever a process holds the directory, and it
-is read off `state`, so the two can never disagree. It is what crom used to publish alone,
-and alone it cannot tell you the one thing you need: an agent that connects to an
-`unreachable` profile hangs.
+taken — and `crom status` prints what the port did or said, which tells a stranger holding
+the port from plain silence. It does not separate starting up from shutting down from
+wedged: all three are silence, and silence reads the same whichever it is.
+`running` is the short answer, true wherever a process holds the directory, and it is read
+off `state`, so the two can never disagree. It is what crom used to publish alone, and
+alone it cannot tell you the one thing you need: an agent that connects to an `unreachable`
+profile hangs.
 
 `--no-probe` reports what the process table says and leaves the CDP port unasked, for a
 caller that must not touch the network and for anyone who wants a listing to stay purely
@@ -174,14 +177,15 @@ because that wait is how it knows the launch worked: `crom up --no-probe` on a s
 profile launches, waits, and then reports `unprobed`. The flag governs the state crom
 reports, not the launch handshake.
 
-Four commands add keys to that record. `crom restart --json` and `crom down --json` add
+Five commands add keys to that record. `crom restart --json` and `crom down --json` add
 `stopped`, the pids they killed, empty when the profile was not running — what a run took
 down is a fact about the act, and the record describes the profile. `crom show --json`
 adds `started`, whether it had to launch the browser first, and `windows`, how many came
 forward — zero for a headless profile, which is raised successfully and simply has no
 window to show for it. `crom up --json` adds two: `found`, the drift verdict it reached,
 and `stopped`, the pids its relaunch replaced — the same key the two above publish, with
-the same meaning, and empty unless this run actually relaunched.
+the same meaning, and empty unless this run actually relaunched. `crom status --json` adds
+five: `heard`, `browser`, `websocket`, `tabs` and `processes`.
 
 `found` carries the `{"verdict", "finding", "changes"}` object described below, the one
 `crom list` and `crom config` publish under the key `drift`, and it is spelled differently
@@ -196,6 +200,39 @@ would go silent in exactly the run that was asked to report drift. `"found":
 `--no-restart` run that found drift, and that pair is how a consumer tells a convergence
 crom declined from one it carried out. No key echoes the flag back: a caller already knows
 which flags it passed, and those two describe the outcome without it.
+
+`crom status` asks a profile's port what is on it and reports the answer. `heard` is one
+sentence saying what the port did or said, and it is always filled in. Only `browser`,
+`websocket` and `tabs` go `null`; `processes` is an array, empty when nothing is running.
+`browser` is what the CDP endpoint calls itself, `Chrome/152.0.7977.76`,
+and `websocket` is the browser websocket URL a client connects by,
+`ws://127.0.0.1:9228/devtools/browser/45e0cffe-…`. Both come out of the `/json/version`
+document the reachability probe already fetches, which crom used to read for a yes or no
+and throw away, and both are `null` whenever no browser crom can drive answered — which
+includes a port some other program is listening on, where something did answer and none
+of it was a browser. `tabs` is an array of `{"title", "url"}` objects, one per page the
+browser has open — CDP targets of type `page`
+and nothing else, because a browser showing a single new tab also carries omnibox popups,
+extension background pages, iframes and service workers behind it, and counting those would
+report five tabs open on a browser nobody has touched.
+
+`tabs` is `null` whenever no drivable browser answered, and `null` again when a browser
+answered the version request and then would not list its targets; an empty array is a
+browser that answered and has no pages open, so read `state` to tell those two apart.
+`processes` is an array of `{"pid", "uptime_seconds"}` objects, one per pid in `pids`,
+read from `ps`, where
+`uptime_seconds` is `null` for a pid `ps` no longer knows — which happens when the browser
+exits between crom's two readings of the process table. A browser that will not answer
+costs you the port's half and none of the process table's: `state`, `pids` and `processes`
+are reported whatever CDP is doing, while `browser`, `websocket` and `tabs` go `null`
+together. `--no-probe` arrives at the same place from the other side, since the state then
+reads `unprobed` and crom opens no socket at all.
+
+Nothing is guessed and nothing is stored — every fact is read at the moment you ask.
+`websocket` is the one that needs it that way: the browser takes a new URL every time it
+restarts, so a copy saved anywhere is wrong from the next restart onward, and the only
+place to read it is the moment you connect. The port is the part that does not move, which
+is what `crom port` hands out.
 
 `crom list --json` gives an array, but not every element has that shape. A profile that
 could not be resolved appears as `{"namespace", "profile", "ref", "error"}`, and with
@@ -432,10 +469,10 @@ unfamiliar reason still lands somewhere sensible.
 
 Not every failure gets an envelope, and the rule is that one appears exactly when a
 command that takes `--json` was given it and parsed it. `up`, `down`, `restart`, `show`,
-`list`, `config` and `doctor` take the flag; `add`, `rm`, `init`, `port`, `env`, `mcp`,
-`forget`, `release` and `clean` answer in prose only. Bad usage — exit `2`, an unknown
-flag or a missing argument — is parsing itself failing, so the `--json` on that line was
-never understood either: there is no flag to honour, and the answer stays prose.
+`list`, `status`, `config` and `doctor` take the flag; `add`, `rm`, `init`, `port`, `env`,
+`mcp`, `forget`, `release` and `clean` answer in prose only. Bad usage — exit `2`, an
+unknown flag or a missing argument — is parsing itself failing, so the `--json` on that
+line was never understood either: there is no flag to honour, and the answer stays prose.
 `crom --version` is not a command and answers in prose for the same reason. A broken pipe
 is deliberately outside all of it: when `crom list | head` loses its reader mid-write,
 crom ends silently with exit `1` and nothing on either stream, because a reader that has
@@ -459,6 +496,8 @@ crom restart [REF]            stop it and start it again on its current config
 crom show [REF]               bring its window to the front, launching it if needed
 crom list [--all]             profiles addressable from here, and how each stands against
                               its config; --all covers every namespace
+crom status [REF]             what the browser on its port actually is — pids and uptimes,
+                              what CDP calls itself, and the pages it has open
 crom add NAME [--seed SEED]   declare a profile in the config governing this directory
 crom rm REF                   stop it if running, undeclare it, release its port, delete its data
 crom init [NS] [--seed SEED]  write a .crom.toml here
@@ -486,12 +525,12 @@ and a directory path, each spelled the way `crom doctor` printed it.
 `crom rm` lands wholly before it or wholly after rather than in the gap between the stop
 and the start. Typing `crom down && crom up` leaves that gap open.
 
-`crom up`, `crom restart`, `crom show`, `crom list` and `crom config` each take
-`--no-probe`, which reports a running profile as `unprobed` — read off the process table,
-with its CDP port left unasked — instead of `ready` or `unreachable`. `crom down` does not
-take it, because there is no probe there to suppress: `down` reports `stopped` from what
-it established itself, its kill having returned only once the process was gone and the
-port free.
+`crom up`, `crom restart`, `crom show`, `crom list`, `crom status` and `crom config` each
+take `--no-probe`, which reports a running profile as `unprobed` — read off the process
+table, with its CDP port left unasked — instead of `ready` or `unreachable`. `crom down`
+does not take it, because there is no probe there to suppress: `down` reports `stopped`
+from what it established itself, its kill having returned only once the process was gone
+and the port free.
 
 `crom show` is the one macOS-only command. Every crom-managed Chrome is the same
 application bundle, so `activate` cannot pick between them — it raises whichever instance
