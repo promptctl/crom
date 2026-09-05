@@ -1667,13 +1667,12 @@ def release_cmd(key: str):
     something that is not a legal `namespace/name` at all, and those are the very ones
     nothing else can reach.
 
-    Crom releases a reservation `crom doctor` calls `orphaned`, and only while nothing is
-    on its port. It refuses one a config still declares — `crom rm <ref>` undeclares and
-    releases together — and one whose own browser is still running, which you close
-    first. It also refuses a reservation it could not check or could not probe: a
-    released port goes to the next profile that asks for one and never comes back, so
-    crom will not release on evidence it never got. `crom doctor` says which of those any
-    reservation is.
+    Crom releases a reservation `crom doctor` calls `orphaned`. It refuses one a config
+    still declares — `crom rm <ref>` undeclares and releases together — and one whose
+    own browser is still running, which you close first. It also refuses a reservation
+    it could not check or could not probe: a released port goes to the next profile that
+    asks for one and never comes back, so crom will not release on evidence it never
+    got. `crom doctor` says which of those any reservation is.
     """
     match reclaim.releasable(key, doctor.survey()):
         case reclaim.Refused(reason=reason, why=why):
