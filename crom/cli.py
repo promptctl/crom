@@ -53,6 +53,7 @@ from .model import (
     Emitted,
     FailedProfile,
     Fields,
+    Flag,
     Layer,
     NotFound,
     ProfileRef,
@@ -415,6 +416,35 @@ def _emit(as_json: bool, payload, lines: list[str]) -> None:
     click.echo(_json_text(payload) if as_json else "\n".join(lines))
 
 
+def _pid_list(pids: tuple[int, ...]) -> str:
+    """How a profile's PIDs read in a message — one spelling, for the three that print them."""
+    return ", ".join(map(str, pids))
+
+
+def _supplied(change: drift.Change, notes: dict[str, str]) -> str:
+    """Which layers decided the current value of a changed switch, as a clause beside it.
+
+    `drift` carries no provenance and could not: it compares a record written at launch
+    against what the config resolves to now, and only the current side still has layers to
+    name — the recorded side was decided by a config file this crom no longer has. So the
+    clause is attached here, from the same `_note` `crom config` prints, and only to the
+    side that resolves. [LAW:one-source-of-truth] one rendering of where a flag came from.
+
+    Joined on the whole flag text and confirmed against the subject, because `notes` holds
+    only what a launch *emits*: a change about `chrome binary` or an `env` variable has no
+    layer clause to find, and its value could spell a flag text that does. `drift` keys its
+    own entries by kind to make that collision unrepresentable and deliberately does not
+    publish the kind, so re-deriving it from the switch is what keeps a variable set to
+    `--window-size=800,600` from borrowing `--window-size`'s provenance.
+    """
+    # `or ""` only to keep the parse total. Both mean "no flag text to look up" here; the
+    # `None`-is-not-`""` distinction `Change` protects is about what a config said, not
+    # about whether a layer clause exists to find.
+    resolves = change.resolves or ""
+    supplies = notes.get(resolves, "") * (Flag.parse(resolves).switch == change.subject)
+    return f" ({supplies})" * bool(supplies)
+
+
 def _status(profile: ResolvedProfile, live: dict[str, tuple[int, ...]]) -> tuple[bool, tuple[int, ...]]:
     pids = live.get(str(profile.profile_dir), ())
     return bool(pids), pids
@@ -512,21 +542,31 @@ def main():
 
     Every command asks for a state, not a change, so asking twice is not an
     error: `crom init` in a project that has a .crom.toml, `crom add` of a
-    profile already declared, and `crom up` of a browser already running all
-    report what is there and exit 0. Only a request for something *different*
-    from what exists is refused — `crom add dev --port 9500` when `dev` is
-    declared on another port names the difference and changes nothing.
+    profile already declared, and `crom up` of a browser already running what
+    this config resolves to all report what is there and exit 0. A browser
+    running something else is not that state, so `crom up` stops it and
+    starts it again on the current config: edit a flag, run `crom up`, and
+    the edit is live. Only a request for something *different* from what
+    exists is refused — `crom add dev --port 9500` when `dev` is declared on
+    another port names the difference and changes nothing.
     """
 
 
-def _start_under_lock(profile: ResolvedProfile) -> tuple[bool, tuple[int, ...]]:
+def _start_under_lock(profile: ResolvedProfile) -> tuple[drift.Verdict, tuple[int, ...]]:
     """Bring a profile up, for a caller already holding `seed.profile_lock`.
 
-    Hands back whether *this* call started the browser and the PIDs it is running under,
-    rather than reporting it, because the three callers say different things about the
-    same outcome: `up` reports "Started" or "Already running", `restart` has just
+    Hands back how the browser stood when this call found it and the PIDs it is running
+    under now, rather than reporting either, because the three callers say different
+    things about the same outcome: `up` converges on the verdict, `restart` has just
     stopped whatever was there, and `show` mentions a launch only when it had to make one.
     [LAW:effects-at-boundaries] the decision is computed here and rendered at the command.
+
+    A verdict rather than the `started` boolean it replaces, because `drift.Stopped` is
+    precisely "nothing was running", which is precisely the case this launches in — so one
+    read of the process table decides both halves of the answer. A boolean beside a verdict
+    taken from a second `ps` could disagree with it, the browser quitting between the two
+    reads being all that takes, and a caller would then hold two answers to "did this call
+    start it". [LAW:one-source-of-truth]
 
     Written for a caller that already holds the lock, not one that takes it, because
     `seed.profile_lock` is `flock` on a fresh descriptor and blocks even within one
@@ -542,11 +582,11 @@ def _start_under_lock(profile: ResolvedProfile) -> tuple[bool, tuple[int, ...]]:
         click.echo(f"Creating {profile.ref} from seed '{rendered}' …", err=True)
     seed.materialize_under_lock(profile)
 
-    pids = chrome.find_pids(profile)
-    started = not pids
-    if started:
-        pids = chrome.launch(profile)
-    return started, pids
+    running = chrome.find_pids(profile)
+    # `running or launch`, and not a branch on the verdict that follows: both read the one
+    # `find_pids` above, so "nothing was running" cannot be true for the launch and false
+    # for the verdict reported beside it. [LAW:dataflow-not-control-flow]
+    return drift.of(profile, running), running or chrome.launch(profile)
 
 
 @main.command("up")
@@ -554,8 +594,20 @@ def _start_under_lock(profile: ResolvedProfile) -> tuple[bool, tuple[int, ...]]:
 @_json_option
 @click.pass_obj
 def up_cmd(session: _Session, ref: str, as_json: bool):
-    """Launch a profile, or report the running one. Idempotent."""
+    """Bring a profile up on its current config, whatever is running.
+
+    Idempotent: a browser already running what this config resolves to is reported, not
+    restarted. One running something else is stopped and started again on the current
+    config, with what moved named before anything stops. A browser crom holds no launch
+    record for is left running and reported as unmeasured — crom cannot tell what it was
+    started with, which is no grounds to kill a browser that may already match.
+    """
     profile = session.working(ref)
+    where = f"{profile.ref} on {profile.cdp_url}"
+    # Which layers decided each switch the *current* resolution emits, keyed and phrased
+    # exactly as `crom config` keys and phrases it. Built out here because it is a fact
+    # about the resolution, and nothing the lock protects can change it.
+    notes = {str(item.flag): _note(item) for item in profile.provenance.emitted}
     # Seeding, the liveness check, and the launch are one critical section. Split, two
     # concurrent `crom up` calls both see no running Chrome and both launch against the
     # same profile directory and port — and because Chrome binds the CDP port well before
@@ -563,14 +615,80 @@ def up_cmd(session: _Session, ref: str, as_json: bool):
     # "another process" when that process is the browser it was asking for. Serialized,
     # the second caller finds the first's Chrome and reports it, which is what `up` has
     # always claimed to do.
+    #
+    # The replacement below is inside the same hold for the reason `restart`'s two halves
+    # are: released in between, a concurrent `up` lands in the gap and starts the browser
+    # on the configuration this one is replacing, and an `rm` deletes the directory it is
+    # about to launch against. [LAW:no-ambient-temporal-coupling]
     with seed.profile_lock(profile):
-        started, pids = _start_under_lock(profile)
+        verdict, running = _start_under_lock(profile)
+        # The browser this call found is the browser it keeps, and only one verdict says
+        # otherwise. Stated once as the standing answer rather than repeated in the three
+        # arms that agree with it. [LAW:polishing-by-subtraction]
+        stopped, pids = (), running
+        # Four verdicts, four answers, decided and worded together: the verb is a function
+        # of the verdict only because the policy is, and split across two matches the pair
+        # could come apart — an arm saying "Relaunched" with no arm that stopped anything.
+        # [LAW:one-source-of-truth]
+        #
+        # `Unmeasured` is emphatically not a quiet `Drifted`. It says crom cannot tell what
+        # the running browser was launched with — no record, or none it can read — which is
+        # neither "nothing changed" nor "something did". Relaunching on it would kill a
+        # browser that may already match, and take the user's tabs with it, on the evidence
+        # of a crom upgrade. It is not a quiet `Matches` either, which is why it says so
+        # out loud below. [LAW:no-silent-failure]
+        match verdict:
+            case drift.Stopped():
+                lines = [f"Started {where}"]
+            case drift.Matches():
+                lines = [f"Already running {where}"]
+            case drift.Unmeasured():
+                # Said rather than swallowed: a bare "Already running" here would be crom
+                # reporting an agreement it never established, and is how a browser goes on
+                # running flags its config stopped asking for with crom appearing to have
+                # checked.
+                lines = [f"Already running {where}", f"  {verdict.finding}"]
+            case drift.Drifted():
+                # Said before acting, so the reason survives a relaunch whose start half
+                # fails: that user is left with no browser at all, and an error naming only
+                # the start would hide that crom stopped the working one they had. It
+                # doubles as the progress line for the pause while Chrome comes back.
+                # [CLI binding] stderr.
+                click.echo(f"{profile.ref} {verdict.finding}; replacing it …", err=True)
+                stopped = chrome.kill(profile)
+                # `kill` returns only once the profile holds neither process nor CDP port,
+                # so the start can follow it directly rather than racing its own teardown.
+                # Its verdict is discarded because it can only be `Stopped`: nothing is
+                # running by construction, and what a reader wants named is the drift that
+                # sent us here, which the outer `verdict` still holds.
+                _, pids = _start_under_lock(profile)
+                lines = [
+                    f"Relaunched {where} (was pid {_pid_list(stopped)}, "
+                    f"now pid {_pid_list(pids)})",
+                    # A generator over a tuple that is empty exactly when the flags moved
+                    # only in order — a real drifted state `Drifted.finding` already spells
+                    # out on the line above, so the section appears when it has something
+                    # to say and no branch decides whether it exists.
+                    # [LAW:dataflow-not-control-flow]
+                    *(f"  {change}{_supplied(change, notes)}" for change in verdict.changes),
+                ]
 
-    verb = "Started" if started else "Already running"
     _emit(
         as_json,
-        profile.describe(running=True, pids=pids),
-        [f"{verb} {profile.ref} on {profile.cdp_url}"],
+        {
+            **profile.describe(running=True, pids=pids),
+            # The verdict crom *found*, under a key that says so. `crom list` and `crom
+            # config` publish `drift`, which is how a profile stands right now; this
+            # command's answer is how it stood before this command fixed it, and reusing
+            # the name would have one key meaning two things across the JSON surface.
+            # [FRAMING:representation]
+            "found": drift.describe(verdict),
+            # What the convergence replaced, the way `restart` carries it: empty unless the
+            # verdict was `drifted`, and the only thing separating a browser this command
+            # left alone from one it swapped out under the same "running" record.
+            "stopped": list(stopped),
+        },
+        lines,
     )
 
 
@@ -592,7 +710,7 @@ def down_cmd(session: _Session, ref: str, as_json: bool):
     with seed.profile_lock(profile):
         pids = chrome.kill(profile)
     message = (
-        f"Stopped {profile.ref} (pid {', '.join(map(str, pids))})"
+        f"Stopped {profile.ref} (pid {_pid_list(pids)})"
         if pids
         else f"{profile.ref} was not running"
     )
@@ -627,17 +745,15 @@ def restart_cmd(session: _Session, ref: str, as_json: bool):
             # would hide that crom stopped the working one they had. It doubles as the
             # progress line for the pause while Chrome comes up. [CLI binding] stderr.
             click.echo(
-                f"Stopped {profile.ref} (pid {', '.join(map(str, stopped))}); "
-                f"starting it again …",
+                f"Stopped {profile.ref} (pid {_pid_list(stopped)}); starting it again …",
                 err=True,
             )
-        # The `started` flag is discarded rather than reported: `kill` has just guaranteed
-        # nothing is running, so a start here is always a start, and the interesting fact
-        # is what was stopped. That is what `stopped` carries.
+        # The verdict is discarded rather than reported: `kill` has just guaranteed nothing
+        # is running, so it can only be `Stopped` and a start here is always a start. The
+        # interesting fact is what was stopped, and that is what `stopped` carries.
         _, pids = _start_under_lock(profile)
 
-    was = ", ".join(map(str, stopped))
-    now = ", ".join(map(str, pids))
+    was, now = _pid_list(stopped), _pid_list(pids)
     message = (
         f"Restarted {profile.ref} on {profile.cdp_url} (was pid {was}, now pid {now})"
         if stopped
@@ -671,7 +787,14 @@ def show_cmd(session: _Session, ref: str, as_json: bool):
     # osascript round trip, which is the same order as the `ps` call `_start_under_lock`
     # already makes while holding it.
     with seed.profile_lock(profile):
-        started, pids = _start_under_lock(profile)
+        verdict, pids = _start_under_lock(profile)
+        # `Stopped` is the verdict for a profile with nothing running, which is exactly the
+        # case `_start_under_lock` launches in — so this reads the launch off the same
+        # observation that caused it rather than asking after the fact. `show` raises a
+        # window and does not converge: a browser whose config has moved on is the user's
+        # to replace with `crom up`, and killing it here would cost them the very window
+        # they asked to be shown. [LAW:decomposition] one purpose, said in one sentence.
+        started = isinstance(verdict, drift.Stopped)
         if started:
             # Said before the raise rather than assembled with the result afterwards, so
             # the fact survives a raise that fails. Withheld Automation access is likeliest
