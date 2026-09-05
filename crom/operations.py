@@ -6,11 +6,10 @@ the work and hand back what happened, leaving the sentence a user reads to be wr
 somewhere else.
 
 They take what is already resolved: a `ResolvedProfile`, never a `Session` and never a ref
-string, because parsing a reference is the caller's half of the job. `add` is the one
-exception the rule implies rather than admits — it is what *creates* a declaration for the
-others to resolve, so it takes the scope and the request instead. A future operation that
-mutates an existing profile takes the resolved profile; do not read `add`'s signature as
-licence otherwise.
+string, because parsing a reference is the caller's half of the job. What an operation
+*creates* has nothing resolved to take — so `add` takes the scope and the request, `init`
+the directory. A future operation that mutates an existing profile takes the resolved
+profile; do not read either signature as licence otherwise.
 
 What lives here rather than in a command body is the critical section. Seeding, the
 liveness read, the launch, and the replacement that may follow are one indivisible span,
@@ -27,13 +26,25 @@ back as a value. [LAW:effects-at-boundaries] the decision is computed here and r
 the command.
 """
 
+import shutil
 from dataclasses import dataclass
 from enum import Enum, auto
 from pathlib import Path
 
-from . import chrome, config, configwrite, drift, flags, report, seed
+from . import chrome, config, configwrite, drift, flags, registry, report, seed
 from . import resolve as resolver
-from .model import USER_NAMESPACE, Layer, ProfileSpec, Reason, ResolvedProfile, Scope
+from .model import (
+    DEFAULT_SEED,
+    DEFAULTS_STANZA,
+    USER_NAMESPACE,
+    Layer,
+    ProfileSpec,
+    Reason,
+    ResolvedProfile,
+    Scope,
+    slug_for,
+    validate_name,
+)
 
 
 class OnDrift(Enum):
@@ -111,7 +122,14 @@ class Up:
 
 
 class Declaration(Enum):
-    """Whether `add` wrote the profile's stanza or found the config already holding one.
+    """Whether this call wrote the declaration or found the file already holding one.
+
+    Shared by `add` and `init`, which are the same two endings about different subjects:
+    a profile's stanza, and the project config that names the namespace. Both are
+    idempotent, both hand back a boolean from `configwrite`, and both spend it on one
+    choice of verb. Two enums differing only in which subject their members were named
+    after is what [LAW:one-type-per-behavior] forbids — the subject is already carried by
+    which operation the caller invoked, so it is not a second thing for the value to say.
 
     An enum and not the `written` boolean `configwrite.ensure_profile` hands back, for the
     reason `OnDrift` is one: a bare bool crossing this seam asks every reader to hold which
@@ -160,6 +178,33 @@ class Add:
     outcome: Declaration
     profile: ResolvedProfile
     target: Path
+
+
+@dataclass(frozen=True)
+class Init:
+    """What a project is configured as: which ending `init` reached, the file that
+    configures it, and the two facts that file states.
+
+    `namespace` and `seed` are read back out of the file rather than echoed from the
+    request, so on the converging path they are what the project actually declares and
+    not what this call would have written. The two differ exactly when the project was
+    already initialised — which is the case a caller most needs told apart, and the one
+    a request-shaped record could not tell it. [FRAMING:representation]
+
+    `seed` is the file's own spelling of the seed, as text, because that is the only
+    form both readers need: it is compared against the rendered request and printed. A
+    parsed `Seed` would be the stronger type in general and is the wrong one here —
+    `configwrite.value_at` deliberately returns the raw TOML value so that convergence
+    does not depend on the rest of the file parsing, and re-parsing it here would put
+    that dependence back. An absent `[defaults].seed` is not missing: `config.parse`
+    reads that absence as `DEFAULT_SEED`, so it renders as the answer the next command
+    will act on.
+    """
+
+    outcome: Declaration
+    target: Path
+    namespace: str
+    seed: str
 
 
 def start_under_lock(
@@ -539,3 +584,249 @@ def add(scope: Scope, spec: ProfileSpec, log=report.to_stderr) -> Add:
     # before a port was ever claimed, which is what retired the `registry.forget` handler
     # this ordering used to need.
     return Add(Declaration.CREATED if written else Declaration.ALREADY_PRESENT, profile, target)
+
+
+def delete_directory(directory: Path, retry: str) -> None:
+    """Remove one directory crom owns, as a `CromError` rather than a traceback.
+
+    `shutil.rmtree` raises a bare `OSError` — `FileNotFoundError` for an entry that
+    vanishes mid-walk, `ENOTEMPTY` for one that appears — and the path alone does not say
+    what is left to try. Both callers meet that same race for the same reason: `rm`
+    deletes a directory a Chrome helper outliving `chrome.kill` can still be writing to,
+    and `crom clean` deletes one a seed that is still running may still be filling.
+
+    The retry sentence is the caller's, because only the caller knows what it left
+    reachable. `rm` deletes before it undeclares precisely so that a retry exists;
+    `clean` names a path that stays exactly as `crom doctor` prints it.
+
+    One reason for both, and it keeps `profile_dir_undeletable` as its published spelling:
+    a staging directory is a profile directory that never finished being built, the failure
+    is the same one, and the next move — fix what the sentence names, run the command
+    again — does not divide. A slug earns its place by separating next moves.
+    """
+    try:
+        shutil.rmtree(directory)
+    except OSError as e:
+        raise Reason.PROFILE_DIR_UNDELETABLE.error(
+            f"could not delete {directory}: {e}\n{retry}"
+        ) from e
+
+
+def rm(
+    profile: ResolvedProfile, ambient: Scope, *, keep_data: bool, log=report.to_stderr
+) -> tuple[int, ...]:
+    """Take a profile away: stop it, delete its data, release its port, undeclare it.
+
+    Hands back the PIDs it stopped — empty if nothing was running — because that is the
+    most surprising thing this does and the caller is the one with somewhere to say it.
+
+    Converges rather than refusing: this used to reject a running profile and tell the
+    user to run `crom down` first, which made the caller responsible for establishing a
+    state `rm` needs and can reach on its own, under the very lock it already takes.
+    Exporting it as a two-command ritual left an orphan-shaped hole in the other
+    direction too, since `keep_data` was the one path that refused without ever
+    explaining that the browser it left running was about to lose its declaration.
+    [LAW:no-ambient-temporal-coupling] the phase transition is this operation's to own.
+
+    The scope is derived from the profile's own namespace rather than accepted beside it,
+    so no caller can pair a profile with another scope's config and undeclare the wrong
+    file. Both halves of the identity come from one argument, the same closure `add` makes
+    over `write_target`. [LAW:types-are-the-program]
+
+    `keep_data` is required and keyword-only rather than an `OnDrift`-shaped enum, and
+    that is a judgement rather than an oversight: what `OnDrift` fixes is a *negation*
+    crossing the seam — `--no-restart` read backwards kills a browser someone asked crom
+    to spare — and `--keep-data` states what it does. Required, because the difference
+    between its values is a user's logins, cookies and history; keyword-only, because a
+    bare `True` sitting third in a call reads as nothing at all. Do not replace it with an
+    enum for symmetry with `up`.
+    """
+    scope = resolver.scope_for(profile.ref.namespace, ambient, log=log)
+    # Stopping and deleting are one critical section, for the same reason `up` holds this
+    # lock across its own check-and-launch: a concurrent `crom up` can seed and launch
+    # Chrome in the window between them, and this would otherwise delete a live browser's
+    # user-data-dir out from under it — a process crom can no longer find or stop, writing
+    # into a directory that no longer exists.
+    #
+    # The lock starts here and not before, so a caller may take as long as it likes asking
+    # its user whether to go ahead: holding it across an interactive prompt would block
+    # every other crom process for as long as the human takes to answer. Which is why
+    # `kill` runs unconditionally rather than under a liveness read taken before that
+    # question — such a read is stale by construction, and a Chrome started while the
+    # question was on screen must not survive the answer.
+    # [LAW:dataflow-not-control-flow] `chrome.kill` returns an empty tuple when there was
+    # nothing to stop, so the same operation runs every time and only its result varies.
+    with seed.profile_lock(profile):
+        stopped = chrome.kill(profile)
+        # Data first, while the profile is still fully declared. `rm` resolves by name
+        # before it does anything, so a delete that failed partway after the declaration
+        # was gone left a half-removed directory belonging to a profile no command could
+        # name — unreachable by the `crom rm` that would have retried it. Deleting first
+        # inverts that: a failure here leaves everything nameable and the command
+        # repeatable, and a failure *after* a successful delete leaves a declared profile
+        # whose directory the next `crom up` simply re-seeds. Same principle the comment
+        # below applies to the other two steps — between interruptible steps, take the
+        # one whose failure is recoverable.
+        if not keep_data and profile.profile_dir.exists():
+            delete_directory(
+                profile.profile_dir,
+                f"'{profile.ref}' is still declared — run `crom rm {profile.ref}` again.",
+            )
+        # Release the reservation before removing the declaration, not after. Both
+        # orderings can be interrupted, but they strand different things: undeclaring
+        # first leaves a port held by a profile no longer nameable, so no command can
+        # reach it to retry. Releasing first leaves a declared profile without a
+        # reservation, which the next resolve heals by assigning one. Between two
+        # interruptible steps, take the one whose failure is recoverable.
+        registry.forget(str(profile.ref))
+        configwrite.remove_profile(config.write_target(scope), profile.ref.name)
+    return stopped
+
+
+def init(here: Path, namespace: str | None, seed_text: str | None) -> Init:
+    """Give a directory its own namespace by writing a project config into it.
+
+    Idempotent, the way `add` is: a directory that already has a config is reported
+    rather than rewritten, and a request asking that file for something it does not say
+    is refused rather than reported as done.
+
+    Takes the directory and nothing derived from it, so every fact about the config file
+    — where it goes, whether the project is already initialised, and what a relative
+    `--seed` is anchored on — comes from one argument and from one look at the disk.
+    `config.init_target` reads the filesystem, so a caller that computed the target and
+    passed it alongside `here` would be handing over a second, older answer: a `crom
+    init` racing this one can create `.crom/config.toml` in between, and the seed would
+    then be rendered against a directory this call is not writing to — `render_seed`
+    falling back to this machine's absolute path in a file meant to be committed. Passing
+    the target instead of `here` closes the race and opens a worse hole, since a target
+    outside `here` becomes expressible. [LAW:types-are-the-program]
+
+    Which is why the seed arrives as *text* where `add` takes a parsed `ProfileSpec`. It
+    is still crom's own vocabulary and not argv — `fresh`, `chrome:<Profile>`, `./path`
+    is the spelling the config file itself holds, and `config.parse_seed` is the one
+    border both readers cross. What a caller cannot supply is the anchor a relative path
+    is resolved against, because that is the target's own directory. [LAW:single-enforcer]
+
+    `namespace` is what the user *stated*, `None` when they stated nothing, and that
+    absence is load-bearing rather than a convenience: it is what makes a bare `crom
+    init` in an initialised project a no-op instead of a rename. The fallback below is
+    crom's guess, and a guess must not be able to contradict a name the project chose.
+    [LAW:no-silent-failure]
+
+    No `log=`: unlike `add`, which converges a vanished config on its way past, this has
+    nothing to say before its answer — the one write it makes *is* the answer. A
+    parameter offered and never used would advertise a channel that carries nothing, the
+    reason `down` declines one too. [LAW:polishing-by-subtraction]
+    """
+    target = config.init_target(here)
+    # Everything downstream anchors on the config's own directory rather than on `here`:
+    # a relative seed path is parsed and rendered against it everywhere else, and
+    # `write_default` renders it back with `render_seed(seed, path.parent)`. The two agree
+    # today only because `PROJECT_CONFIG_CANDIDATES[0]` is the bare `.crom.toml`, whose
+    # parent *is* `here`; under the `.crom/config.toml` candidate they diverge, and
+    # `--seed ./fixtures` would parse to `here/fixtures`, fail `relative_to(here/'.crom')`,
+    # and be written as this machine's absolute path into a file meant to be committed.
+    # Taken from the same `target` the write uses, so no interleaving can put the parse
+    # and the write in different directories. [LAW:one-source-of-truth]
+    base = target.parent
+    # Whether crom's guess can reach disk, and nothing else: create-or-converge is
+    # `write_default`'s `O_CREAT | O_EXCL`, and a reserved namespace in the file is
+    # `config.parse`'s to refuse. A message bought before the write, not an invariant.
+    existing = target.is_file()
+
+    # crom's guess, and the value that reaches disk when the user named nothing. Derived
+    # from the directory through `slug_for`, which is the one rule for turning arbitrary
+    # text into a name — shared with `config`'s repair path so that a reset config cannot
+    # claim a different namespace from the one `crom init` gave the project.
+    chosen = validate_name("namespace", namespace or slug_for(here.name))
+
+    # The namespace this call *claims*: what the user typed, else crom's guess — and
+    # nothing at all when a config already exists, because then the namespace is the
+    # file's and the guess is discarded a few lines below without ever reaching disk
+    # (`write_default` creates with `O_CREAT | O_EXCL`, so it cannot overwrite the name
+    # the project chose). Refusing on the discarded guess is precisely the guess
+    # contradicting that name: in a directory named `user`, `crom init myproj` wrote
+    # `namespace = "myproj"` and a bare `crom init` afterwards exited 4 saying `"user"` is
+    # reserved — about a value the user never typed and the file never held.
+    # [LAW:dataflow-not-control-flow] the refusal always runs; only the value it reads
+    # differs. A reserved namespace *in the file* is not re-litigated here either —
+    # `config.parse` refuses that at the read boundary for every command.
+    # [LAW:single-enforcer]
+    claimed = namespace or (None if existing else chosen)
+    if claimed == USER_NAMESPACE:
+        raise Reason.NAMESPACE_RESERVED.error(
+            f'"{USER_NAMESPACE}" is reserved; pass a different namespace'
+        )
+
+    # After the namespace is settled and not before, because the order is what a script
+    # branching on the exit code sees: `crom init user --seed chorme` names the reserved
+    # namespace (a conflict) rather than the unrecognised seed (a failure), and the two
+    # answer on different codes. Parsed here rather than by the caller for the reason the
+    # docstring gives — `base` is this function's to derive. [LAW:parse-dont-validate] the
+    # border still runs before the write, so a misspelt seed cannot reach the file.
+    stated_seed = (
+        None if seed_text is None else config.parse_seed(seed_text, DEFAULTS_STANZA, target, base)
+    )
+
+    # The refusal here is the kernel's `O_CREAT | O_EXCL`, not a check of ours, so two
+    # `crom init` calls racing in one directory produce one file rather than one clobbering
+    # the other. What changes is only what the loser does with the answer: it reads the
+    # winner's file back below and reports it, since a project that has the config it was
+    # asked for has had the request met.
+    wrote = configwrite.write_default(
+        target,
+        namespace=chosen,
+        seed=DEFAULT_SEED if stated_seed is None else stated_seed,
+    )
+
+    # Read back rather than echoed from the values above, because on the converging path
+    # those are what crom *would* have written and the file is what the project actually
+    # declares — and reporting a guessed namespace as though it were the project's would be
+    # the same lie the comment above refuses to write. On the path that just created the
+    # file the two are identical, so one read serves both and doubles as a check on the
+    # write. [FRAMING:representation]
+    declared_namespace = configwrite.value_at(target, "namespace")
+    # Reading a fact obliges this operation to handle every shape the file can hold it in.
+    # A hand-written `.crom.toml` with no `namespace`, or one holding a number, is a file
+    # that exists without configuring anything — so converging on it would report a
+    # namespace of `None` and send the user to a `crom up` that `config.parse` is about to
+    # refuse. Said here instead, naming the fix. [LAW:parse-dont-validate] the full
+    # diagnosis stays `config.parse`'s; this is only the checkpoint for the value this
+    # record is about to state as fact.
+    if not isinstance(declared_namespace, str):
+        raise Reason.CONFIG_INVALID.error(
+            f"{target} exists but declares no usable `namespace` "
+            f"({declared_namespace!r}), so it does not configure this project.\n"
+            f'Add namespace = "{chosen}" to it, or delete it and run '
+            f"`crom init` again."
+        )
+
+    declared = configwrite.value_at(target, "defaults", "seed")
+    # Narrowed to text once, here, rather than left raw for two readers to each coerce:
+    # the comparison below and the caller's rendering are the same fact and must not be
+    # two spellings of it. [LAW:parse-dont-validate]
+    declared_seed = (
+        configwrite.render_seed(DEFAULT_SEED, base) if declared is None else str(declared)
+    )
+
+    reject_restatement(
+        f"{target} already configures this project, and this asks to change it:",
+        (
+            ("namespace", declared_namespace, namespace),
+            (
+                "seed",
+                declared_seed,
+                None if stated_seed is None else configwrite.render_seed(stated_seed, base),
+            ),
+        ),
+        f"Edit {target} directly — crom writes a project config once and leaves it "
+        f"yours after that. Changing the namespace also moves this project's ports and "
+        f"profile directories, which is why crom will not do it for you.",
+    )
+
+    return Init(
+        Declaration.CREATED if wrote else Declaration.ALREADY_PRESENT,
+        target,
+        declared_namespace,
+        declared_seed,
+    )
