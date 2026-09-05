@@ -156,10 +156,12 @@ reading `port` and friends.
 
 Every element `crom list --json` resolves carries `drift` as well, and so does the
 `resolved` object in `crom config --json`: `{"verdict", "finding", "changes"}`. `verdict`
-is one of the four words above, `finding` is the sentence the human listing prints, and
-`changes` names each entry that moved — `{"subject", "launched", "resolves"}`, where the
-subject is a switch name, an `env NAME`, or `chrome binary`, and the side that does not
-carry the entry at all is `null`. `changes` is empty for every verdict but `drifted`.
+is `matches`, `drifted`, `unmeasured` or `stopped`; `finding` is the sentence the human
+listing prints; and `changes` names each entry that moved — `{"subject", "launched",
+"resolves"}`, where the subject is a switch name, an `env NAME`, or `chrome binary`, and
+the side that does not carry the entry at all is `null`. `changes` is empty for every
+verdict but `drifted` — and under `drifted` when the flags differ only in order, so read
+`verdict` to tell drift from agreement, never the length of `changes`.
 
 `crom doctor --json` is neither shape. It answers with an object: `registry`, the path of
 crom's port ledger, `reservations`, the rows in it, and `staging`, the half-built profile
