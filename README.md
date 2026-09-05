@@ -585,11 +585,20 @@ seeded from the Chrome you probably have open right now.
 ~/.local/state/crom/profiles/<ns>/<name>/     Chrome user-data-dirs
 ~/.local/state/crom/profiles/<ns>/<name>/crom-stderr.log
                                               what Chrome has printed since its last launch
+~/.local/state/crom/profiles/<ns>/<name>/crom-launch.json
+                                              the flags and env of its last launch
 ```
 
 `crom-stderr.log` is rewritten each time crom starts that profile's browser, and goes when
 `crom rm` deletes the profile — `crom down` leaves it, so a browser that died has an
 account of itself. A failed launch quotes its tail and names the file.
+
+`crom-launch.json` records the flags and the `env` table crom started that browser
+with — both are layered configuration you can edit between launches, and neither can be
+read back off the running process afterward. Chrome re-execs itself and rewrites its own
+argv, so what `ps` shows is Chrome's current invocation, not the one crom started. Each
+successful launch rewrites the file and a failed one leaves the previous record alone;
+`crom rm` takes it with the profile, `crom down` leaves it.
 
 `XDG_CONFIG_HOME` and `XDG_STATE_HOME` are honored.
 

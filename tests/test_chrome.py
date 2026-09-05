@@ -22,7 +22,7 @@ from itertools import chain, repeat
 from pathlib import Path
 from unittest import mock
 
-from crom import chrome
+from crom import chrome, launched
 from crom.model import CromError, ProfileRef, Reason, ResolvedProfile, SeedFresh
 from crom.resolve import build_argv
 
@@ -459,13 +459,13 @@ class ProcessBoundaryTest(unittest.TestCase):
         self.assertRegex(str(caught.exception), "could not open .*crom-stderr.log")
 
 
-class LaunchReadinessTest(unittest.TestCase):
-    """What `launch` concludes about a browser that has been started but is not up yet.
+class LaunchHarness(unittest.TestCase):
+    """A machine `launch` can be run against: a spawnable Chrome and a readable process table.
 
-    A dead Chrome and a slow Chrome used to be indistinguishable here: the wait loop
-    watched only the CDP port, so the only ending it could reach was "timed out". That
-    cost 30 seconds of wall clock and then named the wrong cause — the port, when the
-    process had been gone since millisecond twenty.
+    Shared rather than copied because two suites below need the same fake machine and
+    differ only in what they ask of it — one in what `launch` concludes about a browser
+    that has not come up, the other in what it writes down about one that did. Carries no
+    tests of its own; it is the setup those two have in common. [LAW:one-type-per-behavior]
     """
 
     def setUp(self):
@@ -495,6 +495,16 @@ class LaunchReadinessTest(unittest.TestCase):
     def record_signal(self, pid: int, sig: int) -> None:
         self.signals.append((pid, sig))
         self.running.clear()
+
+
+class LaunchReadinessTest(LaunchHarness):
+    """What `launch` concludes about a browser that has been started but is not up yet.
+
+    A dead Chrome and a slow Chrome used to be indistinguishable here: the wait loop
+    watched only the CDP port, so the only ending it could reach was "timed out". That
+    cost 30 seconds of wall clock and then named the wrong cause — the port, when the
+    process had been gone since millisecond twenty.
+    """
 
     def test_a_browser_that_answers_is_returned_with_its_pids(self):
         """The port is rarely up on the first probe, so the loop has to keep waiting."""
@@ -1103,6 +1113,83 @@ while True:
     conn.sendall(b"HTTP/1.1 200 OK\\r\\nContent-Length: %d\\r\\n\\r\\n" % len(body) + body)
     conn.close()
 '''
+
+
+class LaunchRecordTest(LaunchHarness):
+    """What a launch writes down about itself, and when.
+
+    `launch` is the only moment crom's flags and the browser they started exist together:
+    afterwards the browser has rewritten its own argv and the flags are gone from every
+    view of it the machine offers. So this is not bookkeeping beside the launch — it is the
+    launch's only output that outlives the process crom spawns.
+    """
+
+    def flagged(self, *flags: str) -> ResolvedProfile:
+        """`self.profile`, launched with flags a later reader could ask about."""
+        return dataclasses.replace(
+            self.profile,
+            argv=build_argv(Path("/chrome"), self.profile.profile_dir, self.profile.port, flags),
+        )
+
+    def test_a_successful_launch_records_the_flags_it_used(self):
+        profile = self.flagged("--disable-extensions")
+
+        with mock.patch.object(chrome, "_probe_port", return_value=chrome._Answered()):
+            chrome.launch(profile)
+
+        self.assertEqual(launched.read(profile.profile_dir), launched.Launch.of(profile))
+
+    def test_the_record_keeps_the_flags_chromes_own_argv_rewrite_throws_away(self):
+        """The observation this whole record exists because of, stated as a test.
+
+        Chrome re-execs itself and rewrites its argv, so the process table is a map of the
+        browser's current command line rather than of crom's launch. crom can still find
+        the browser there — the directory survives the rewrite, which is why `scan` keys on
+        it — but every flag crom chose is gone. Recovering the launch from `ps` is not a
+        harder implementation of this feature; it is an impossible one.
+        """
+        profile = self.flagged("--disable-extensions")
+
+        with mock.patch.object(chrome, "_probe_port", return_value=chrome._Answered()):
+            chrome.launch(profile)
+
+        rewritten = ps_line(
+            4242,
+            (
+                "/chrome",
+                f"--remote-debugging-port={profile.port}",
+                "--restart",
+                f"--user-data-dir={profile.profile_dir}",
+                "--restart",
+            ),
+        )
+        self.assertNotIn("--disable-extensions", rewritten)
+        self.assertEqual(
+            chrome._group_by_user_data_dir(rewritten), {str(profile.profile_dir): (4242,)}
+        )
+        self.assertIn("--disable-extensions", launched.read(profile.profile_dir).argv)
+
+    def test_a_launch_that_failed_leaves_the_running_browsers_record_alone(self):
+        """Written on success, so an attempt that started nothing cannot overwrite the truth.
+
+        `find_pids` misses a running browser now and then — the rewrite above is exactly how
+        — and crom then tries to launch a second Chrome that the port check refuses. Recorded
+        before the spawn, that doomed attempt would replace the record of the browser that is
+        still running, and every later comparison would be made against flags no live process
+        ever had.
+        """
+        # The directory a running browser would already have, since `launch` is not the
+        # call that creates it here — the launch that made it is the one being outlived.
+        self.profile.profile_dir.mkdir(parents=True)
+        standing = launched.Launch.of(self.flagged("--the-browser-that-is-running"))
+        launched.record(self.profile.profile_dir, standing)
+        self.proc.poll.return_value = 3
+
+        with mock.patch.object(chrome, "_probe_port", return_value=chrome._Silent()):
+            with self.assertRaises(CromError):
+                chrome.launch(self.flagged("--the-launch-that-failed"))
+
+        self.assertEqual(launched.read(self.profile.profile_dir), standing)
 
 
 class StderrCaptureTest(unittest.TestCase):

@@ -10,6 +10,11 @@ runs with no `--user-data-dir` in its argv, so `scan` cannot see it at all —
 `singleton_holder` reads Chrome's own process singleton instead. Two questions, two
 mechanisms, both about Chrome, so both live here.
 
+A successful launch also writes down what it launched with, through `launched`. That is
+not the shadow state disclaimed above: the process table is still the only authority on
+which browsers exist, and this is the one question it cannot answer, because Chrome
+rewrites its own argv (see `_USER_DATA_DIR_RE`). One fact, one authority, either way.
+
 Nothing here reads a config file or decides a port — what to launch arrives already
 resolved.
 """
@@ -28,6 +33,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import IO
 
+from . import launched
 from .model import CromError, Reason, ResolvedProfile
 
 LAUNCH_TIMEOUT_SECONDS = 30.0
@@ -752,13 +758,18 @@ def launch(profile: ResolvedProfile) -> tuple[int, ...]:
     """
     _require_port_available(profile)
     profile.profile_dir.mkdir(parents=True, exist_ok=True)
-    command = " ".join(profile.argv)
+    # Named once and spent three times — the process is started from it, the messages
+    # below quote it, and a success writes it down. A record built from a second read of
+    # `profile` would be a claim about this launch rather than a copy of it, and the two
+    # could differ without anything here being wrong. [LAW:one-source-of-truth]
+    entry = launched.Launch.of(profile)
+    command = " ".join(entry.argv)
 
     with _stderr_sink(profile.profile_dir) as sink:
         try:
             proc = subprocess.Popen(
-                profile.argv,
-                env={**os.environ, **profile.env},
+                entry.argv,
+                env={**os.environ, **entry.env},
                 stdout=subprocess.DEVNULL,
                 stderr=sink.handle,
                 start_new_session=True,
@@ -780,6 +791,12 @@ def launch(profile: ResolvedProfile) -> tuple[int, ...]:
         case _Answered():
             pids = find_pids(profile)
             if pids:
+                # The only ending that started a browser, so the only one whose flags are
+                # worth remembering: `ps` cannot be asked later, because Chrome re-execs
+                # and rewrites the argv `scan` reads (`_USER_DATA_DIR_RE` above). Written
+                # after the launch is known to have succeeded, so a failed attempt cannot
+                # overwrite the record of the browser that is actually running.
+                launched.record(profile.profile_dir, entry)
                 return pids
             # CDP answering and `ps` naming the process are two separate reads, and nothing
             # makes them agree. Returning `()` here would hand back an answer-shaped void —
