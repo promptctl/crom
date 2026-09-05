@@ -269,7 +269,7 @@ class CliTest(unittest.TestCase):
     def test_repairing_a_config_does_not_require_finding_chrome(self):
         """Whether a file tokenizes as TOML is a question about bytes. Running the repair
         through a full load would have made `find_chrome()` a precondition of every
-        command — including `crom init`, which `_Session` exists to keep working on a
+        command — including `crom init`, which `Session` exists to keep working on a
         machine that has no Chrome yet.
         """
         with mock.patch(
