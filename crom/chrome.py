@@ -107,6 +107,12 @@ _VERSION_REQUEST = (
 #
 #     ... --remote-debugging-port=9223 --restart --user-data-dir=/…/dev --restart
 #
+# Re-observed on Chrome 152, by driving a crom-launched browser to `chrome://restart` and
+# reading its new command line whole: the rewrite also *sorts* every switch alphabetically
+# before appending `--restart`, so `--user-data-dir` can land anywhere in the line and the
+# flags come back in an order crom never emitted. Same lesson, drawn tighter — no fact
+# about crom's own ordering may be load-bearing in this pattern.
+#
 # The anchored pattern does not match that. `scan()` then returns nothing, and every
 # command that asks "is this profile running" is told no about a browser that is running:
 # `up` starts a second Chrome on the same directory, `down` cannot find it, `list` reports
