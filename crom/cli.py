@@ -35,6 +35,7 @@ from . import (
     flags,
     mcp,
     migrate,
+    reclaim,
     registry,
     report,
     resolve as resolver,
@@ -247,7 +248,7 @@ _COMMAND_SECTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Run a browser", ("up", "down", "restart", "show", "list")),
     ("Point tools at one", ("mcp", "env", "port")),
     ("Declare what exists", ("init", "add", "rm", "config", "forget")),
-    ("Look after crom's own state", ("doctor",)),
+    ("Look after crom's own state", ("doctor", "release", "clean")),
 )
 
 
@@ -312,7 +313,7 @@ class CromGroup(click.Group):
 
         Catching `CromError` alone left the second half escaping as a raw traceback, and
         the codebase had begun closing that one call site at a time —
-        `_delete_profile_data` wraps `rmtree`, `configwrite._writing` wraps the config
+        `_delete_directory` wraps `rmtree`, `configwrite._writing` wraps the config
         save, `seed._copy` wraps the seed stat — while `crom mcp --path <a-directory>`
         still printed a stack trace out of `read_text`. [LAW:single-enforcer] a rule kept
         per command is a rule the next command is written without; kept here, a new
@@ -1131,14 +1132,17 @@ def rm_cmd(session: _Session, ref: str, yes: bool, keep_data: bool):
         # below applies to the other two steps — between interruptible steps, take the
         # one whose failure is recoverable.
         if not keep_data and profile.profile_dir.exists():
-            _delete_profile_data(profile)
+            _delete_directory(
+                profile.profile_dir,
+                f"'{profile.ref}' is still declared — run `crom rm {profile.ref}` again.",
+            )
         # Release the reservation before removing the declaration, not after. Both
         # orderings can be interrupted, but they strand different things: undeclaring
         # first leaves a port held by a profile no longer nameable, so no command can
         # reach it to retry. Releasing first leaves a declared profile without a
         # reservation, which the next resolve heals by assigning one. Between two
         # interruptible steps, take the one whose failure is recoverable.
-        registry.forget(profile.ref)
+        registry.forget(str(profile.ref))
         configwrite.remove_profile(scope.source or user_config_file(), profile.ref.name)
     # The stop is reported rather than performed quietly: killing someone's browser is
     # the most surprising thing this command does, and `--yes` skips the prompt that
@@ -1607,6 +1611,12 @@ def doctor_cmd(as_json: bool):
     and is listed the same way, so a directory here may still be filling rather than
     abandoned; crom does not tell the two apart. Each is reported with its size, and so
     is every namespace crom could not look under.
+
+    Nothing here writes. `crom release <key>` hands back the port under one reservation
+    this reports, and `crom clean <path>` deletes one staging directory it found — both
+    act only on what this command already named, and both refuse a verdict crom could not
+    establish. Releasing a port and deleting a profile copy cannot be undone, which is why
+    they are things you ask for rather than things a doctor does on its way past.
     """
     found = doctor.survey()
     _emit(
@@ -1643,24 +1653,101 @@ def doctor_cmd(as_json: bool):
     )
 
 
-def _delete_profile_data(profile: ResolvedProfile) -> None:
-    """Remove a profile's user-data-dir, as a `CromError` rather than a traceback.
+@main.command("release")
+@click.argument("key")
+def release_cmd(key: str):
+    """Hand one reservation's port back, leaving the rest of its namespace alone.
+
+    The other way to release a port is `crom forget <namespace>`, which releases every
+    port under that namespace — the live profiles' included — so it cannot reach one
+    orphan without taking its neighbours with it. This reaches exactly one.
+
+    Give it the key `crom doctor` prints, spelled exactly as it prints it. The key is
+    taken as written and never taken apart: a hand repair can strand a reservation under
+    something that is not a legal `namespace/name` at all, and those are the very ones
+    nothing else can reach.
+
+    Crom releases a reservation `crom doctor` calls `orphaned`. It refuses one a config
+    still declares — `crom rm <ref>` undeclares and releases together — and one whose
+    own browser is still running, which you close first. It also refuses a reservation
+    it could not check or could not probe: a released port goes to the next profile that
+    asks for one and never comes back, so crom will not release on evidence it never
+    got. `crom doctor` says which of those any reservation is.
+    """
+    match reclaim.releasable(key, doctor.survey()):
+        case reclaim.Refused(reason=reason, why=why):
+            raise reason.error(why)
+        case reclaim.Releasable(row=row):
+            # The survey read the ledger and `forget` writes it under its own lock, so a
+            # concurrent release can empty the key in between. Which of the two happened
+            # is what `forget` reports, and the line says it rather than crediting crom
+            # with freeing a number it found already free. The state the caller asked for
+            # holds either way, which is why this is an answer and not a failure.
+            # [LAW:no-silent-failure]
+            act = "Released" if registry.forget(row.ref) else "Already released"
+            click.echo(
+                f"{act} {row.ref} — port {row.held.port} is free for the next profile "
+                f"that asks for one"
+            )
+
+
+@main.command("clean")
+@click.argument("path")
+@click.option("--yes", is_flag=True, help="Skip the confirmation prompt.")
+def clean_cmd(path: str, yes: bool):
+    """Delete one staging directory a seed abandoned, by the path `crom doctor` prints.
+
+    Seeding builds a profile beside its final path and moves it in only once it is whole,
+    so a `crom up` killed mid-copy leaves a whole seed's worth of bytes behind under a
+    dot-prefixed name `ls` hides. The retry succeeds, so nothing ever looks wrong.
+
+    Only a directory `crom doctor` reported can be deleted here, and that is the whole of
+    the safety: a migration stages a legacy profile under the same dot-prefixed shape,
+    and for part of its run that copy is the only one there is. The path may be spelled
+    however your shell produced it — pasted, relative, through a symlink — because what
+    gets deleted is the directory `crom doctor` walked to, not the name you typed.
+
+    A seed running right now leaves identical evidence, and crom cannot tell the two
+    apart. The prompt names the size so you can; `--yes` skips it.
+    """
+    match reclaim.deletable(path, doctor.survey()):
+        case reclaim.Refused(reason=reason, why=why):
+            raise reason.error(why)
+        case reclaim.Deletable(staged=staged):
+            size = _human_size(staged.bytes)
+            if not yes:
+                click.confirm(
+                    f"Deleting {staged.path} ({size}) cannot be undone.\nContinue?", abort=True
+                )
+            _delete_directory(
+                staged.path, f"Run `crom clean {staged.path}` again once that is fixed."
+            )
+            click.echo(f"Deleted {staged.path} ({size} reclaimed)")
+
+
+def _delete_directory(directory: Path, retry: str) -> None:
+    """Remove one directory crom owns, as a `CromError` rather than a traceback.
 
     `shutil.rmtree` raises a bare `OSError` — `FileNotFoundError` for an entry that
     vanishes mid-walk, `ENOTEMPTY` for one that appears — and the path alone does not say
-    that the profile is still declared. That became
-    reachable when `rm` started stopping the browser itself instead of refusing: a Chrome
-    helper outliving `chrome.kill` can still be writing here for a moment.
+    what is left to try. Both callers meet that same race for the same reason: `crom rm`
+    deletes a directory a Chrome helper outliving `chrome.kill` can still be writing to,
+    and `crom clean` deletes one a seed that is still running may still be filling.
 
-    The message names the retry because the caller ordered the delete first precisely so
-    that one exists — the profile is still declared when this raises.
+    The retry sentence is the caller's, because only the caller knows what it left
+    reachable. `rm` deletes before it undeclares precisely so that a retry exists;
+    `clean` names a path that stays exactly as `crom doctor` prints it.
+
+    One reason for both, and it keeps `profile_dir_undeletable` as its published spelling:
+    a staging directory is a profile directory that never finished being built, the failure
+    is the same one, and the next move — fix what the sentence names, run the command
+    again — does not divide. A slug earns its place by separating next moves.
     """
     try:
-        shutil.rmtree(profile.profile_dir)
+        shutil.rmtree(directory)
     except OSError as e:
         raise Reason.PROFILE_DIR_UNDELETABLE.error(
-            f"could not delete {profile.profile_dir}: {e}\n"
-            f"'{profile.ref}' is still declared — run `crom rm {profile.ref}` again."
+            f"could not delete {directory}: {e}\n{retry}"
         ) from e
 
 

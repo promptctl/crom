@@ -1000,7 +1000,7 @@ def kill(profile: ResolvedProfile) -> tuple[int, ...]:
     Residual, and deliberately not chased: `find_pids` matches only the main browser and
     skips Chrome's `--type=` helpers, so a crashpad handler can briefly outlive this.
     Extending the wait to helpers would widen `scan`'s contract for a window that closes
-    on its own; `cli._delete_profile_data` covers what remains by reporting a failed
+    on its own; `cli._delete_directory` covers what remains by reporting a failed
     delete as a retryable `CromError` rather than a traceback.
     """
     pids = find_pids(profile)

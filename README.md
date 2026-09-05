@@ -156,12 +156,13 @@ reading `port` and friends.
 
 `crom doctor --json` is neither shape. It answers with an object: `registry`, the path of
 crom's port ledger, `reservations`, the rows in it, and `staging`, the half-built profile
-copies an interrupted seed left behind. The path is in the answer because editing that
-file by hand is the only way to release a single reservation no config declares any more.
-A row carries `ref` whole — `"myapp/beta"` — rather than split into `namespace` and
-`profile` the way the record does. Nothing rejects a ledger key a hand-edit invented, so a
-row may name something that is not a legal `namespace/name` at all, and `crom doctor`
-reports it rather than refusing it.
+copies an interrupted seed left behind. The path is in the answer because the rows are
+the contents of one file on your machine, and a reader looking at a leak wants to know
+which file is holding it: `crom release` hands back one reservation at a time, and the
+ledger is where all the rest of them live. A row carries `ref` whole — `"myapp/beta"` —
+rather than split into `namespace` and `profile` the way the record does. Nothing rejects
+a ledger key a hand-edit invented, so a row may name something that is not a legal
+`namespace/name` at all, and `crom doctor` reports it rather than refusing it.
 
 A row also carries `standing`, where the reservation stands against the config the ledger
 names as its source, and `finding`, the sentence behind that verdict — it names the
@@ -212,6 +213,28 @@ profile directory at all, so a hand-edited ledger key with nothing on its port s
 a real answer. `liveness_finding` is where the reason lives, and for `unprobed` it is the
 only place it appears, since no slug can carry it.
 
+`crom release KEY` is what you do about an orphaned row, and it acts on exactly one: the
+port that single reservation holds goes back, and every other reservation in the
+namespace is left alone. `crom forget` cannot do that — it drops a whole namespace,
+releasing the live profiles' ports along with the leak. Spell `KEY` as `crom doctor`
+printed it, including a key a hand-edit invented that is no legal `namespace/name` at
+all; hand-editing the ledger was the only way to free a single port before this command
+existed, so those are the keys lying around on real machines. crom releases when
+`standing` is `orphaned` and `liveness` is `idle` or `foreign`, and the number is then
+genuinely reusable — the next profile that asks for a port can be handed it.
+
+It refuses the rest, each with its own next move. `declared` exits 4 and sends you to
+`crom rm REF`, which undeclares and releases in one act. `unchecked` and `unprobed`
+exit 1, because a released port never comes back and crom will not release on evidence
+it never got. `own` exits 4 for a different reason: there is no evidence gap there,
+crom can see exactly what is happening, and a declaration that vanished while its own
+browser kept running is far more often a config mid-edit or a checkout in flight than a
+profile someone meant to delete. Close that browser and run it again — `crom down`
+cannot reach it, since `crom down` resolves profiles through the config that no longer
+declares this one. Those four judge a reservation the ledger holds; a `KEY` it holds no
+row under has no standing or liveness to judge and exits 3, sending you back to
+`crom doctor`, which lists every key the ledger does hold.
+
 The two halves of the answer treat a gone config differently, on purpose. For a namespace
 whose config file is gone, the `staging` half falls back to crom's default profile root
 and reports a caveat beside what it finds, while `liveness` declines to answer at all. The
@@ -259,6 +282,16 @@ A seed running right now has a staging directory too, and `crom doctor` reports 
 as well. The evidence on disk is identical, and crom does not try to tell them apart; the
 copy still in flight moves into place the moment it is whole, and the row for it goes with
 it.
+
+`crom clean PATH` deletes one of those directories, and only one `crom doctor` actually
+reported — that is the whole of the safety. It is also why a migration's staging copy is
+refused with exit 3: a legacy profile being migrated is staged under the same
+`.<name>.partial` shape, and for part of that run the staged copy is the only copy of the
+profile's cookies and logins. Spell `PATH` however your shell produced it — pasted
+absolute from `crom doctor`, relative, or through a symlink — since selection is by
+resolved path, and what goes is the directory `crom doctor` walked to rather than the
+name you typed. crom prints the directory's size and asks before deleting; `--yes` skips
+the prompt, and with nothing on stdin it aborts with exit 1 and deletes nothing.
 
 `crom --version` prints the version alone on one line, so a script reads it without
 splitting a sentence. It reports the crom you have installed rather than any checkout you
@@ -334,14 +367,14 @@ unfamiliar reason still lands somewhere sensible.
 
 Not every failure gets an envelope, and the rule is that one appears exactly when a
 command that takes `--json` was given it and parsed it. `up`, `down`, `restart`, `show`,
-`list`, `config` and `doctor` take the flag; `add`, `rm`, `init`, `port`, `env`, `mcp` and
-`forget` answer in prose only. Bad usage — exit `2`, an unknown flag or a missing
-argument — is parsing itself failing, so the `--json` on that line was never understood
-either: there is no flag to honour, and the answer stays prose. `crom --version` is not a
-command and answers in prose for the same reason. A broken pipe is deliberately outside
-all of it: when `crom list | head` loses its reader mid-write, crom ends silently with
-exit `1` and nothing on either stream, because a reader that has already left is the one
-failure with nowhere to put a document.
+`list`, `config` and `doctor` take the flag; `add`, `rm`, `init`, `port`, `env`, `mcp`,
+`forget`, `release` and `clean` answer in prose only. Bad usage — exit `2`, an unknown
+flag or a missing argument — is parsing itself failing, so the `--json` on that line was
+never understood either: there is no flag to honour, and the answer stays prose.
+`crom --version` is not a command and answers in prose for the same reason. A broken pipe
+is deliberately outside all of it: when `crom list | head` loses its reader mid-write,
+crom ends silently with exit `1` and nothing on either stream, because a reader that has
+already left is the one failure with nowhere to put a document.
 
 One gap worth knowing, because it looks like an envelope and is not. The `error` string a
 `crom list --json` element carries for a declaration it could not resolve is a sentence
@@ -369,6 +402,8 @@ crom mcp [REF]                write .mcp.json
 crom doctor                   every reservation in the ledger, which ones are orphaned,
                               who holds each one's port, and the half-built copies an
                               interrupted seed left behind
+crom release KEY              hand back one orphaned reservation's port, by ledger key
+crom clean PATH               delete one half-built profile copy crom doctor reported
 crom forget NAMESPACE         drop a namespace deliberately, releasing its ports
 ```
 
@@ -376,6 +411,8 @@ crom forget NAMESPACE         drop a namespace deliberately, releasing its ports
 `default`, with two exceptions: `crom config` without a REF reports the ambient scope
 alone (which config is in effect, and what it declares) rather than resolving a profile,
 and `crom rm` requires a REF — it will not guess which profile you meant to delete.
+`crom release` and `crom clean` take no REF at all: their arguments are a raw ledger key
+and a directory path, each spelled the way `crom doctor` printed it.
 
 `crom restart` holds one profile lock across both halves, so a concurrent `crom up` or
 `crom rm` lands wholly before it or wholly after rather than in the gap between the stop
@@ -416,7 +453,9 @@ no pidfile to go stale.
 
 A crom command names an end state and converges to it, so crom never tells you to run a
 different crom command first. If the only thing between a command and its job is another
-crom command, crom runs it and says so.
+crom command, crom runs it and says so. Releasing a port and deleting a directory are
+irreversible, so `crom release` and `crom clean` stay acts a person asks for by name,
+never repairs crom performs on the way to something else.
 
 Asking for a state you are already in is the simplest case of that. `crom init` in a
 project that already has a `.crom.toml` reports the namespace and seed that file

@@ -23,7 +23,7 @@ from unittest import mock
 
 from click.testing import CliRunner
 
-from crom import cli, config, configwrite, doctor, mcp, migrate
+from crom import cli, config, configwrite, doctor, mcp, migrate, registry
 from crom.config import load_ambient
 from crom.model import USER_NAMESPACE, Conflict, CromError, ProfileRef, Reason
 from crom.paths import registry_file, state_home, user_config_file
@@ -2232,6 +2232,318 @@ class CliTest(unittest.TestCase):
         self.assertIn(f"{root / 'myapp'} could not be read", errors[0])
         self.assertIn(f"{config_file} is gone", errors[1])
         self.assertIn("1 namespace(s) crom could not check", self.crom("doctor"))
+
+    # --- handing leaked state back ---------------------------------------------------
+
+    def _orphan_beta(self) -> None:
+        """Two reservations, then a config that declares only the first.
+
+        The shape of the leak the epic reproduced: an edit removes a stanza and the ledger
+        keeps the port forever. `beta` is the orphan, `alpha` is the neighbour every test
+        here checks is still standing afterwards.
+        """
+        self._two_profiles()
+        (self.project / ".crom.toml").write_text(
+            'namespace = "myapp"\n\n[profiles.alpha]\nport = 9401\n'
+        )
+
+    def test_release_reclaims_one_orphaned_reservation_and_leaves_its_namespace_alone(self):
+        """The whole ticket: one leak reclaimed, its neighbours untouched.
+
+        `crom forget myapp` is the only other way to release a reserved port and it
+        releases every port under the namespace — `alpha`'s included — so it cannot reach
+        one orphan without taking the live profiles with it. `alpha` is asserted as hard as
+        `beta` for exactly that reason: without it this passes against a release that is
+        `crom forget` spelled differently, which is the one thing it must not be.
+        [LAW:verifiable-goals]
+        """
+        self._orphan_beta()
+
+        self.crom("release", "myapp/beta")
+
+        rows = self._rows()
+        self.assertNotIn("myapp/beta", rows)
+        self.assertEqual(9401, rows["myapp/alpha"]["port"])
+        self.assertEqual("declared", rows["myapp/alpha"]["standing"])
+
+    def test_release_hands_the_number_back_to_the_profile_that_asks_next(self):
+        """Released has to mean *reusable*, which no reading of the ledger can establish.
+
+        The leak costs a port, so the repair is worth nothing until the allocator can hand
+        that port out again — and `registry._allocate` steps over every number the ledger
+        holds. A release that removed the row but left the number unreachable would satisfy
+        every assertion in the test above.
+
+        Ports are left unpinned here, where the rest of this section pins them, because a
+        pin is the one thing that would let a new profile land on the number without the
+        allocator ever having been free to choose it. The number is read back from the row
+        rather than written as a literal: what is being asserted is that this number came
+        back, not that crom numbers profiles in any particular way.
+        """
+        (self.project / ".crom.toml").write_text(
+            'namespace = "myapp"\n\n[profiles.alpha]\n[profiles.beta]\n'
+        )
+        self.crom("list")
+        released = self._rows()["myapp/beta"]["port"]
+        (self.project / ".crom.toml").write_text('namespace = "myapp"\n\n[profiles.alpha]\n')
+
+        self.crom("release", "myapp/beta")
+        self.crom("add", "gamma")
+
+        self.assertEqual(released, json.loads(self.crom("config", "gamma", "--json"))["resolved"]["port"])
+
+    def test_release_reaches_a_ledger_key_no_profile_reference_could_name(self):
+        """The keys a hand repair strands, which are the ones nothing else can reach.
+
+        Hand-editing the ledger was the only way to release a single reservation before
+        this command, so keys `ProfileRef` refuses — a second slash, a capital, a space —
+        really are in there, and `registry._read` validates every entry and no key. A
+        release that took a `ProfileRef` would be unable to name exactly the reservations
+        its own predecessor left behind. So the argument is the raw ledger key, and this
+        is what fails the moment anyone narrows it back. [LAW:types-are-the-program]
+        """
+        self._orphan_beta()
+        ledger = json.loads(registry_file().read_text())
+        for key, port in (("a/b/c", 9444), ("Not A Ref!", 9445)):
+            ledger["ports"][key] = {"port": port, "pinned": False, "source": str(self.project / ".crom.toml")}
+        registry_file().write_text(json.dumps(ledger))
+
+        self.crom("release", "a/b/c")
+        self.crom("release", "Not A Ref!")
+
+        remaining = self._rows()
+        self.assertNotIn("a/b/c", remaining)
+        self.assertNotIn("Not A Ref!", remaining)
+        self.assertEqual(9401, remaining["myapp/alpha"]["port"])
+
+    def test_release_refuses_a_reservation_a_config_still_declares(self):
+        """The port a live profile is still being handed, and it must not move.
+
+        `crom port`, `crom env` and `crom mcp` go on giving `alpha` this number, so
+        releasing it hands the same number to the next profile that asks for one. The
+        reservation is asserted to survive rather than only the exit code: a refusal that
+        printed and released anyway would pass on the code alone.
+        """
+        self._orphan_beta()
+
+        failure = self.failure("release", "myapp/alpha")
+
+        self.assertEqual(Reason.RESERVATION_DECLARED, failure.reason)
+        self.assertIn("crom rm myapp/alpha", str(failure))
+        self.assertEqual(9401, self._rows()["myapp/alpha"]["port"])
+
+    def test_release_refuses_a_reservation_whose_config_crom_could_not_read(self):
+        """`unchecked` is never a quieter `orphaned`, and this is where that costs money.
+
+        A config that will not parse may declare this profile perfectly well, so
+        'nothing declares it' was never established. A released port never comes back —
+        every checked-in `.mcp.json` and `CDP_URL` pointing at the number breaks with it —
+        which is why the one verdict crom refuses to guess at is also the one a release
+        must refuse to act on. [LAW:no-silent-failure]
+        """
+        self._two_profiles()
+        (self.project / ".crom.toml").write_text("namespace = \"myapp\"\n\n[profiles.alpha\n")
+
+        failure = self.failure("release", "myapp/beta")
+
+        self.assertEqual(Reason.RESERVATION_UNSETTLED, failure.reason)
+        self.assertEqual("unchecked", self._rows()["myapp/beta"]["standing"])
+
+    def test_release_refuses_a_reservation_whose_port_crom_could_not_probe(self):
+        """The second axis's own version of the refusal above, and it earns its own arm.
+
+        Standing and liveness are independent, so a reservation can be squarely orphaned —
+        crom read the config, nothing declares it — while crom still has no idea who is on
+        the number. `unprobed` means the probe never answered, and reading it as `idle` is
+        acting on evidence crom never got, on the one field a release trusts before it
+        hands a number back.
+        """
+        self._orphan_beta()
+
+        with mock.patch(
+            "crom.chrome.port_is_free",
+            side_effect=Reason.PORT_CHECK_FAILED.error(
+                "could not check whether port 9402 is free: [Errno 24] Too many open files"
+            ),
+        ):
+            failure = self.failure("release", "myapp/beta")
+
+        self.assertEqual(Reason.RESERVATION_UNSETTLED, failure.reason)
+        self.assertIn("Too many open files", str(failure))
+        self.assertIn("myapp/beta", self._rows())
+
+    def test_release_refuses_a_reservation_whose_own_browser_is_still_running(self):
+        """The declaration is gone and the browser is not, which is the deliberate refusal.
+
+        Crom knows exactly what is happening here — unlike the two refusals above, this is
+        not an evidence gap — and refuses anyway. A profile whose stanza vanished while its
+        own Chrome kept running is far more often a config mid-edit or a checkout in flight
+        than a profile someone meant to delete, and the two are indistinguishable from the
+        ledger while the cost of being wrong runs one way only.
+
+        `registry._allocate` binds before it hands a port out, so it would step over this
+        number anyway — but that is the allocator protecting itself, and it stops the
+        moment the browser exits. The refusal is this command being careful, which is a
+        different thing and is why it is asserted here.
+        """
+        self._orphan_beta()
+        directory = str(state_home() / "profiles" / "myapp" / "beta")
+
+        with (
+            mock.patch("crom.chrome.port_is_free", lambda port: port != 9402),
+            mock.patch("crom.chrome.scan", return_value={directory: (4242,)}),
+        ):
+            failure = self.failure("release", "myapp/beta")
+
+        self.assertEqual(Reason.RESERVATION_IN_USE, failure.reason)
+        self.assertIn("myapp/beta", self._rows())
+
+    def test_release_reclaims_a_reservation_a_stranger_has_taken_over(self):
+        """The epic's motivating leak, and what keeps the refusal above about `own`.
+
+        Identical setup to the test above but for the one fact that decides it: the port is
+        held and the holder is not this profile's browser. That is `foreign`, the loudest
+        thing `crom doctor` says, and it is precisely when a user most wants the number
+        back — crom's promise that the port never moves is already broken.
+
+        Paired deliberately. Without this, a release that refused every held port would
+        pass the test above while making the command useless on the case the epic was
+        opened for. [LAW:verifiable-goals]
+        """
+        self._orphan_beta()
+
+        with mock.patch("crom.chrome.port_is_free", lambda port: port != 9402):
+            self.assertEqual("foreign", self._rows()["myapp/beta"]["liveness"])
+            self.crom("release", "myapp/beta")
+
+        self.assertNotIn("myapp/beta", self._rows())
+
+    def test_release_says_the_ledger_holds_no_such_key_rather_than_reporting_success(self):
+        """A typo has to land somewhere a script can see, and exit 3 is where.
+
+        A release that quietly succeeded on a key it never found would tell a repair script
+        the leak was gone every time it misspelled one — an answer-shaped void on the exact
+        command a machine reaches for when its state is already wrong.
+        [LAW:parse-dont-validate]
+        """
+        self._orphan_beta()
+
+        failure = self.failure("release", "myapp/no-such-profile")
+
+        self.assertEqual(Reason.RESERVATION_UNKNOWN, failure.reason)
+        self.assertIn("crom doctor", str(failure))
+
+    def test_release_credits_a_concurrent_release_rather_than_claiming_the_port_itself(self):
+        """The window between deciding and writing, and the only lie available inside it.
+
+        `crom release` decides from a survey and writes under `registry.forget`'s own lock,
+        so another release can empty the key in between. A command that printed "Released"
+        there would be crediting crom with freeing a number it found already free — the
+        quietest possible lie about crom's own state, and the whole reason `forget` reports
+        whether an entry was actually removed. Nothing else reads that boolean.
+        [LAW:no-silent-failure]
+
+        The rival release is the real one, run from inside the survey the command is about
+        to decide on, rather than a ledger fabricated to look raced: what is asserted is
+        that the two orderings tell the user apart, not that a particular stub was reached.
+        [LAW:behavior-not-structure]
+
+        This exits 0, and that is the answer rather than a failure — the caller asked for
+        the port to be unreserved and it is.
+        """
+        self._orphan_beta()
+        survey = doctor.survey
+
+        def lose_the_race():
+            found = survey()
+            registry.forget("myapp/beta")
+            return found
+
+        with mock.patch("crom.doctor.survey", lose_the_race):
+            output = self.crom("release", "myapp/beta")
+
+        self.assertIn("Already released myapp/beta", output)
+        self.assertNotIn("myapp/beta", self._rows())
+
+    def test_clean_deletes_the_staging_directory_a_seed_abandoned(self):
+        """The other half of the leak, and the bytes are the point.
+
+        Two interrupted runs against a 234 MB seed cost 350 MB on the machine that prompted
+        this epic, hidden behind a leading dot with every retry succeeding. The directory is
+        asserted gone from the filesystem and not merely absent from the next report: a
+        `doctor` that stopped listing it would satisfy the second on its own.
+        """
+        self._interrupted_seed(
+            f'namespace = "myapp"\n\n[profiles.dev]\nseed = "{self.root / "seed"}"\n'
+        )
+        (leaked,) = (Path(item["path"]) for item in self._staging())
+        self.assertTrue(leaked.is_dir())
+
+        self.crom("clean", str(leaked), "--yes")
+
+        self.assertFalse(leaked.exists())
+        self.assertEqual([], self._staging())
+
+    def test_clean_asks_before_deleting_and_a_silent_answer_is_no(self):
+        """The bytes are unrecoverable, so the default answer has to be the safe one.
+
+        `crom rm` prompts before deleting a profile's data for the same reason, and this
+        deletes the same kind of thing. With nothing on stdin `click.confirm` aborts, which
+        is what a script that piped nothing in gets — so the directory has to survive that,
+        not merely survive a typed `n`.
+        """
+        self._interrupted_seed(
+            f'namespace = "myapp"\n\n[profiles.dev]\nseed = "{self.root / "seed"}"\n'
+        )
+        (leaked,) = (Path(item["path"]) for item in self._staging())
+
+        self.invoke("clean", str(leaked), expect=1)
+
+        self.assertTrue(leaked.is_dir())
+
+    def test_clean_will_not_delete_a_migrations_staging_copy(self):
+        """The one directory here that is sometimes the only copy of someone's profile.
+
+        `migrate._move_staged` stages a legacy profile as `.<name>.partial` in this very
+        root and, on a same-filesystem move, renames the original away *before* the copy
+        exists — so for part of that run the `.partial` holds the profile's only cookies
+        and logins. It is dot-prefixed and it is a directory, which is every test a
+        seed's residue passes.
+
+        `crom doctor` already refuses to call it a leak, and `clean` deletes only what the
+        survey reported rather than re-deriving what a leak is. That is what this holds
+        open: a second reader of the rule would be free to drift from the report it acts
+        on. [LAW:single-enforcer]
+        """
+        self._interrupted_seed(
+            f'namespace = "myapp"\n\n[profiles.dev]\nseed = "{self.root / "seed"}"\n'
+        )
+        (leaked,) = (Path(item["path"]) for item in self._staging())
+        migrating = leaked.parent / f".legacy{migrate.STAGING_SUFFIX}"
+        migrating.mkdir()
+
+        failure = self.failure("clean", str(migrating), "--yes")
+
+        self.assertEqual(Reason.STAGING_UNKNOWN, failure.reason)
+        self.assertTrue(migrating.is_dir())
+
+    def test_clean_takes_a_path_spelled_however_a_shell_produced_it(self):
+        """Tab completion gives a relative path; `crom doctor` prints an absolute one.
+
+        Both name the same directory, so both have to reach it — a repair command that
+        only accepted one spelling would refuse the completion the user's own shell just
+        offered. Selection is by resolved path, while what gets deleted is always the path
+        `doctor` walked to, so a looser spelling can pick a finding and can never widen
+        one. [LAW:parse-dont-validate]
+        """
+        self._interrupted_seed(
+            f'namespace = "myapp"\n\n[profiles.dev]\nseed = "{self.root / "seed"}"\n'
+        )
+        (leaked,) = (Path(item["path"]) for item in self._staging())
+
+        self.crom("clean", f"./{leaked.name}", "--yes", cwd=leaked.parent)
+
+        self.assertFalse(leaked.exists())
 
     # --- removal --------------------------------------------------------------------
 
