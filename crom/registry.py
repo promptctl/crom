@@ -303,11 +303,34 @@ def forget_namespace(namespace: str) -> int:
     return len(released)
 
 
-def forget(ref: ProfileRef) -> None:
+def forget(key: str) -> bool:
+    """Drop one reservation, under the key the ledger filed it as; say whether it was there.
+
+    The raw key and not a `ProfileRef`, because the ledger's key space is strings and
+    `str(ProfileRef)` is only one producer of them. `_read` validates every entry and no
+    key, so a hand-edit puts keys in here that `ProfileRef` would refuse — and hand-editing
+    was the only way to release a single reservation until `crom release` existed, which
+    makes those keys exactly the ones stranded and exactly the ones a release has to
+    reach. A `ProfileRef` parameter made them unreachable by construction, so the type was
+    narrower than the domain rather than stronger than it. [LAW:types-are-the-program]
+
+    The safety question — whether this key *should* be released — is not asked here.
+    `reclaim.releasable` asks it once, against a `doctor` survey, and `crom rm` answers it
+    a different way for a profile it is undeclaring in the same breath. This is the
+    mechanism both of them spend, and an invariant enforced in the mechanism would be
+    enforced twice over for `rm` and wrongly for a key no config can name.
+    [LAW:single-enforcer]
+
+    Reports whether an entry was actually removed. The caller decided from a survey taken
+    before this took the lock, so a concurrent release is the one thing that can have
+    emptied the key in between — and a command announcing a release it did not perform
+    would be the quietest possible lie about crom's own state. [LAW:no-silent-failure]
+    """
     with _locked() as path:
         data = _read(path)
-        data["ports"].pop(str(ref), None)
+        held = data["ports"].pop(key, None)
         _write(path, data)
+    return held is not None
 
 
 def adopt(ref: ProfileRef, port: int, source: Path | None) -> None:
