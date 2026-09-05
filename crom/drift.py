@@ -49,7 +49,7 @@ class Change:
     """One question the two launches answer differently.
 
     Whole values on both sides, not the part they differ on, for the reason
-    `cli._effective_flags` renders whole values: a difference has no vocabulary for what
+    `operations._effective_flags` renders whole values: a difference has no vocabulary for what
     is unchanged, so `--window-size` reported as `800,600 → 1280,800` quietly denies the
     switch name that makes either number mean anything. `--window-size=800,600` reads
     back in the spelling the config file uses. [FRAMING:representation]
