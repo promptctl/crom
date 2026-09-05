@@ -330,7 +330,7 @@ class MalformedConfigTest(unittest.TestCase):
         """The quieter half of the same defect: `name in "typo"` is a *substring* test.
 
         It raises nothing and answers True for a profile nobody declared — `declares` is
-        what `add_cmd` uses to decide a name is taken and what its cleanup path uses to
+        what `operations.add` uses to decide a name is taken and what its cleanup path uses to
         decide whether it lost a race, so a wrong answer here is worse than a crash.
         """
         self.target.write_text('namespace = "myapp"\nprofiles = "typo"\n')

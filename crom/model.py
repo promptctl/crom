@@ -195,7 +195,7 @@ class Reason(Enum):
     # Nothing: the floor of the search is crom's own constant and the machine being full
     # leaves a caller exactly one next move, so no field would separate anything.
     PORT_EXHAUSTED = ("port_exhausted", Conflict)
-    # Not `profile_differs`: `_reject_restatement` raises this for `crom add` comparing a
+    # Not `profile_differs`: `operations.reject_restatement` raises this for `crom add` comparing a
     # profile's declaration *and* for `crom init` comparing the project's own namespace
     # and defaults, a command that names no profile at all. One slug rather than two
     # because the next move is the same either way — edit the file or change the request

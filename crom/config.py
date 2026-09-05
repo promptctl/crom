@@ -625,6 +625,23 @@ def reject_duplicate_ports(profiles: dict[str, ProfileSpec], source: Path) -> No
 # --- loading, and the one repair that writes -----------------------------------------
 
 
+def write_target(scope: Scope) -> Path:
+    """The config file a write against `scope` lands in.
+
+    `Scope.source` is None for exactly one scope — the implicit `user` scope on a machine
+    with no user config yet — and a write there is what creates that file, so every writer
+    resolved the absence the same way and three of them said so in their own words:
+    `crom add`, `crom rm`, and `resolve_or_declare`. Three copies of one rule is the
+    arrangement that holds until one of them learns something the others do not.
+    [LAW:one-source-of-truth]
+
+    Not a property on `Scope` for one reason only: `paths` imports `model`, so `model`
+    reaching back for `user_config_file` would close a cycle. [LAW:one-way-deps] It sits
+    here instead, with the module that builds every `Scope` there is.
+    """
+    return scope.source or user_config_file()
+
+
 def load_file(source: Path, *, namespace: str | None = None) -> Scope:
     if not source.is_file():
         raise Reason.CONFIG_MISSING.error(f"config file not found: {source}", path=str(source))

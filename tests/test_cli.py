@@ -24,7 +24,7 @@ from unittest import mock
 
 from click.testing import CliRunner
 
-from crom import chrome, cli, config, configwrite, doctor, launched, mcp, migrate, registry
+from crom import chrome, cli, config, configwrite, doctor, launched, mcp, migrate, operations, registry
 from crom.config import load_ambient
 from crom.model import USER_NAMESPACE, Conflict, CromError, ProfileRef, Reason, parse_ref
 from crom.paths import registry_file, state_home, user_config_file
@@ -580,7 +580,7 @@ class CliTest(unittest.TestCase):
         self.assertIn("--no-pings", output)
 
     def test_a_refusal_names_the_profiles_whole_effective_flag_list(self):
-        """Both sides are full values, in the vocabulary `_reject_restatement` promises.
+        """Both sides are full values, in the vocabulary `operations.reject_restatement` promises.
 
         Reporting only what the two sides differ on read `declared (unset)` for a profile
         that had flags — the wording that means "nothing is set" for seed and port —
@@ -3853,7 +3853,7 @@ class CliTest(unittest.TestCase):
         self.assertEqual(json.loads(self.crom("config", "ci", "--json"))["resolved"], before)
 
     def test_a_profile_removed_mid_declaration_is_named_rather_than_left_a_key_error(self):
-        """`add_cmd` reads the file back after `ensure_profile` wrote it, so a concurrent
+        """`operations.add` reads the file back after `ensure_profile` wrote it, so a concurrent
         `crom rm` — or a `git checkout` over the file — landing between the two arrives
         here. Left to the dict lookup it was a `KeyError`, which would leave this module's
         exit-code contract as a traceback. [LAW:no-silent-failure]
@@ -4286,7 +4286,7 @@ class CliTest(unittest.TestCase):
 
     def test_a_restated_declaration_answers_one_slug_for_both_of_its_callers(self):
         """`crom add` comparing a profile's declaration and `crom init` comparing the
-        project's own namespace both raise from `_reject_restatement`, and neither
+        project's own namespace both raise from `operations.reject_restatement`, and neither
         command carries `--json` — so this is the only seam where the reason can be read
         at all, which is why the assertion is here rather than on an envelope.
 
@@ -4298,7 +4298,7 @@ class CliTest(unittest.TestCase):
         no profile, and a slug that says otherwise sends a reader to the wrong stanza.
         """
         with self.assertRaises(Conflict) as caught:
-            cli._reject_restatement(
+            operations.reject_restatement(
                 "already configures this project, and this asks to change it:",
                 # A second fact that agrees, so `settings` is asserted to name what
                 # differs rather than everything that was compared.

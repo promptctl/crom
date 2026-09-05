@@ -359,7 +359,7 @@ def _declare(path: Path, spec: ProfileSpec, header: str) -> bool:
     [LAW:single-enforcer] Without a header the created document has no `namespace` key,
     so the profile is appended to a file `config.parse` then rejects wholesale on the
     very next load — every command in that project failing on the file crom itself just
-    wrote. `cli.add_cmd` guarded its own call against this, which protected that one
+    wrote. `operations.add` guarded its own call against this, which protected that one
     caller rather than the invariant; enforcing it where the document is created covers
     every caller, including the tests that were quietly producing unparseable configs.
     """
