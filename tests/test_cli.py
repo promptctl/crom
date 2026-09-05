@@ -26,7 +26,7 @@ from click.testing import CliRunner
 
 from crom import chrome, cli, config, configwrite, doctor, launched, mcp, migrate, registry
 from crom.config import load_ambient
-from crom.model import USER_NAMESPACE, Conflict, CromError, ProfileRef, Reason
+from crom.model import USER_NAMESPACE, Conflict, CromError, ProfileRef, Reason, parse_ref
 from crom.paths import registry_file, state_home, user_config_file
 
 # README.md is the only place a reader learns the failure envelope's vocabulary, so it
@@ -269,7 +269,7 @@ class CliTest(unittest.TestCase):
     def test_repairing_a_config_does_not_require_finding_chrome(self):
         """Whether a file tokenizes as TOML is a question about bytes. Running the repair
         through a full load would have made `find_chrome()` a precondition of every
-        command — including `crom init`, which `_Session` exists to keep working on a
+        command — including `crom init`, which `Session` exists to keep working on a
         machine that has no Chrome yet.
         """
         with mock.patch(
@@ -818,13 +818,13 @@ class CliTest(unittest.TestCase):
         removed before the write (a `git clean`, another agent resetting the workspace).
         A fresh `crom` would simply re-discover and fall back to the user scope, so the
         scope is stubbed to hold a source that no longer exists — which is exactly the
-        state `_Session.scope` would be caching.
+        state `Session.scope` would be caching.
         """
         self.crom("init")
         scope = load_ambient(self.project)
         (self.project / ".crom.toml").unlink()
 
-        with mock.patch("crom.cli.load_ambient", return_value=scope):
+        with mock.patch("crom.session.load_ambient", return_value=scope):
             self.crom("add", "two")
 
         recreated = (self.project / ".crom.toml").read_text()
@@ -997,7 +997,7 @@ class CliTest(unittest.TestCase):
         previous = Path.cwd()
         os.chdir(self.project)
         try:
-            profile = resolver.resolve(cli.parse_ref("default", "myproj"), load_ambient())
+            profile = resolver.resolve(parse_ref("default", "myproj"), load_ambient())
         finally:
             os.chdir(previous)
         interpolation = resolver._variables(
@@ -2731,7 +2731,7 @@ class CliTest(unittest.TestCase):
     def test_doctor_claims_no_uncertainty_about_where_personal_profiles_live(self):
         """The first `crom doctor` of a machine, and the row it must not print.
 
-        What keeps that row off is `cli._bootstrap_user_config`, not anything doctor
+        What keeps that row off is `session._bootstrap_user_config`, not anything doctor
         decides: it writes the user config from `CromGroup.command_class.invoke`, before
         the body of every command, so the survey below finds a file and reads it. The
         namespace crom is surest of is the one it has already made sure of.
@@ -4504,7 +4504,7 @@ class CliTest(unittest.TestCase):
         self.crom("init")
         readying = (
             ("crom.migrate.run_if_needed", Reason.MIGRATION_NEEDS_QUIET, "a legacy Chrome is still running"),
-            ("crom.cli._bootstrap_user_config", Reason.CONFIG_UNWRITABLE, "could not write the user config"),
+            ("crom.session._bootstrap_user_config", Reason.CONFIG_UNWRITABLE, "could not write the user config"),
         )
         for target, reason, sentence in readying:
             with self.subTest(target=target):
@@ -4543,7 +4543,7 @@ class CliTest(unittest.TestCase):
         [LAW:verifiable-goals]
         """
         with mock.patch(
-            "crom.cli._bootstrap_user_config",
+            "crom.session._bootstrap_user_config",
             side_effect=Reason.CONFIG_UNWRITABLE.error("could not write the user config"),
         ):
             self.crom("list", expect=1)

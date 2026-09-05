@@ -715,7 +715,7 @@ def _namespace_for(source: Path) -> str:
     orphan everything already pointing at the old ports.
 
     The registry can only answer for a project crom has loaded successfully at least
-    once, because `_Session.scope` records the name *after* the load. A `.crom.toml` that
+    once, because `Session.scope` records the name *after* the load. A `.crom.toml` that
     arrived broken — a fresh clone, a hand-written file — therefore falls back to the
     directory name, which is the same rule `crom init` applies. That is a real rename, and
     it is why `repair_unreadable` reports the name it chose rather than assuming the
