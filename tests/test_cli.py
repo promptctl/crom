@@ -387,6 +387,23 @@ class CliTest(unittest.TestCase):
 
         self.crom("init", cwd=here, expect=4)
 
+    def test_init_refuses_an_unrecognised_seed(self):
+        output = self.crom("init", "--seed", "chorme", expect=1)
+
+        self.assertIn("'chorme' is not recognised", output)
+        self.assertFalse((self.project / ".crom.toml").exists())
+
+    def test_init_names_the_reserved_namespace_before_an_unrecognised_seed(self):
+        """Both arguments are wrong, and which one crom answers with is what a script
+        branching on the exit code sees: a reserved namespace is a conflict (4), an
+        unrecognised seed a failure (1). Parsing the seed in the command — before the
+        namespace was settled — once put the seed's refusal first, and only this pairing
+        can tell the two orders apart, which is why neither test alone is the test."""
+        output = self.crom("init", "user", "--seed", "chorme", expect=4)
+
+        self.assertIn("reserved", output)
+        self.assertNotIn("chorme", output)
+
     def test_init_converges_in_a_directory_named_after_the_reserved_namespace(self):
         """The reserved name is refused for a namespace the command claims, not for one it
         is about to throw away. A project that chose `myproj` is named `myproj` whatever
