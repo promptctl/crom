@@ -924,8 +924,15 @@ def _sweep(session: Session, as_json: bool) -> None:
     # answers with: taking half of it would leave a namespace crom could not load to
     # vanish from the sweep on the day it widens, which is the one row that says crom may
     # not have seen the whole fleet. [LAW:no-silent-failure]
+    #
+    # `failure` is on this row too, so the key is on every row the sweep publishes and a
+    # consumer reads `row["failure"]` across the whole array without first asking which
+    # kind of row it is holding. `null` because a namespace crom could not load is not a
+    # stop that failed — nothing was attempted here either.
+    # [LAW:dataflow-not-control-flow] The rest of the shape stays what `crom list --all`
+    # publishes for this same fact, spelled the same way. [LAW:one-source-of-truth]
     for namespace, error in unavailable:
-        records.append({"namespace": namespace, "error": error})
+        records.append({"namespace": namespace, "error": error, "failure": None})
         lines.append(f"{namespace}/ — unavailable — {error}")
 
     # One document on stdout, and the summary on stderr — so a `--json` reader parses the
@@ -943,7 +950,7 @@ def _sweep(session: Session, as_json: bool) -> None:
     "--all",
     "everything",
     is_flag=True,
-    help="Stop every profile `crom list --running` shows, instead of one named profile.",
+    help="Stop every profile crom list --running shows, instead of one named profile.",
 )
 @_json_option
 @click.pass_obj

@@ -5854,6 +5854,32 @@ class CliTest(unittest.TestCase):
         self.assertEqual(set(_readme_names(sentence[1])), offering)
         self.assertEqual(set(_readme_names(sentence[2])), commands - offering)
 
+    def test_no_option_help_carries_markup_click_would_print_literally(self):
+        """click renders `help=` verbatim, so a backtick in one reaches the terminal.
+
+        The command docstrings do use backticks and keep them: `crom list --help` and
+        `crom status --help` have printed them since those commands were written, and a
+        paragraph of prose reads either way. An option's help is one cell of a two-column
+        table, where a stray backtick is punctuation a reader steps over rather than
+        emphasis they can take or leave — `--all` on `down` shipped as ``Stop every
+        profile `crom list --running` shows`` and printed the backticks.
+
+        Read out of click rather than from a list of option names written here, which
+        would be a second copy of the CLI's own parameters — green for exactly as long as
+        nobody adds an option. [LAW:one-source-of-truth]
+
+        Asserted as the whole set rather than one flag at a time so a failure names every
+        option that has drifted, not merely the first the loop reached.
+        """
+        marked = {
+            f"crom {name} {parameter.opts[0]}"
+            for name in cli.main.list_commands(None)
+            for parameter in cli.main.get_command(None, name).params
+            if "`" in (getattr(parameter, "help", None) or "")
+        }
+
+        self.assertEqual(marked, set())
+
     # --- crom's own version ----------------------------------------------------------
 
     def test_the_version_reported_is_the_installed_distributions_own(self):
