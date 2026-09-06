@@ -14,7 +14,10 @@ exit codes are a contract a script can branch on:
 
 Four codes is as fine as a numeric contract can afford to be, so every failure also
 carries a reason slug — one word naming what actually went wrong, enumerated in
-`model.Reason`.
+`model.Reason`. `_answer` publishes it in the `--json` envelope, with one exception:
+`crom down --all` fails once per profile and answers with an array, so its slugs ride the
+rows that earned them and no envelope is written. `_reported` is what holds the row's
+vocabulary and the envelope's to one table.
 """
 
 import errno
@@ -242,6 +245,33 @@ class _Failure(click.ClickException):
         self.exit_code = exit_code
 
 
+def _reported(error: Exception) -> tuple[int, dict]:
+    """What crom answers for one error, as values: the exit code, and the naming a script
+    branches on.
+
+    Split out of `_answer` because `crom down --all` needs the naming without the
+    envelope. A sweep has N failures and one envelope could name only one of them, so the
+    reason travels on the row that failed — and it is built here, from the same `_ANSWERS`
+    lookup and the same `detail()` call the envelope is built from, so a row's vocabulary
+    and an envelope's cannot drift into two spellings of one refusal.
+    [LAW:one-source-of-truth]
+
+    No message, because the two callers do not have one. `_answer` renders `str(error)`
+    for a `CromError` and `filename: strerror` for an `OSError`, while a sweep row carries
+    `str(error)` under its own `error` key either way — so a message handed back from here
+    would be a third spelling, and wrong for one of them.
+    """
+    answer = next(a for a in _ANSWERS if isinstance(error, a.error))
+    detail = answer.detail(error)
+    return answer.code, {
+        "kind": answer.kind,
+        "reason": detail.reason,
+        # Always present, `{}` where the reason declares no fields, so a caller reads one
+        # shape rather than testing for the key first. [LAW:dataflow-not-control-flow]
+        "fields": detail.fields,
+    }
+
+
 def _answer(ctx: click.Context, error: Exception, message: str) -> _Failure:
     """crom's whole answer to a failed command: the machine's copy on stdout when one was
     asked for, and the exception carrying the human's copy and the exit code.
@@ -261,24 +291,13 @@ def _answer(ctx: click.Context, error: Exception, message: str) -> _Failure:
     gets the quiet ending every other broken pipe gets. [LAW:single-enforcer] the rule
     keeps one home rather than growing a second guard beside it.
     """
-    answer = next(a for a in _ANSWERS if isinstance(error, a.error))
+    code, naming = _reported(error)
     # Absent only where the parse itself failed, since nothing crom does runs ahead of
     # it: a malformed command line reaches the user as prose because the flag on it was
     # never understood either. The envelope answers for a command crom has understood.
     if ctx.meta.get(_JSON_REQUESTED, False):
-        detail = answer.detail(error)
-        envelope = {
-            "code": answer.code,
-            "kind": answer.kind,
-            "reason": detail.reason,
-            # Always present, `{}` where the reason declares no fields, so a caller reads
-            # one shape rather than testing for the key first.
-            # [LAW:dataflow-not-control-flow]
-            "fields": detail.fields,
-            "message": message,
-        }
-        click.echo(_json_text({"error": envelope}))
-    return _Failure(message, answer.code)
+        click.echo(_json_text({"error": {"code": code, **naming, "message": message}}))
+    return _Failure(message, code)
 
 
 # How `crom --help` groups its commands, as data rather than as prose that has to be
@@ -836,6 +855,17 @@ def _sweep(session: Session, as_json: bool) -> None:
     exit 0 from a sweep that left a browser running would be crom claiming work it did
     not do — the failure is loud in stdout, in stderr and in `$?`.
 
+    THE REASON RIDES THE ROW, BECAUSE A SWEEP HAS ONE PER FAILURE. Every other command
+    answers with `_answer`'s envelope, which names a single refusal. This one can fail on
+    `myproj/a` with `chrome_stop_failed` and on `user/b` with `EPERM` in the same run, so
+    an envelope would name one of those and drop the other — and would land after the
+    records array, where a reader that parses one document never reaches it. Each row
+    carries `failure` instead: the `kind`, `reason` and `fields` `_reported` draws from
+    `_ANSWERS`, `null` where nothing failed there. [LAW:one-source-of-truth] One key
+    rather than three beside `error`, because a row holding a reason and no kind is a
+    state with no meaning — nested, a failure is present or absent and never half of one.
+    [LAW:types-are-the-program]
+
     An unresolved declaration does not fail the sweep, though it is reported. "A browser
     is still up" and "a declaration is malformed" are different next moves, and a sweep
     that answered 1 for both would leave a script unable to separate them — the same test
@@ -864,13 +894,27 @@ def _sweep(session: Session, as_json: bool) -> None:
                     # report a browser that is still up as down. The `error` beside it is
                     # what `chrome.kill` observed, which names the half that failed.
                     failed.append(entry.ref)
-                    record = {**entry.describe(standing[entry.ref]), "stopped": [], "error": str(error)}
+                    # The code is dropped on purpose: it belongs to the command, and a
+                    # per-row copy would be a number that means nothing on its own.
+                    _, failure = _reported(error)
+                    record = {
+                        **entry.describe(standing[entry.ref]),
+                        "stopped": [],
+                        "error": str(error),
+                        "failure": failure,
+                    }
                     line = f"{entry.ref} — {error}"
                 else:
-                    record = {**entry.describe(Stopped()), "stopped": list(pids), "error": None}
+                    record = {
+                        **entry.describe(Stopped()),
+                        "stopped": list(pids),
+                        "error": None,
+                        "failure": None,
+                    }
                     line = _stop_line(entry.ref, pids)
             case FailedProfile():
-                record, line = entry.describe(), f"{entry.ref} — unresolved — {entry.error}"
+                record = {**entry.describe(), "failure": None}
+                line = f"{entry.ref} — unresolved — {entry.error}"
         records.append(record)
         lines.append(line)
 

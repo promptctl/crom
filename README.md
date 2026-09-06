@@ -181,15 +181,20 @@ Five commands add keys to that record. `crom restart --json` and `crom down --js
 `stopped`, the pids they killed, empty when the profile was not running — what a run took
 down is a fact about the act, and the record describes the profile.
 `crom down --all --json` publishes an array of those records rather than one object, a row
-per profile the sweep reached, and each row adds `error`: the message where a stop failed,
-`null` where it took. A row whose stop failed still reads `running: true` and the state
-crom saw before the attempt, because the stop is exactly what did not happen. `crom show --json`
-adds `started`, whether it had to launch the browser first, and `windows`, how many came
-forward — zero for a headless profile, which is raised successfully and simply has no
-window to show for it. `crom up --json` adds two: `found`, the drift verdict it reached,
-and `stopped`, the pids its relaunch replaced — the same key the two above publish, with
-the same meaning, and empty unless this run actually relaunched. `crom status --json` adds
-five: `heard`, `browser`, `websocket`, `tabs` and `processes`.
+per profile the sweep reached, and each row adds two keys. `error` is the message where a
+stop failed, `null` where it took. `failure` is an object where a stop failed and `null`
+everywhere else, including the row for a declaration crom could not resolve, where no stop
+was attempted; it holds exactly `kind`, `reason` and `fields`, spelled the way the
+`--json` error envelope spells them. Why a sweep answers on the rows rather than in one
+envelope is explained below. A row whose stop failed still reads `running: true` and the
+state crom saw before the attempt, because the stop is exactly what did not happen.
+`crom show --json` adds `started`, whether it had to launch the browser first, and
+`windows`, how many came forward — zero for a headless profile, which is raised
+successfully and simply has no window to show for it. `crom up --json` adds two: `found`,
+the drift verdict it reached, and `stopped`, the pids its relaunch replaced — the same
+key the two above publish, with the same meaning, and empty unless this run actually
+relaunched. `crom status --json` adds five: `heard`, `browser`, `websocket`, `tabs` and
+`processes`.
 
 `found` carries the `{"verdict", "finding", "changes"}` object described below, the one
 `crom list` and `crom config` publish under the key `drift`, and it is spelled differently
@@ -482,11 +487,28 @@ is deliberately outside all of it: when `crom list | head` loses its reader mid-
 crom ends silently with exit `1` and nothing on either stream, because a reader that has
 already left is the one failure with nowhere to put a document.
 
+`crom down --all` is the exception to one shape for every failure. A sweep that failed
+exits `1` and still answers with its array of rows and no envelope, because every other
+crom command has exactly one outcome to name and a sweep has as many as it reached: one
+run can fail on `myproj/a` with `chrome_stop_failed` and on `user/b` with an OS refusal at
+the same time, and a single envelope would publish one of those and drop the other.
+Printing an envelope after the array would not fix that either — it puts two JSON
+documents on stdout, and a reader that parses one document gets a truncated answer.
+
+So the reason travels on the row that earned it. Each row's `failure` is an object where
+that profile's stop failed and `null` everywhere else, and its `kind`, `reason` and
+`fields` are read from the same table as the envelope's, so a slug spelled one way in an
+envelope is spelled that way on a row. It carries no `message`, because `error` on that
+same row is the message, and no `code`, because the exit code answers for the whole
+command and a per-row copy would be a number that means nothing on its own. A sweep whose
+stops all took exits `0`, and one that failed still publishes every row it reached.
+
 One gap worth knowing, because it looks like an envelope and is not. The `error` string a
-`crom list --json` element carries for a declaration it could not resolve is a sentence
-with no `reason` and no `fields`, inside a document that exited `0` — a failure carried as
-a value rather than raised as one, and the one place left in crom's output where a failure
-is only English.
+`crom list --json` element or a `crom down --all --json` row carries for a declaration it
+could not resolve is a sentence with no `reason` and no `fields` — on the sweep that
+row's `failure` is `null`, because no stop was attempted there — and it does not fail
+the command that published it. A failure carried as a value rather than raised as one, and
+the one failure left in crom's output that is only English.
 
 ## Commands
 

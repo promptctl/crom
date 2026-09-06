@@ -1817,14 +1817,26 @@ class CliTest(unittest.TestCase):
         `down` reports `Stopped()` because `chrome.kill` guarantees it; where that
         guarantee was refused the row carries the state crom read going in, so a consumer
         reading `running` off the sweep's own output is not told a live browser is dead.
-        `error` is on every row — `null` where the stop took — so the shape a consumer
-        parses does not depend on which rows failed.
+        `error` and `failure` are on every row — `null` where nothing failed there — so
+        the shape a consumer parses does not depend on which rows failed, which is why all
+        three kinds of row a sweep can publish are in one listing here.
+
+        `failure` is where this command's reason slug lives. Every other command answers
+        one failure and can name it in the `--json` envelope; a sweep fails once per
+        profile, and one envelope would publish one of those and drop the rest. `kind` and
+        `fields` are asserted beside `reason` because the row is built from the same
+        `_ANSWERS` table the envelope is built from: a row built from the wrong entry of
+        that table would still spell the reason right, and only `kind` would show it.
         """
         self.crom("init")
         self.crom("add", "took", "--port", "9401")
         self.crom("add", "stuck", "--port", "9402")
         live = {self._dir_of(name): (4242,) for name in ("took", "stuck")}
         wedged = Reason.CHROME_STOP_FAILED.error("could not stop 'myproj/stuck': port still held")
+        config_path = self.project / ".crom.toml"
+        config_path.write_text(
+            config_path.read_text() + '\n[profiles.broken]\nflags = ["--x=${CROM_NOPE}"]\n'
+        )
 
         with (
             mock.patch("crom.chrome.scan", return_value=live),
@@ -1840,11 +1852,22 @@ class CliTest(unittest.TestCase):
         self.assertEqual(rows["myproj/took"]["state"], "stopped")
         self.assertFalse(rows["myproj/took"]["running"])
         self.assertEqual(rows["myproj/took"]["stopped"], [4242])
+        # Subscripted rather than `.get`: present-and-null is the contract, so a key that
+        # went missing must fail here instead of reading as the null it should have been.
         self.assertIsNone(rows["myproj/took"]["error"])
+        self.assertIsNone(rows["myproj/took"]["failure"])
 
         self.assertTrue(rows["myproj/stuck"]["running"])
         self.assertEqual(rows["myproj/stuck"]["stopped"], [])
         self.assertIn("port still held", rows["myproj/stuck"]["error"])
+        self.assertEqual(
+            rows["myproj/stuck"]["failure"],
+            {"kind": "failure", "reason": "chrome_stop_failed", "fields": {}},
+        )
+
+        # No stop was attempted for a declaration crom could not resolve, so nothing
+        # failed there — and the row says so in the key the other two answer in.
+        self.assertIsNone(rows["myproj/broken"]["failure"])
 
     def test_down_all_reports_what_it_could_not_resolve_and_signals_nothing_for_it(self):
         """crom read no state for these, so it has nothing there it could claim to stop.
@@ -1902,6 +1925,26 @@ class CliTest(unittest.TestCase):
             result = self.invoke("down", "ci", "--all", expect=2)
 
         self.assertIn("--all", result.output)
+        killer.assert_not_called()
+
+    def test_down_refuses_an_empty_ref_rather_than_stopping_the_default_profile(self):
+        """`crom down ""` and `crom down` carry two different facts, and `or` collapsed them.
+
+        A script interpolating an unset `$PROFILE` writes the first and has named no
+        profile at all. Read as the second it would stop `myproj/default` — a browser the
+        script never asked about, quietly and with exit 0 — where the empty name reaching
+        `validate_name` is refused with `invalid_name` at exit 1, the same refusal every
+        other command answers it with. The discriminator is whether click was given the
+        argument, which it already answers with `None`. [LAW:no-silent-failure]
+        """
+        self.crom("init")
+
+        with mock.patch("crom.chrome.kill") as killer:
+            result = self.invoke("down", "", "--json", expect=1)
+
+        self.assertEqual(json.loads(result.stdout)["error"]["reason"], "invalid_name")
+        # The harm this refusal exists to prevent is a stop, so the assertion is that
+        # nothing was stopped — not merely that crom said something.
         killer.assert_not_called()
 
     def test_down_documents_the_sweep_against_the_listing_that_previews_it(self):
