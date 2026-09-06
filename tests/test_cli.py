@@ -5311,6 +5311,41 @@ class CliTest(unittest.TestCase):
         self.assertIs(error.reason, Reason.PROFILE_NO_DATA)
         self.assertIn("crom up myproj/ci", str(error))
 
+    def test_a_profile_removed_while_capture_was_deciding_still_says_what_to_do(self):
+        """The window between reading a fact and acting on it, closed by reading it inside.
+
+        `crom rm` deletes a profile's directory under the profile lock. A capture that
+        read `profile_dir.exists()` *before* taking that lock could be overtaken there:
+        the check passes, `rm` wins the lock and deletes, and the copy then meets a
+        missing source and answers `seed_missing` — a reason written for a seed a config
+        names, telling this caller to fix a config when their profile is simply gone.
+
+        The removal is injected exactly in that window rather than raced for, so the test
+        fails deterministically against the old ordering instead of when the scheduler
+        happens to cooperate. [LAW:no-ambient-temporal-coupling]
+        """
+        self.crom("init")
+        directory = self._a_profile_with_data()
+        with self._standing_in(None):
+            profile = cli.Session.begin().profile("ci")
+
+        real_exclusive = operations.locking.exclusive
+        removed = []
+
+        def remove_first(*args, **kwargs):
+            if not removed:
+                removed.append(shutil.rmtree(directory))
+            return real_exclusive(*args, **kwargs)
+
+        with mock.patch.object(operations.locking, "exclusive", side_effect=remove_first):
+            with self.assertRaises(CromError) as caught:
+                operations.capture(profile, "logged-in")
+
+        # The profile is gone, so "run crom up" is the honest next move — and it is the
+        # answer whether the removal landed a microsecond before this call or during it.
+        self.assertIs(caught.exception.reason, Reason.PROFILE_NO_DATA)
+        self.assertFalse((state_home() / "snapshots" / "logged-in").exists())
+
     def test_two_captures_racing_for_one_name_leave_the_loser_a_conflict(self):
         """The existence check is worth only as much as the lock it runs under.
 

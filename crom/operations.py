@@ -703,6 +703,9 @@ def capture(profile: ResolvedProfile, name: str) -> Capture:
     the only honest answers are "made it" and "there is already one of those".
     [LAW:no-silent-failure]
 
+    Both refusals are read under the locks rather than ahead of them, so a profile
+    removed while this was deciding cannot change which of them a caller gets.
+
     Two locks, because a capture touches two resources and each has its own claimant.
     `locking.exclusive(destination)` is what makes the existence check mean anything: it
     is keyed on the *name*, so two captures of different profiles under one name are
@@ -722,20 +725,22 @@ def capture(profile: ResolvedProfile, name: str) -> Capture:
     snapshot, and quoting the source would name a number that appears nowhere on disk.
     """
     destination = paths.snapshot_dir(name)
-    # Before either lock: a profile that has never been up has nothing to capture, and
-    # that is a different answer from every refusal below it. Reaching `seed.capture`
-    # with it would land in `_copy`'s missing-source arm, which answers `seed_missing` —
-    # written for a seed a config names, and the wrong next move for a caller who needs
-    # to run `crom up` first. [LAW:no-silent-failure]
-    if not profile.profile_dir.exists():
-        raise Reason.PROFILE_NO_DATA.error(
-            f"{profile.ref} has no data to capture yet:\n"
-            f"  {profile.profile_dir} does not exist\n"
-            f"crom creates a profile's directory the first time it launches the browser. "
-            f"Run `crom up {profile.ref}`, sign in to what the snapshot is for, quit the "
-            f"browser, and capture then."
-        )
     with locking.exclusive(destination), seed.profile_lock(profile):
+        # Under the lock, where every other read of this same fact already happens —
+        # `_start_under_lock` and `rm` both ask it there. Read outside, a `crom rm` of
+        # this profile landing in the gap deletes the directory after the check passes,
+        # and the copy then reaches `_copy`'s missing-source arm and answers
+        # `seed_missing`: the wrong next move, produced by the very check added to stop
+        # crom giving it. [LAW:no-ambient-temporal-coupling] the check and the copy it
+        # guards are one critical section, not two reads with a window between them.
+        if not profile.profile_dir.exists():
+            raise Reason.PROFILE_NO_DATA.error(
+                f"{profile.ref} has no data to capture yet:\n"
+                f"  {profile.profile_dir} does not exist\n"
+                f"crom creates a profile's directory the first time it launches the "
+                f"browser. Run `crom up {profile.ref}`, sign in to what the snapshot is "
+                f"for, quit the browser, and capture then."
+            )
         if destination.exists():
             raise Reason.SNAPSHOT_EXISTS.error(
                 f"a snapshot named '{name}' is already there:\n"
