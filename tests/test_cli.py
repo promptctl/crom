@@ -1684,7 +1684,7 @@ class CliTest(unittest.TestCase):
         """
         return {str(call.args[0].ref) for call in killer.call_args_list}
 
-    def test_down_all_stops_exactly_the_profiles_list_running_shows(self):
+    def test_down_all_stops_exactly_the_profiles_list_running_all_shows(self):
         """The listing is a preview of the sweep, asserted as one equality from outside.
 
         This is the claim `--running` was built first to make, and the only one that
@@ -1702,7 +1702,8 @@ class CliTest(unittest.TestCase):
 
         with mock.patch("crom.chrome.scan", return_value=live):
             previewed = {
-                row["ref"] for row in json.loads(self.crom("list", "--running", "--json"))
+                row["ref"]
+                for row in json.loads(self.crom("list", "--running", "--all", "--json"))
             }
             with mock.patch("crom.chrome.kill", return_value=(4242,)) as killer:
                 swept = {row["ref"] for row in json.loads(self.crom("down", "--all", "--json"))}
@@ -1726,13 +1727,79 @@ class CliTest(unittest.TestCase):
 
         with mock.patch("crom.chrome.scan", return_value=live):
             previewed = {
-                row["ref"] for row in json.loads(self.crom("list", "--running", "--json"))
+                row["ref"]
+                for row in json.loads(self.crom("list", "--running", "--all", "--json"))
             }
             with mock.patch("crom.chrome.kill", return_value=(4243,)) as killer:
                 self.crom("down", "--all")
 
         self.assertEqual(previewed, {"myproj/here", "user/default"})
         self.assertEqual(self._asked_to_stop(killer), previewed)
+
+    def test_down_all_sweeps_a_browser_running_in_another_project(self):
+        """The machine-wide claim, and the one the sibling test above cannot make.
+
+        `user/` is reachable from inside every project, so a sweep scoped to the ambient
+        namespace satisfies that test while still leaving a second checkout's browser
+        running — the failure is invisible from the project crom happens to be standing
+        in, which is exactly where a user would look for it. A namespace crom reaches only
+        through the registry is what separates the two, so the fleet here is a real one.
+        """
+        other = self.root / "otherproj"
+        other.mkdir()
+        self.crom("init", cwd=other)
+        self.crom("port", cwd=other)  # registers the namespace by reading its config
+
+        self.crom("init")
+        self.crom("add", "here", "--port", "9401")
+        live = {self._dir_of("here"): (4242,), self._dir_of("otherproj/default"): (4243,)}
+
+        with mock.patch("crom.chrome.scan", return_value=live):
+            previewed = {
+                row["ref"]
+                for row in json.loads(self.crom("list", "--running", "--all", "--json"))
+            }
+            with mock.patch("crom.chrome.kill", return_value=(4243,)) as killer:
+                self.crom("down", "--all")
+
+        self.assertEqual(previewed, {"myproj/here", "otherproj/default"})
+        self.assertEqual(self._asked_to_stop(killer), previewed)
+
+    def test_down_all_reports_a_namespace_it_could_not_load_and_stops_nothing_there(self):
+        """The row the sweep could not reach until it widened, asserted rather than assumed.
+
+        `failure` is asserted present *and* null, which are two claims: present, so a
+        consumer reads `row["failure"]` across every row the array carries without first
+        asking which kind of row it holds; null, because a namespace crom could not load is
+        not a stop that was attempted and failed. The sweep still exits 0 and signals
+        nothing on its behalf — "crom could not look here" and "a browser is still up" are
+        different next moves, and an exit code that conflated them would leave a script
+        unable to tell which it got. [LAW:parse-dont-validate]
+
+        `.stdout` rather than `crom()`, because `scope_for` narrates the namespace it could
+        no longer find on stderr, and the folded stream is not a JSON document.
+        """
+        gone = self.root / "gone"
+        gone.mkdir()
+        self.crom("init", cwd=gone)
+        self.crom("add", "dev", cwd=gone)
+        (gone / ".crom.toml").unlink()
+
+        self.crom("init")
+        self.crom("add", "here", "--port", "9401")
+
+        with (
+            mock.patch("crom.chrome.scan", return_value={self._dir_of("here"): (4242,)}),
+            mock.patch("crom.chrome.kill", return_value=(4242,)) as killer,
+        ):
+            rows = json.loads(self.invoke("down", "--all", "--json").stdout)
+
+        unreadable = [row for row in rows if row.get("namespace") == "gone"]
+        self.assertEqual(len(unreadable), 1)
+        self.assertIn("failure", unreadable[0])
+        self.assertIsNone(unreadable[0]["failure"])
+        self.assertEqual([row for row in rows if "failure" not in row], [])
+        self.assertEqual(self._asked_to_stop(killer), {"myproj/here"})
 
     def test_down_all_stops_the_wedged_browser_the_listing_calls_unreachable(self):
         """The profile a fleet sweep exists for, and the one a slug filter would skip.
@@ -1951,13 +2018,13 @@ class CliTest(unittest.TestCase):
         """A sweep is only safe to run if `--help` says what it will take down.
 
         Naming the flag is not enough here: the whole discipline of this command is that
-        `crom list --running` shows the set first, and a reader who is not told that has
-        no way to look before acting.
+        `crom list --running --all` shows the set first, and a reader who is not told that
+        has no way to look before acting — least of all which namespaces it reaches.
         """
         documented = self.crom("down", "--help")
 
         self.assertIn("--all", documented)
-        self.assertIn("crom list --running", documented)
+        self.assertIn("crom list --running --all", documented)
 
     # --- the fourth state, and the flag that produces it --------------------------------
 

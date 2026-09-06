@@ -822,8 +822,8 @@ def _stop_line(ref: ProfileRef, pids: tuple[int, ...]) -> str:
 def _sweep(session: Session, as_json: bool) -> None:
     """Stop every profile a browser is up for, reporting each outcome, failures included.
 
-    THE SET IS `crom list --running`'S SET, BY CONSTRUCTION. `hidden` below is the same
-    expression that command uses, read through the same `state.running` — the attribute
+    THE SET IS `crom list --running --all`'S SET, BY CONSTRUCTION. `hidden` below is the
+    same expression that command uses, read through the same `state.running` — the attribute
     `describe()` publishes under the key `running` — over a listing built from the same
     `_scopes_to_list`. The listing is therefore a preview of this sweep rather than a
     second opinion about the word "running", which is the whole reason the filter was
@@ -831,6 +831,14 @@ def _sweep(session: Session, as_json: bool) -> None:
     schedule for disagreeing; matching on `state.slug` here would have been that second
     copy, and would have skipped exactly the browser a user most wants swept — an
     `unreachable` one, holding a port it will not give back.
+
+    THE FLEET IS EVERY NAMESPACE, NOT THE ONE CROM IS STANDING IN. `_scopes_to_list` is
+    asked `everything=True`, so a browser left running in another project is swept from
+    wherever this was typed — the machine-wide reading of "every profile", and the only
+    one under which the answer does not depend on the directory the user happened to be
+    in. That width is the listing's own `--all`, which is why the preview is spelled with
+    it: a sweep wider than the listing that previews it would take down a browser the user
+    was never shown. [LAW:one-source-of-truth]
 
     THE PORT IS NOT ASKED, AND THE SET IS UNCHANGED BY THAT. `running` is true on
     `ready`, `unreachable` and `unprobed` alike, because liveness comes from the process
@@ -844,10 +852,10 @@ def _sweep(session: Session, as_json: bool) -> None:
 
     WHAT CROM READ NO STATE FOR IS REPORTED, NEVER ACTED ON. `hidden` can only hold refs
     `chrome.health` answered for, so an unresolvable declaration survives the narrowing
-    the same way it survives `crom list --running` — and then falls to the `FailedProfile`
-    arm, which renders it and stops nothing. [LAW:parse-dont-validate] the absence of an
-    answer is not the answer "no", and a declaration crom cannot resolve is exactly where
-    a browser it cannot see would be hiding.
+    the same way it survives `crom list --running --all` — and then falls to the
+    `FailedProfile` arm, which renders it and stops nothing. [LAW:parse-dont-validate] the
+    absence of an answer is not the answer "no", and a declaration crom cannot resolve is
+    exactly where a browser it cannot see would be hiding.
 
     A FAILED STOP DOES NOT ABORT THE SWEEP, AND DOES NOT PASS FOR SUCCESS EITHER. Each
     stop is caught where it happens, becomes a row, and the sweep goes on to the next
@@ -872,7 +880,7 @@ def _sweep(session: Session, as_json: bool) -> None:
     `Reason` applies to its slugs. The row is the signal there; the exit code is reserved
     for stops crom attempted and could not establish.
     """
-    scopes, unavailable = _scopes_to_list(session, everything=False)
+    scopes, unavailable = _scopes_to_list(session, everything=True)
     listing = [entry for scope in scopes for entry in resolver.resolve_all(scope)]
     standing = chrome.health(
         (entry for entry in listing if isinstance(entry, ResolvedProfile)),
@@ -918,12 +926,9 @@ def _sweep(session: Session, as_json: bool) -> None:
         records.append(record)
         lines.append(line)
 
-    # Empty while the sweep asks only the scopes `crom list` shows by default, since that
-    # is the arm of `_scopes_to_list` that loads no remembered namespace and so cannot
-    # fail to. Rendered rather than dropped because the pair is what that function
-    # answers with: taking half of it would leave a namespace crom could not load to
-    # vanish from the sweep on the day it widens, which is the one row that says crom may
-    # not have seen the whole fleet. [LAW:no-silent-failure]
+    # A namespace crom could not load is the one row that says it may not have seen the
+    # whole fleet, so the sweep reports it and stops nothing on its behalf — the same
+    # split `--running` makes for what crom read no state for. [LAW:no-silent-failure]
     #
     # `failure` is on this row too, so the key is on every row the sweep publishes and a
     # consumer reads `row["failure"]` across the whole array without first asking which
@@ -950,17 +955,19 @@ def _sweep(session: Session, as_json: bool) -> None:
     "--all",
     "everything",
     is_flag=True,
-    help="Stop every profile crom list --running shows, instead of one named profile.",
+    help="Stop every profile crom list --running --all shows, instead of one named profile.",
 )
 @_json_option
 @click.pass_obj
 def down_cmd(session: Session, ref: str | None, everything: bool, as_json: bool):
     """Stop a running profile, or the whole fleet with `--all`.
 
-    `crom down --all` stops exactly the profiles `crom list --running` shows, so run that
-    listing first to see what the sweep will take down. It keeps going when one profile
-    fails and reports every outcome, and it leaves alone what it could not resolve —
-    crom read no state for those, so it has nothing there it could claim to stop.
+    `crom down --all` stops exactly the profiles `crom list --running --all` shows, so run
+    that listing first to see what the sweep will take down. It reaches every namespace
+    crom knows rather than the project you are standing in, so a browser forgotten in
+    another checkout is swept from here. It keeps going when one profile fails and reports
+    every outcome, and it leaves alone what it could not resolve — crom read no state for
+    those, so it has nothing there it could claim to stop.
     """
     # Refused here, and `_sweep` takes no ref at all, so the illegal pairing cannot be
     # expressed past this line rather than being defended against below it.
