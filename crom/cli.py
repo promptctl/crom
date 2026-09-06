@@ -14,7 +14,10 @@ exit codes are a contract a script can branch on:
 
 Four codes is as fine as a numeric contract can afford to be, so every failure also
 carries a reason slug — one word naming what actually went wrong, enumerated in
-`model.Reason`.
+`model.Reason`. `_answer` publishes it in the `--json` envelope, with one exception:
+`crom down --all` fails once per profile and answers with an array, so its slugs ride the
+rows that earned them and no envelope is written. `_reported` is what holds the row's
+vocabulary and the envelope's to one table.
 """
 
 import errno
@@ -242,6 +245,33 @@ class _Failure(click.ClickException):
         self.exit_code = exit_code
 
 
+def _reported(error: Exception) -> tuple[int, dict]:
+    """What crom answers for one error, as values: the exit code, and the naming a script
+    branches on.
+
+    Split out of `_answer` because `crom down --all` needs the naming without the
+    envelope. A sweep has N failures and one envelope could name only one of them, so the
+    reason travels on the row that failed — and it is built here, from the same `_ANSWERS`
+    lookup and the same `detail()` call the envelope is built from, so a row's vocabulary
+    and an envelope's cannot drift into two spellings of one refusal.
+    [LAW:one-source-of-truth]
+
+    No message, because the two callers do not have one. `_answer` renders `str(error)`
+    for a `CromError` and `filename: strerror` for an `OSError`, while a sweep row carries
+    `str(error)` under its own `error` key either way — so a message handed back from here
+    would be a third spelling, and wrong for one of them.
+    """
+    answer = next(a for a in _ANSWERS if isinstance(error, a.error))
+    detail = answer.detail(error)
+    return answer.code, {
+        "kind": answer.kind,
+        "reason": detail.reason,
+        # Always present, `{}` where the reason declares no fields, so a caller reads one
+        # shape rather than testing for the key first. [LAW:dataflow-not-control-flow]
+        "fields": detail.fields,
+    }
+
+
 def _answer(ctx: click.Context, error: Exception, message: str) -> _Failure:
     """crom's whole answer to a failed command: the machine's copy on stdout when one was
     asked for, and the exception carrying the human's copy and the exit code.
@@ -261,24 +291,13 @@ def _answer(ctx: click.Context, error: Exception, message: str) -> _Failure:
     gets the quiet ending every other broken pipe gets. [LAW:single-enforcer] the rule
     keeps one home rather than growing a second guard beside it.
     """
-    answer = next(a for a in _ANSWERS if isinstance(error, a.error))
+    code, naming = _reported(error)
     # Absent only where the parse itself failed, since nothing crom does runs ahead of
     # it: a malformed command line reaches the user as prose because the flag on it was
     # never understood either. The envelope answers for a command crom has understood.
     if ctx.meta.get(_JSON_REQUESTED, False):
-        detail = answer.detail(error)
-        envelope = {
-            "code": answer.code,
-            "kind": answer.kind,
-            "reason": detail.reason,
-            # Always present, `{}` where the reason declares no fields, so a caller reads
-            # one shape rather than testing for the key first.
-            # [LAW:dataflow-not-control-flow]
-            "fields": detail.fields,
-            "message": message,
-        }
-        click.echo(_json_text({"error": envelope}))
-    return _Failure(message, answer.code)
+        click.echo(_json_text({"error": {"code": code, **naming, "message": message}}))
+    return _Failure(message, code)
 
 
 # How `crom --help` groups its commands, as data rather than as prose that has to be
@@ -788,19 +807,181 @@ def up_cmd(
     )
 
 
+def _stop_line(ref: ProfileRef, pids: tuple[int, ...]) -> str:
+    """What one stop reads like, in the one spelling `down` and its sweep both use.
+
+    Empty pids are not the sweep's dead case: it acts on the profiles it just found
+    running, and a browser that exits in the gap between that reading and the signal
+    lands here with nothing stopped. Spelled once, a race in the fleet reads exactly like
+    `crom down` on a profile that was already stopped, because it is the same fact.
+    [LAW:one-source-of-truth]
+    """
+    return f"Stopped {ref} (pid {_pid_list(pids)})" if pids else f"{ref} was not running"
+
+
+def _sweep(session: Session, as_json: bool) -> None:
+    """Stop every profile a browser is up for, reporting each outcome, failures included.
+
+    THE SET IS `crom list --running`'S SET, BY CONSTRUCTION. `hidden` below is the same
+    expression that command uses, read through the same `state.running` — the attribute
+    `describe()` publishes under the key `running` — over a listing built from the same
+    `_scopes_to_list`. The listing is therefore a preview of this sweep rather than a
+    second opinion about the word "running", which is the whole reason the filter was
+    built first. [LAW:one-source-of-truth] a rule spelled twice is two rules with a
+    schedule for disagreeing; matching on `state.slug` here would have been that second
+    copy, and would have skipped exactly the browser a user most wants swept — an
+    `unreachable` one, holding a port it will not give back.
+
+    THE PORT IS NOT ASKED, AND THE SET IS UNCHANGED BY THAT. `running` is true on
+    `ready`, `unreachable` and `unprobed` alike, because liveness comes from the process
+    table: `_reachability` answers `Stopped` on an empty pid reading before it looks at
+    the port at all. So `unasked_ports` selects the same profiles `probe_ports` would, and
+    selects them without spending `PORT_REPLY_SECONDS` on each wedged browser in the
+    fleet — the cost that made batching matter for `list`. It also keeps `down` a command
+    that takes no reading: what it publishes is what `chrome.kill` established.
+    [LAW:effects-at-boundaries] the one reading this does take, `chrome.scan`, is taken
+    once for the whole fleet.
+
+    WHAT CROM READ NO STATE FOR IS REPORTED, NEVER ACTED ON. `hidden` can only hold refs
+    `chrome.health` answered for, so an unresolvable declaration survives the narrowing
+    the same way it survives `crom list --running` — and then falls to the `FailedProfile`
+    arm, which renders it and stops nothing. [LAW:parse-dont-validate] the absence of an
+    answer is not the answer "no", and a declaration crom cannot resolve is exactly where
+    a browser it cannot see would be hiding.
+
+    A FAILED STOP DOES NOT ABORT THE SWEEP, AND DOES NOT PASS FOR SUCCESS EITHER. Each
+    stop is caught where it happens, becomes a row, and the sweep goes on to the next
+    profile; the exit code then answers for all of them at once. [LAW:no-silent-failure]
+    exit 0 from a sweep that left a browser running would be crom claiming work it did
+    not do — the failure is loud in stdout, in stderr and in `$?`.
+
+    THE REASON RIDES THE ROW, BECAUSE A SWEEP HAS ONE PER FAILURE. Every other command
+    answers with `_answer`'s envelope, which names a single refusal. This one can fail on
+    `myproj/a` with `chrome_stop_failed` and on `user/b` with `EPERM` in the same run, so
+    an envelope would name one of those and drop the other — and would land after the
+    records array, where a reader that parses one document never reaches it. Each row
+    carries `failure` instead: the `kind`, `reason` and `fields` `_reported` draws from
+    `_ANSWERS`, `null` where nothing failed there. [LAW:one-source-of-truth] One key
+    rather than three beside `error`, because a row holding a reason and no kind is a
+    state with no meaning — nested, a failure is present or absent and never half of one.
+    [LAW:types-are-the-program]
+
+    An unresolved declaration does not fail the sweep, though it is reported. "A browser
+    is still up" and "a declaration is malformed" are different next moves, and a sweep
+    that answered 1 for both would leave a script unable to separate them — the same test
+    `Reason` applies to its slugs. The row is the signal there; the exit code is reserved
+    for stops crom attempted and could not establish.
+    """
+    scopes, unavailable = _scopes_to_list(session, everything=False)
+    listing = [entry for scope in scopes for entry in resolver.resolve_all(scope)]
+    standing = chrome.health(
+        (entry for entry in listing if isinstance(entry, ResolvedProfile)),
+        chrome.scan(),
+        chrome.unasked_ports,
+    )
+    hidden = {ref for ref, state in standing.items() if not state.running}
+    listing = [entry for entry in listing if entry.ref not in hidden]
+
+    records, lines, failed = [], [], []
+    for entry in listing:
+        match entry:
+            case ResolvedProfile():
+                try:
+                    pids = operations.down(entry)
+                except (CromError, OSError) as error:
+                    # The state crom read before the attempt, because the attempt is
+                    # exactly what did not happen — publishing `Stopped()` here would
+                    # report a browser that is still up as down. The `error` beside it is
+                    # what `chrome.kill` observed, which names the half that failed.
+                    failed.append(entry.ref)
+                    # The code is dropped on purpose: it belongs to the command, and a
+                    # per-row copy would be a number that means nothing on its own.
+                    _, failure = _reported(error)
+                    record = {
+                        **entry.describe(standing[entry.ref]),
+                        "stopped": [],
+                        "error": str(error),
+                        "failure": failure,
+                    }
+                    line = f"{entry.ref} — {error}"
+                else:
+                    record = {
+                        **entry.describe(Stopped()),
+                        "stopped": list(pids),
+                        "error": None,
+                        "failure": None,
+                    }
+                    line = _stop_line(entry.ref, pids)
+            case FailedProfile():
+                record = {**entry.describe(), "failure": None}
+                line = f"{entry.ref} — unresolved — {entry.error}"
+        records.append(record)
+        lines.append(line)
+
+    # Empty while the sweep asks only the scopes `crom list` shows by default, since that
+    # is the arm of `_scopes_to_list` that loads no remembered namespace and so cannot
+    # fail to. Rendered rather than dropped because the pair is what that function
+    # answers with: taking half of it would leave a namespace crom could not load to
+    # vanish from the sweep on the day it widens, which is the one row that says crom may
+    # not have seen the whole fleet. [LAW:no-silent-failure]
+    #
+    # `failure` is on this row too, so the key is on every row the sweep publishes and a
+    # consumer reads `row["failure"]` across the whole array without first asking which
+    # kind of row it is holding. `null` because a namespace crom could not load is not a
+    # stop that failed — nothing was attempted here either.
+    # [LAW:dataflow-not-control-flow] The rest of the shape stays what `crom list --all`
+    # publishes for this same fact, spelled the same way. [LAW:one-source-of-truth]
+    for namespace, error in unavailable:
+        records.append({"namespace": namespace, "error": error, "failure": None})
+        lines.append(f"{namespace}/ — unavailable — {error}")
+
+    # One document on stdout, and the summary on stderr — so a `--json` reader parses the
+    # rows it would have parsed on a clean sweep rather than an error envelope appended
+    # after them. Every failure is already in those rows; what `_answer` would add is a
+    # second telling. [LAW:one-source-of-truth]
+    _emit(as_json, records, lines or ["Nothing running to stop."])
+    if failed:
+        raise _Failure(f"could not stop: {', '.join(str(ref) for ref in failed)}", EXIT_FAILURE)
+
+
 @main.command("down")
-@click.argument("ref", required=False, default="default")
+@click.argument("ref", required=False)
+@click.option(
+    "--all",
+    "everything",
+    is_flag=True,
+    help="Stop every profile crom list --running shows, instead of one named profile.",
+)
 @_json_option
 @click.pass_obj
-def down_cmd(session: Session, ref: str, as_json: bool):
-    """Stop a running profile."""
-    profile = session.profile(ref)
+def down_cmd(session: Session, ref: str | None, everything: bool, as_json: bool):
+    """Stop a running profile, or the whole fleet with `--all`.
+
+    `crom down --all` stops exactly the profiles `crom list --running` shows, so run that
+    listing first to see what the sweep will take down. It keeps going when one profile
+    fails and reports every outcome, and it leaves alone what it could not resolve —
+    crom read no state for those, so it has nothing there it could claim to stop.
+    """
+    # Refused here, and `_sweep` takes no ref at all, so the illegal pairing cannot be
+    # expressed past this line rather than being defended against below it.
+    # [LAW:parse-dont-validate] There is no reading of `crom down ci --all` that is not a
+    # mistake: one arm names a profile and the other names every profile, and honouring
+    # either would be crom picking which half of the command line to believe.
+    if everything and ref is not None:
+        raise click.UsageError("--all stops every running profile; it takes no REF.")
+    if everything:
+        return _sweep(session, as_json)
+
+    # `if ref is None` and not `ref or`, because the two facts an optional argument can
+    # carry — "no REF was given" and "the REF given was empty" — are different, and `or`
+    # collapses them. A script interpolating an unset `$PROFILE` writes `crom down ""`,
+    # which used to be refused by `validate_name` with `invalid_name` and would otherwise
+    # stop `default` instead: a wrong profile stopped quietly, in place of a loud refusal.
+    # [LAW:no-silent-failure] the discriminator is whether click was given the argument,
+    # which it already answers with `None`. [LAW:parse-dont-validate]
+    profile = session.profile("default" if ref is None else ref)
     pids = operations.down(profile)
-    message = (
-        f"Stopped {profile.ref} (pid {_pid_list(pids)})"
-        if pids
-        else f"{profile.ref} was not running"
-    )
+    message = _stop_line(profile.ref, pids)
     # `Stopped()` rather than a reading taken here: `chrome.kill` returns only once the
     # process is gone *and* the port is free, or raises — so this command's own
     # postcondition is what the state says, and probing to be told what crom has just

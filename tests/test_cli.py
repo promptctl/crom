@@ -1659,6 +1659,306 @@ class CliTest(unittest.TestCase):
         """The flag is only usable if `crom list --help` says it exists."""
         self.assertIn("--running", self.crom("list", "--help"))
 
+    # --- the fleet, swept ---------------------------------------------------------------
+
+    @staticmethod
+    def _stopped(**pids_by_name):
+        """A `chrome.kill` answering per profile: pids where the stop took, and a raised
+        `CromError` where it did not — which is how `chrome.kill` reports both."""
+
+        def kill(profile):
+            outcome = pids_by_name[profile.ref.name]
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        return kill
+
+    @staticmethod
+    def _asked_to_stop(killer) -> set[str]:
+        """Which profiles the sweep actually signalled, read off the stub's own record.
+
+        The refs it *reported* are the other half of the claim and are asserted beside
+        this, never instead of it: a sweep that printed a row and stopped nothing would
+        satisfy every assertion made on its output alone.
+        """
+        return {str(call.args[0].ref) for call in killer.call_args_list}
+
+    def test_down_all_stops_exactly_the_profiles_list_running_shows(self):
+        """The listing is a preview of the sweep, asserted as one equality from outside.
+
+        This is the claim `--running` was built first to make, and the only one that
+        cannot be kept by two filters that merely agree today: both sets are taken from
+        one fixture in one run, so a sweep keyed on anything other than the `running` the
+        listing publishes fails here rather than the day a fifth state lands. Asserted
+        against what was signalled as well as what was reported, because a sweep that
+        reports a row it never acted on is the failure this equality exists to catch.
+        """
+        self.crom("init")
+        self.crom("add", "answers", "--port", "9401")
+        self.crom("add", "wedged", "--port", "9402")
+        self.crom("add", "idle", "--port", "9403")
+        live = {self._dir_of("answers"): (4242,), self._dir_of("wedged"): (4243,)}
+
+        with mock.patch("crom.chrome.scan", return_value=live):
+            previewed = {
+                row["ref"] for row in json.loads(self.crom("list", "--running", "--json"))
+            }
+            with mock.patch("crom.chrome.kill", return_value=(4242,)) as killer:
+                swept = {row["ref"] for row in json.loads(self.crom("down", "--all", "--json"))}
+
+        self.assertEqual(previewed, {"myproj/answers", "myproj/wedged"})
+        self.assertEqual(swept, previewed)
+        self.assertEqual(self._asked_to_stop(killer), previewed)
+
+    def test_down_all_sweeps_the_user_namespace_a_project_listing_already_reaches(self):
+        """`crom list` from inside a project shows `user/` too, so the sweep must reach it.
+
+        A personal browser is addressable from every project on the machine and is exactly
+        the one a user forgets is running. Scoping the sweep to the project crom happens to
+        be standing in would leave `crom list --running` naming a profile `crom down --all`
+        never signalled — the two commands disagreeing about the fleet, in the direction
+        that quietly leaves a browser up.
+        """
+        self.crom("init")
+        self.crom("add", "here", "--port", "9401")
+        live = {self._dir_of("here"): (4242,), self._dir_of("user/default"): (4243,)}
+
+        with mock.patch("crom.chrome.scan", return_value=live):
+            previewed = {
+                row["ref"] for row in json.loads(self.crom("list", "--running", "--json"))
+            }
+            with mock.patch("crom.chrome.kill", return_value=(4243,)) as killer:
+                self.crom("down", "--all")
+
+        self.assertEqual(previewed, {"myproj/here", "user/default"})
+        self.assertEqual(self._asked_to_stop(killer), previewed)
+
+    def test_down_all_stops_the_wedged_browser_the_listing_calls_unreachable(self):
+        """The profile a fleet sweep exists for, and the one a slug filter would skip.
+
+        `unreachable` is a process holding the user-data-dir with nothing answering on the
+        port — it is holding that port and will not give it back, so it is the row a user
+        runs this command *because* of. The state is established through the listing
+        first, so this asserts against crom's own published word rather than against a
+        fixture only this test can read.
+        """
+        self.crom("init")
+        self.crom("add", "wedged", "--port", "9402")
+
+        with mock.patch("crom.chrome.scan", return_value={self._dir_of("wedged"): (4243,)}):
+            (row,) = [
+                row
+                for row in json.loads(self.crom("list", "--json"))
+                if row["ref"] == "myproj/wedged"
+            ]
+            with mock.patch("crom.chrome.kill", return_value=(4243,)) as killer:
+                output = self.crom("down", "--all")
+
+        self.assertEqual(row["state"], "unreachable")
+        self.assertEqual(self._asked_to_stop(killer), {"myproj/wedged"})
+        self.assertIn("Stopped myproj/wedged (pid 4243)", output)
+
+    def test_down_all_asks_no_port_because_liveness_is_the_process_table(self):
+        """`down` publishes what it established, and a sweep does not change that.
+
+        Every profile the sweep acts on is live in the process table, and `running` is
+        already true for all three live states — so the port's half of the answer decides
+        nothing here, and asking it would spend `PORT_REPLY_SECONDS` on each wedged
+        browser to arrive at the same set. The socket goes underneath the stub so any
+        route to the network fails the test, whatever it is named.
+        """
+        self.crom("init")
+        self.crom("add", "live", "--port", "9401")
+        live = {self._dir_of("live"): (4242,)}
+
+        with (
+            mock.patch("crom.chrome.scan", return_value=live),
+            mock.patch("crom.chrome.kill", return_value=(4242,)) as killer,
+            self._the_network_must_not_be_touched(),
+        ):
+            output = self.crom("down", "--all")
+
+        self.assertEqual(self._asked_to_stop(killer), {"myproj/live"})
+        self.assertIn("Stopped myproj/live (pid 4242)", output)
+
+    def test_down_all_sweeps_on_past_a_stop_it_could_not_establish(self):
+        """One wedged profile must not cost the user every other browser in the fleet.
+
+        The sweep continues, reports the failure beside the stops that took, and still
+        answers non-zero — a script that reads `$?` alone must not be told a browser was
+        stopped when it is still up. The profile added last is what makes this a test of
+        resilience rather than of ordering: it is signalled after the failure.
+        """
+        self.crom("init")
+        self.crom("add", "first", "--port", "9401")
+        self.crom("add", "stuck", "--port", "9402")
+        self.crom("add", "last", "--port", "9403")
+        live = {self._dir_of(name): (4242,) for name in ("first", "stuck", "last")}
+        wedged = Reason.CHROME_STOP_FAILED.error("could not stop 'myproj/stuck': port still held")
+
+        with (
+            mock.patch("crom.chrome.scan", return_value=live),
+            mock.patch(
+                "crom.chrome.kill",
+                side_effect=self._stopped(first=(4242,), stuck=wedged, last=(4244,)),
+            ) as killer,
+        ):
+            result = self.invoke("down", "--all", expect=1)
+
+        self.assertEqual(self._asked_to_stop(killer), {"myproj/first", "myproj/stuck", "myproj/last"})
+        self.assertIn("Stopped myproj/first (pid 4242)", result.output)
+        self.assertIn("Stopped myproj/last (pid 4244)", result.output)
+        self.assertIn("port still held", result.output)
+
+    def test_down_all_publishes_a_failed_stop_as_a_row_that_still_says_running(self):
+        """A stop that did not happen is not published as a profile that is down.
+
+        `down` reports `Stopped()` because `chrome.kill` guarantees it; where that
+        guarantee was refused the row carries the state crom read going in, so a consumer
+        reading `running` off the sweep's own output is not told a live browser is dead.
+        `error` and `failure` are on every row — `null` where nothing failed there — so
+        the shape a consumer parses does not depend on which rows failed, which is why all
+        three kinds of row a sweep can publish are in one listing here.
+
+        `failure` is where this command's reason slug lives. Every other command answers
+        one failure and can name it in the `--json` envelope; a sweep fails once per
+        profile, and one envelope would publish one of those and drop the rest. `kind` and
+        `fields` are asserted beside `reason` because the row is built from the same
+        `_ANSWERS` table the envelope is built from: a row built from the wrong entry of
+        that table would still spell the reason right, and only `kind` would show it.
+        """
+        self.crom("init")
+        self.crom("add", "took", "--port", "9401")
+        self.crom("add", "stuck", "--port", "9402")
+        live = {self._dir_of(name): (4242,) for name in ("took", "stuck")}
+        wedged = Reason.CHROME_STOP_FAILED.error("could not stop 'myproj/stuck': port still held")
+        config_path = self.project / ".crom.toml"
+        config_path.write_text(
+            config_path.read_text() + '\n[profiles.broken]\nflags = ["--x=${CROM_NOPE}"]\n'
+        )
+
+        with (
+            mock.patch("crom.chrome.scan", return_value=live),
+            mock.patch(
+                "crom.chrome.kill", side_effect=self._stopped(took=(4242,), stuck=wedged)
+            ),
+        ):
+            rows = {
+                row["ref"]: row
+                for row in json.loads(self.invoke("down", "--all", "--json", expect=1).stdout)
+            }
+
+        self.assertEqual(rows["myproj/took"]["state"], "stopped")
+        self.assertFalse(rows["myproj/took"]["running"])
+        self.assertEqual(rows["myproj/took"]["stopped"], [4242])
+        # Subscripted rather than `.get`: present-and-null is the contract, so a key that
+        # went missing must fail here instead of reading as the null it should have been.
+        self.assertIsNone(rows["myproj/took"]["error"])
+        self.assertIsNone(rows["myproj/took"]["failure"])
+
+        self.assertTrue(rows["myproj/stuck"]["running"])
+        self.assertEqual(rows["myproj/stuck"]["stopped"], [])
+        self.assertIn("port still held", rows["myproj/stuck"]["error"])
+        self.assertEqual(
+            rows["myproj/stuck"]["failure"],
+            {"kind": "failure", "reason": "chrome_stop_failed", "fields": {}},
+        )
+
+        # No stop was attempted for a declaration crom could not resolve, so nothing
+        # failed there — and the row says so in the key the other two answer in.
+        self.assertIsNone(rows["myproj/broken"]["failure"])
+
+    def test_down_all_reports_what_it_could_not_resolve_and_signals_nothing_for_it(self):
+        """crom read no state for these, so it has nothing there it could claim to stop.
+
+        The row stays visible for the reason `--running` keeps it: an unresolvable
+        declaration is exactly where a browser crom cannot see would be hiding, and
+        dropping it would answer a question nobody was able to put. It does not fail the
+        sweep either — "a browser is still up" and "a declaration is malformed" are
+        different next moves, and one exit code answering for both leaves a script unable
+        to tell them apart.
+        """
+        self.crom("init")
+        self.crom("add", "live", "--port", "9401")
+        live = {self._dir_of("live"): (4242,)}
+        config_path = self.project / ".crom.toml"
+        config_path.write_text(
+            config_path.read_text() + '\n[profiles.broken]\nflags = ["--x=${CROM_NOPE}"]\n'
+        )
+
+        with (
+            mock.patch("crom.chrome.scan", return_value=live),
+            mock.patch("crom.chrome.kill", return_value=(4242,)) as killer,
+        ):
+            output = self.crom("down", "--all")
+
+        self.assertIn("myproj/broken", output)
+        self.assertIn("unresolved", output)
+        self.assertEqual(self._asked_to_stop(killer), {"myproj/live"})
+
+    def test_down_all_says_so_rather_than_printing_nothing_when_none_are_running(self):
+        """Silence from a command that acts reads like a crash, and this one did nothing."""
+        self.crom("init")
+        self.crom("add", "idle")
+
+        with (
+            mock.patch("crom.chrome.scan", return_value={}),
+            mock.patch("crom.chrome.kill") as killer,
+        ):
+            output = self.crom("down", "--all")
+
+        self.assertIn("Nothing running to stop", output)
+        killer.assert_not_called()
+
+    def test_down_all_refuses_a_ref_rather_than_believing_half_the_command_line(self):
+        """`crom down ci --all` names one profile and every profile at once.
+
+        There is no reading of it that is not a mistake, and honouring either half would
+        be crom picking which one to believe — silently stopping a fleet the user did not
+        ask for, or silently ignoring the flag they typed.
+        """
+        self.crom("init")
+        self.crom("add", "ci")
+
+        with mock.patch("crom.chrome.kill") as killer:
+            result = self.invoke("down", "ci", "--all", expect=2)
+
+        self.assertIn("--all", result.output)
+        killer.assert_not_called()
+
+    def test_down_refuses_an_empty_ref_rather_than_stopping_the_default_profile(self):
+        """`crom down ""` and `crom down` carry two different facts, and `or` collapsed them.
+
+        A script interpolating an unset `$PROFILE` writes the first and has named no
+        profile at all. Read as the second it would stop `myproj/default` — a browser the
+        script never asked about, quietly and with exit 0 — where the empty name reaching
+        `validate_name` is refused with `invalid_name` at exit 1, the same refusal every
+        other command answers it with. The discriminator is whether click was given the
+        argument, which it already answers with `None`. [LAW:no-silent-failure]
+        """
+        self.crom("init")
+
+        with mock.patch("crom.chrome.kill") as killer:
+            result = self.invoke("down", "", "--json", expect=1)
+
+        self.assertEqual(json.loads(result.stdout)["error"]["reason"], "invalid_name")
+        # The harm this refusal exists to prevent is a stop, so the assertion is that
+        # nothing was stopped — not merely that crom said something.
+        killer.assert_not_called()
+
+    def test_down_documents_the_sweep_against_the_listing_that_previews_it(self):
+        """A sweep is only safe to run if `--help` says what it will take down.
+
+        Naming the flag is not enough here: the whole discipline of this command is that
+        `crom list --running` shows the set first, and a reader who is not told that has
+        no way to look before acting.
+        """
+        documented = self.crom("down", "--help")
+
+        self.assertIn("--all", documented)
+        self.assertIn("crom list --running", documented)
+
     # --- the fourth state, and the flag that produces it --------------------------------
 
     @contextlib.contextmanager
@@ -5553,6 +5853,32 @@ class CliTest(unittest.TestCase):
 
         self.assertEqual(set(_readme_names(sentence[1])), offering)
         self.assertEqual(set(_readme_names(sentence[2])), commands - offering)
+
+    def test_no_option_help_carries_markup_click_would_print_literally(self):
+        """click renders `help=` verbatim, so a backtick in one reaches the terminal.
+
+        The command docstrings do use backticks and keep them: `crom list --help` and
+        `crom status --help` have printed them since those commands were written, and a
+        paragraph of prose reads either way. An option's help is one cell of a two-column
+        table, where a stray backtick is punctuation a reader steps over rather than
+        emphasis they can take or leave — `--all` on `down` shipped as ``Stop every
+        profile `crom list --running` shows`` and printed the backticks.
+
+        Read out of click rather than from a list of option names written here, which
+        would be a second copy of the CLI's own parameters — green for exactly as long as
+        nobody adds an option. [LAW:one-source-of-truth]
+
+        Asserted as the whole set rather than one flag at a time so a failure names every
+        option that has drifted, not merely the first the loop reached.
+        """
+        marked = {
+            f"crom {name} {parameter.opts[0]}"
+            for name in cli.main.list_commands(None)
+            for parameter in cli.main.get_command(None, name).params
+            if "`" in (getattr(parameter, "help", None) or "")
+        }
+
+        self.assertEqual(marked, set())
 
     # --- crom's own version ----------------------------------------------------------
 
