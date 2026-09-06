@@ -531,6 +531,9 @@ crom status [REF]             what the browser on its port actually is — pids 
 crom add NAME [--seed SEED]   declare a profile in the config governing this directory
 crom rm REF                   stop it if running, undeclare it, release its port, delete its data
 crom init [NS] [--seed SEED]  write a .crom.toml here
+crom snapshot capture         copy a stopped profile's data under a name, for other
+  NAME [REF]                  profiles to start from; refuses a profile a browser is
+                              writing, or one a browser was killed in
 crom config [REF]             which config is in effect, and the exact Chrome command line
                               — each flag attributed to the layer that supplied it
 crom port [REF]               print the port

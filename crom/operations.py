@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from pathlib import Path
 
-from . import chrome, config, configwrite, doctor, drift, flags, paths, registry, report, seed
+from . import chrome, config, configwrite, doctor, drift, flags, locking, paths, registry, report, seed
 from . import resolve as resolver
 from .model import (
     DEFAULT_SEED,
@@ -703,17 +703,39 @@ def capture(profile: ResolvedProfile, name: str) -> Capture:
     the only honest answers are "made it" and "there is already one of those".
     [LAW:no-silent-failure]
 
-    Under the profile's own lock, so a `crom up` racing this waits rather than launching
-    Chrome into the directory being read. That does not cover a browser the user starts
-    by hand, which is what `seed.capture`'s before-and-after reads are for; the two close
-    different halves of the same window. [LAW:no-ambient-temporal-coupling]
+    Two locks, because a capture touches two resources and each has its own claimant.
+    `locking.exclusive(destination)` is what makes the existence check mean anything: it
+    is keyed on the *name*, so two captures of different profiles under one name are
+    serialized and the loser reads the winner's directory. Without it both pass the check
+    and the loser's `os.replace` raises a bare `ENOTEMPTY` — the OS answering a question
+    this function promises to answer itself. `seed.profile_lock` is the other half, and
+    keeps a racing `crom up` from launching Chrome into the source mid-read. Nothing else
+    in crom takes both, so there is no order for them to deadlock against; the name is
+    claimed for the whole operation, so it is the outer one.
+    [LAW:no-ambient-temporal-coupling]
+
+    A browser the *user* starts by hand is outside both locks, which is what
+    `seed.capture`'s before-and-after reads are for.
 
     The size is measured from the finished snapshot rather than from the profile, so what
     the caller reports is what was actually kept — a profile is several times its
     snapshot, and quoting the source would name a number that appears nowhere on disk.
     """
     destination = paths.snapshot_dir(name)
-    with seed.profile_lock(profile):
+    # Before either lock: a profile that has never been up has nothing to capture, and
+    # that is a different answer from every refusal below it. Reaching `seed.capture`
+    # with it would land in `_copy`'s missing-source arm, which answers `seed_missing` —
+    # written for a seed a config names, and the wrong next move for a caller who needs
+    # to run `crom up` first. [LAW:no-silent-failure]
+    if not profile.profile_dir.exists():
+        raise Reason.PROFILE_NO_DATA.error(
+            f"{profile.ref} has no data to capture yet:\n"
+            f"  {profile.profile_dir} does not exist\n"
+            f"crom creates a profile's directory the first time it launches the browser. "
+            f"Run `crom up {profile.ref}`, sign in to what the snapshot is for, quit the "
+            f"browser, and capture then."
+        )
+    with locking.exclusive(destination), seed.profile_lock(profile):
         if destination.exists():
             raise Reason.SNAPSHOT_EXISTS.error(
                 f"a snapshot named '{name}' is already there:\n"

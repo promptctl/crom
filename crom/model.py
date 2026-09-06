@@ -280,6 +280,13 @@ class Reason(Enum):
     # clean state before a copy of it is worth keeping.
     PROFILE_UNCLEAN = ("profile_unclean", CromError)
 
+    # A profile that is declared but has never been brought up, so there is no
+    # user-data-dir to copy. Distinct from `seed_missing`, which says the seed a config
+    # names is not on disk: the next move there is to fix the config, and the next move
+    # here is `crom up`. [LAW:one-source-of-truth] the slug is what a script branches on,
+    # and one slug cannot carry two next moves.
+    PROFILE_NO_DATA = ("profile_no_data", CromError)
+
     # The move to the namespaced layout, which runs before every command until it takes.
     MIGRATION_BLOCKED = ("migration_blocked", CromError)
     MIGRATION_NEEDS_QUIET = ("migration_needs_quiet", CromError)

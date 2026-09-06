@@ -15,7 +15,10 @@ import re
 import shlex
 import shutil
 import socket
+import threading
 import subprocess
+import sys
+import time
 import tempfile
 import unittest
 from dataclasses import replace
@@ -27,7 +30,7 @@ from unittest import mock
 from click.shell_completion import ShellComplete
 from click.testing import CliRunner
 
-from crom import chrome, cli, config, configwrite, doctor, launched, mcp, migrate, operations, registry
+from crom import chrome, cli, config, configwrite, doctor, launched, mcp, migrate, operations, registry, seed
 from crom.config import load_ambient
 from crom.model import USER_NAMESPACE, Conflict, CromError, ProfileRef, Reason, parse_ref
 from crom.paths import registry_file, state_home, user_config_file
@@ -73,6 +76,37 @@ def _commands_offering_json() -> set[str]:
 # version crom reports. A test that *is* about it names its own strings inline.
 BROWSER = "Chrome/152.0.7977.76"
 BROWSER_WEBSOCKET = "ws://127.0.0.1:9401/devtools/browser/45e0cffe-114f-49ae-857b-531c7c06e1ad"
+
+
+def _dead_pid() -> int:
+    """A pid that has certainly exited — spawned, waited on, and reaped.
+
+    `chrome.singleton_holder` reads a dead pid as *free*, so a lock naming one is how a
+    test reaches the crashed-browser arm rather than the busy one.
+    """
+    proc = subprocess.Popen([sys.executable, "-c", ""])
+    proc.wait()
+    return proc.pid
+
+
+def _invocations() -> tuple[tuple[str, ...], ...]:
+    """Every command a user can actually run, as the words they would type.
+
+    Walks past a group rather than stopping at it. `cli.main.commands` answers with
+    `snapshot` — a group, which runs nothing — and a test that iterates it believes it
+    has covered `crom snapshot capture` while never having reached it. That is how the
+    class `CromSubGroup` exists to be would have gone untested by the very sweep written
+    to catch an uncovered command. [LAW:one-source-of-truth]
+    """
+    def walk(command, path: tuple[str, ...]) -> tuple[tuple[str, ...], ...]:
+        children = getattr(command, "commands", None)
+        if not children:
+            return (path,)
+        return tuple(
+            leaf for name, child in children.items() for leaf in walk(child, (*path, name))
+        )
+
+    return walk(cli.main, ())
 
 
 def _commands_offering_no_probe() -> set[str]:
@@ -5242,6 +5276,96 @@ class CliTest(unittest.TestCase):
         self.assertIn("profile 'myproj/ci' is in use", str(error))
         self.assertFalse((state_home() / "snapshots" / "logged-in").exists())
 
+    def test_capturing_a_profile_a_browser_was_killed_in_is_refused(self):
+        """The refusal the feature exists for, asserted where a user meets it.
+
+        Chrome removes its singletons on the way out, so a directory nothing is running
+        in that still holds them is one a browser was killed in — and a killed Chrome
+        left its SQLite databases mid-transaction. The dead pid is the whole point of the
+        setup: `chrome.singleton_holder` reads it as *free*, so this cannot be reached by
+        the busy arm and is genuinely its own refusal.
+        """
+        self.crom("init")
+        directory = self._a_profile_with_data()
+        os.symlink(f"{socket.gethostname()}-{_dead_pid()}", directory / chrome.SINGLETON_LOCK)
+
+        error = self.failure("snapshot", "capture", "logged-in", "ci")
+
+        self.assertIs(error.reason, Reason.PROFILE_UNCLEAN)
+        self.assertIn("profile 'myproj/ci' was not shut down cleanly", str(error))
+        self.assertFalse((state_home() / "snapshots" / "logged-in").exists())
+
+    def test_capturing_a_profile_that_has_never_been_up_says_to_bring_it_up(self):
+        """A declared profile with no directory yet is its own answer, not a missing seed.
+
+        Both halves matter to a script: `seed_missing` means the seed your config names
+        is not on disk, and the next move is to fix the config; this means the profile
+        was never started, and the next move is `crom up`. One slug cannot carry two next
+        moves, which is the whole reason `Reason` publishes slugs at all.
+        """
+        self.crom("init")
+        self.crom("add", "ci")
+
+        error = self.failure("snapshot", "capture", "logged-in", "ci")
+
+        self.assertIs(error.reason, Reason.PROFILE_NO_DATA)
+        self.assertIn("crom up myproj/ci", str(error))
+
+    def test_two_captures_racing_for_one_name_leave_the_loser_a_conflict(self):
+        """The existence check is worth only as much as the lock it runs under.
+
+        Locked on the *source* profile alone, two captures of different profiles under one
+        name take two different locks, both read no destination, and the loser's
+        `os.replace` answers with a bare ENOTEMPTY — the OS answering a question this
+        command promises to answer itself, at the wrong exit code and with no way to tell
+        which capture landed.
+
+        Same shape as `ConcurrentMaterializeTest`, and slowed for the same reason: two
+        descriptors make `fcntl.flock` serialize threads exactly as it would processes,
+        and the sleep is what forces the interleaving rather than hoping for it. The
+        operation is called directly rather than through `self.crom`, because `invoke`
+        chdirs and the working directory is process-wide.
+        """
+        self.crom("init")
+        self._a_profile_with_data("one")
+        self._a_profile_with_data("two")
+        with self._standing_in(None):
+            session = cli.Session.begin()
+            racers = (session.profile("one"), session.profile("two"))
+
+        real_copytree = shutil.copytree
+
+        def slow_copytree(*args, **kwargs):
+            time.sleep(0.05)
+            return real_copytree(*args, **kwargs)
+
+        made, refused, broke = [], [], []
+
+        def go(profile):
+            try:
+                made.append(operations.capture(profile, "logged-in"))
+            except CromError as e:
+                refused.append(e)
+            except BaseException as e:  # noqa: BLE001 - reported, never swallowed
+                broke.append(e)
+
+        with mock.patch.object(seed.shutil, "copytree", slow_copytree):
+            threads = [threading.Thread(target=go, args=(p,)) for p in racers]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+        # Nothing escaped as an OS-level failure: the loser was refused in crom's own
+        # words, which is the whole difference the destination lock makes.
+        self.assertEqual(broke, [])
+        self.assertEqual(len(made), 1)
+        self.assertEqual([e.reason for e in refused], [Reason.SNAPSHOT_EXISTS])
+        snapshot = state_home() / "snapshots" / "logged-in"
+        self.assertEqual((snapshot / "Default" / "Cookies").read_text(), "sqlite")
+        # And the loser left no staging directory beside the winner's snapshot.
+        self.assertEqual([q for q in snapshot.parent.iterdir() if q.is_dir()], [snapshot])
+
     def test_a_name_a_snapshot_already_answers_to_is_refused_rather_than_overwritten(self):
         """The one place snapshots part company with the rest of crom, which reports a
         state already reached and exits 0. A snapshot is its contents, and two captures
@@ -5887,9 +6011,31 @@ class CliTest(unittest.TestCase):
             self.crom("list", expect=1)
 
             self.assertIn("Usage:", self.crom("--help"))
-            for name in cli.main.commands:
-                with self.subTest(command=name):
-                    self.assertIn("Usage:", self.crom(name, "--help"))
+            for path in _invocations():
+                with self.subTest(command=" ".join(path)):
+                    self.assertIn("Usage:", self.crom(*path, "--help"))
+
+    def test_a_command_nested_under_a_group_is_readied_like_any_other(self):
+        """What `CromSubGroup` exists for, asserted where it can fail.
+
+        Readying is `CromCommand.invoke`'s job, and `CromGroup.command_class` only reaches
+        commands built directly on the root group. A subgroup left to click's default
+        `group_class` builds plain `click.Command`s, so `crom snapshot capture` would be
+        the one command in the CLI that ran without crom being ready — reaching its body
+        with no `Session` on `ctx.obj` and crashing on the attribute, rather than
+        answering the refusal like every sibling.
+
+        The refusal is asserted, not merely the absence of a crash: `expect=1` alone would
+        pass just as green on a `TypeError` escaping through `catch_exceptions=False`.
+        """
+        self.crom("init")
+        with mock.patch(
+            "crom.session._bootstrap_user_config",
+            side_effect=Reason.CONFIG_UNWRITABLE.error("could not write the user config"),
+        ):
+            result = self.invoke("snapshot", "capture", "logged-in", "ci", expect=1)
+
+        self.assertEqual(result.stderr.strip(), "Error: could not write the user config")
 
     def test_bad_usage_is_the_one_failure_left_without_an_envelope(self):
         """The carve-out the README publishes, and now the only one.

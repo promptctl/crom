@@ -113,9 +113,8 @@ def snapshots_root() -> Path:
 def snapshot_dir(name: str) -> Path:
     """One snapshot's directory, by the name a user typed.
 
-    The name is checked here rather than by each caller because this is the one function
+    The name is checked here rather than by the caller because this is the one function
     that turns a snapshot name into a path, and therefore the one place a `..` could walk
-    out of the root. Capture, `snapshot:` seeding and removal all arrive through it, so
-    none of them can be the one that forgot. [LAW:parse-dont-validate]
+    out of the root. [LAW:parse-dont-validate]
     """
     return snapshots_root() / validate_name("snapshot name", name)

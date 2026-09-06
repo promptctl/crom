@@ -417,6 +417,32 @@ _BOOKKEEPING = frozenset({launched.FILENAME, chrome.STDERR_FILENAME})
 _SINGLETONS = (chrome.SINGLETON_LOCK, "SingletonCookie", "SingletonSocket")
 
 
+def _crashed(source: Path) -> tuple[str, ...]:
+    """Chrome's singletons still sitting in a directory, named — or nothing.
+
+    Evidence, not a verdict, the way `chrome.singleton_holder` is: the same three files
+    mean "a browser is writing this" while one is alive and "a browser died in this"
+    once none is, so the caller that already knows which establishes what they say.
+    """
+    return tuple(name for name in _SINGLETONS if os.path.lexists(source / name))
+
+
+def _refuse_unclean(copy: _Copy, left: tuple[str, ...], lead: str) -> CromError:
+    """What crom says about a profile Chrome did not finish writing."""
+    return Reason.PROFILE_UNCLEAN.error(
+        chrome.printable(
+            f"{copy.described} {lead}:\n"
+            f"  {copy.source}\n"
+            f"  {', '.join(left)} — Chrome removes these on a clean exit\n"
+            f"A browser that left them behind was killed rather than quit, so its Cookies, "
+            f"History and Login Data were last written mid-transaction. A snapshot of that "
+            f"is a profile that fails weeks from now, with nothing pointing back here.\n"
+            f"Bring that profile up and quit the browser from its own menu, then run this "
+            f"again."
+        )
+    )
+
+
 @contextlib.contextmanager
 def _quiet(copy: _Copy) -> Iterator[None]:
     """`_undisturbed`, plus the read only a captured profile can afford: a clean exit.
@@ -434,29 +460,32 @@ def _quiet(copy: _Copy) -> Iterator[None]:
     Capture's source is a profile crom itself owns, which is what makes "bring it up and
     quit it" a remedy crom can actually offer.
 
-    Inside `_undisturbed` rather than beside it, because residue only means an unclean
-    exit once nothing is running: a live browser holds the same three files, and reading
-    them without that established first would tell a user their browser had crashed while
-    they were looking at it. [LAW:no-ambient-temporal-coupling] the ordering is the
-    nesting, not a convention.
+    Read before *and* after, for the reason `_undisturbed` reads its own question twice:
+    one read proves only what was true at the instant crom looked. The window a single
+    read leaves is specific and reachable — a browser that opens after the first read,
+    writes, and then crashes before the copy finishes. `_held` reads its dead pid as free
+    by design, so nothing else in the stack would catch it, and a torn profile would
+    commit.
+
+    Inside `_undisturbed` rather than beside it, because these files only mean a crash
+    once nothing is running: a live browser holds the same three, and reporting them as
+    residue would tell a user their browser had crashed while they were looking at it.
+    [LAW:no-ambient-temporal-coupling] the ordering is the nesting, not a convention.
     """
     with _undisturbed(copy):
-        left = tuple(name for name in _SINGLETONS if os.path.lexists(copy.source / name))
-        if left:
-            raise Reason.PROFILE_UNCLEAN.error(
-                chrome.printable(
-                    f"{copy.described} was not shut down cleanly:\n"
-                    f"  {copy.source}\n"
-                    f"  {', '.join(left)} — Chrome removes these on a clean exit\n"
-                    f"A browser that left them behind was killed rather than quit, so its "
-                    f"Cookies, History and Login Data were last written mid-transaction. "
-                    f"A snapshot of that is a profile that fails weeks from now, with "
-                    f"nothing pointing back here.\n"
-                    f"Bring that profile up and quit the browser from its own menu, then "
-                    f"run this again."
-                )
-            )
+        before = _crashed(copy.source)
+        if before:
+            raise _refuse_unclean(copy, before, "was not shut down cleanly")
         yield
+        after = _crashed(copy.source)
+        # `_undisturbed`'s own after-read runs as this block exits and is about to name a
+        # browser that is *still* holding the directory, which is the more useful sentence
+        # of the two. Deferring to it is what keeps the leads honest in both directions:
+        # this arm speaks only for a browser that has already gone.
+        if after and _held(copy.source) is None:
+            raise _refuse_unclean(
+                copy, after, "was left unclean by a browser that ran while crom was copying it"
+            )
 
 
 def capture(source: Path, destination: Path, described: str) -> None:

@@ -663,6 +663,74 @@ class CaptureTest(unittest.TestCase):
         self.assertIn("SingletonSocket", message)
         self.assertFalse(self.destination.exists())
 
+    def test_a_browser_that_crashed_during_the_copy_is_caught_and_the_copy_discarded(self):
+        """The window one read leaves, and the reason this question is asked twice.
+
+        `_undisturbed` reads *its* question before and after because one read proves only
+        what was true at the instant crom looked. The same is true of this one, and the
+        gap is reachable: a browser that opens after the first read, writes, and then
+        crashes before the copy finishes leaves singletons behind — and
+        `chrome.singleton_holder` reads their dead pid as free by design, so
+        `_undisturbed`'s own after-read sees an idle directory and waves it through. The
+        snapshot would commit from a profile that was torn while it was being copied.
+        """
+        self._lived_in()
+        real_copytree = shutil.copytree
+
+        # `copytree` recurses into itself for subdirectories and the module attribute is
+        # patched, so the hook fires again on every inner call — hence the latch. A
+        # browser crashes once, on whichever directory the walk reaches first.
+        crashed = []
+
+        def crash_midway(*args, **kwargs):
+            if not crashed:
+                # A browser that came and went: it took its singletons and never removed
+                # them, which is the only trace a crash leaves.
+                crashed.append(
+                    os.symlink(
+                        f"{socket.gethostname()}-{_dead_pid()}",
+                        self.source / chrome.SINGLETON_LOCK,
+                    )
+                )
+            return real_copytree(*args, **kwargs)
+
+        with mock.patch.object(seed.shutil, "copytree", side_effect=crash_midway):
+            with self.assertRaises(CromError) as caught:
+                self.capture()
+
+        self.assertIs(caught.exception.reason, Reason.PROFILE_UNCLEAN)
+        self.assertIn("while crom was copying it", str(caught.exception))
+        self.assertFalse(self.destination.exists())
+        self.assertEqual(list(self.destination.parent.iterdir()), [])
+
+    def test_a_browser_still_running_after_the_copy_is_named_as_running_not_as_crashed(self):
+        """Both after-reads see the same three files; only one of them is the right
+        sentence. A live browser holds its singletons too, so an unclean-shutdown refusal
+        here would tell a user their browser had crashed while they were watching it run.
+        The busy arm speaks first, and this one speaks only for a browser already gone."""
+        self._lived_in()
+        real_copytree = shutil.copytree
+
+        started = []
+
+        def opened_midway(*args, **kwargs):
+            if not started:
+                started.append(
+                    os.symlink(
+                        f"{socket.gethostname()}-{os.getpid()}",
+                        self.source / chrome.SINGLETON_LOCK,
+                    )
+                )
+            return real_copytree(*args, **kwargs)
+
+        with mock.patch.object(seed.shutil, "copytree", side_effect=opened_midway):
+            with self.assertRaises(CromError) as caught:
+                self.capture()
+
+        self.assertIs(caught.exception.reason, Reason.SEED_BUSY)
+        self.assertIn("was opened by a browser while crom was copying it", str(caught.exception))
+        self.assertFalse(self.destination.exists())
+
     def test_an_unclean_profile_is_refused_before_the_link_rule_can_mistake_it(self):
         """The reason this refusal is worth its own arm rather than being left to
         `_link_guard`. `SingletonSocket` is an absolute link, so the copy was already
