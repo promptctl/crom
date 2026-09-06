@@ -23,7 +23,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from datetime import timedelta
-from itertools import takewhile
+from itertools import groupby, takewhile
 from pathlib import Path
 from unittest import mock
 
@@ -5245,6 +5245,24 @@ class CliTest(unittest.TestCase):
         self.assertIn("Captured 'logged-in' from myproj/ci", output)
         self.assertIn(str(snapshot), output)
 
+    def test_the_size_a_capture_reports_is_the_snapshot_it_kept(self):
+        """The number crom prints is measured from the snapshot, and the gap is the point.
+
+        A reader who knows their profile is gigabytes needs to see that what crom kept is
+        a fraction of it, or the number reads as a failed copy. Measured from the source
+        instead, the report names a size that appears nowhere on disk — and it would be
+        wrong by exactly the amount `_REGENERATED` excludes, which is most of a profile.
+        """
+        self.crom("init")
+        directory = self._a_profile_with_data()
+        (directory / "Default" / "Cache" / "blob").write_text("x" * 4 * 1024 * 1024)
+
+        output = self.crom("snapshot", "capture", "logged-in", "ci")
+
+        # The profile is four megabytes of cache; the snapshot is the Cookies file.
+        self.assertGreater((directory / "Default" / "Cache" / "blob").stat().st_size, 4_000_000)
+        self.assertRegex(output, r"(?m)^  \d+B ", msg=output)
+
     def test_a_snapshot_lands_beside_the_profiles_and_not_under_them(self):
         """Machine-global, which is what `state_dir` makes a live question rather than a
         theoretical one: a project that relocates its profiles must not thereby relocate
@@ -5400,6 +5418,47 @@ class CliTest(unittest.TestCase):
         self.assertEqual((snapshot / "Default" / "Cookies").read_text(), "sqlite")
         # And the loser left no staging directory beside the winner's snapshot.
         self.assertEqual([q for q in snapshot.parent.iterdir() if q.is_dir()], [snapshot])
+
+    def test_a_capture_holds_the_source_lock_across_the_whole_copy(self):
+        """Capture's other lock, and the one no other test would miss.
+
+        `locking.exclusive(destination)` has its own race above; this is its sibling on
+        the source. A capture reads a user-data-dir for as long as the copy takes, and a
+        `crom up` landing inside that window launches Chrome into the directory being
+        read — the copy then catches Chrome's opening writes mid-transaction, which is
+        the corrupt snapshot the running-browser refusal exists to prevent. Taken and
+        released before the copy the lock serialises nothing, so the claim under test is
+        the *span*, the way `test_down_stops_the_browser_under_the_profile_lock` states
+        it. [LAW:no-ambient-temporal-coupling]
+
+        `copytree` recurses into itself once per subdirectory, so the events it appends
+        are collapsed rather than latched — one contiguous run of copying is one copy.
+        """
+        self.crom("init")
+        self._a_profile_with_data()
+
+        events: list[str] = []
+        real_lock = seed.profile_lock
+        real_copytree = shutil.copytree
+
+        @contextlib.contextmanager
+        def tracking_lock(profile):
+            events.append("lock")
+            with real_lock(profile):
+                yield
+            events.append("unlock")
+
+        def noting_copytree(*args, **kwargs):
+            events.append("copy")
+            return real_copytree(*args, **kwargs)
+
+        with (
+            mock.patch("crom.seed.profile_lock", tracking_lock),
+            mock.patch.object(seed.shutil, "copytree", noting_copytree),
+        ):
+            self.crom("snapshot", "capture", "logged-in", "ci")
+
+        self.assertEqual([k for k, _ in groupby(events)], ["lock", "copy", "unlock"])
 
     def test_a_name_a_snapshot_already_answers_to_is_refused_rather_than_overwritten(self):
         """The one place snapshots part company with the rest of crom, which reports a
