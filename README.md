@@ -478,14 +478,14 @@ unfamiliar reason still lands somewhere sensible.
 
 Not every failure gets an envelope, and the rule is that one appears exactly when a
 command that takes `--json` was given it and parsed it. `up`, `down`, `restart`, `show`,
-`list`, `status`, `config` and `doctor` take the flag; `add`, `rm`, `snapshot`, `init`,
-`port`, `env`, `mcp`, `forget`, `release` and `clean` answer in prose only. Bad usage —
-exit `2`, an unknown flag or a missing argument — is parsing itself failing, so the
-`--json` on that line was never understood either: there is no flag to honour, and the
-answer stays prose. `crom --version` is not a command and answers in prose for the same
-reason. A broken pipe is deliberately outside all of it: when `crom list | head` loses
-its reader mid-write, crom ends silently with exit `1` and nothing on either stream,
-because a reader that has already left is the one failure with nowhere to put a
+`list`, `status`, `config` and `doctor` take the flag; `add`, `rm`, `init`, `port`,
+`env`, `mcp`, `forget`, `release`, `clean` and `snapshot capture` answer in prose only.
+Bad usage — exit `2`, an unknown flag or a missing argument — is parsing itself failing,
+so the `--json` on that line was never understood either: there is no flag to honour,
+and the answer stays prose. `crom --version` is not a command and answers in prose for
+the same reason. A broken pipe is deliberately outside all of it: when `crom list |
+head` loses its reader mid-write, crom ends silently with exit `1` and nothing on either
+stream, because a reader that has already left is the one failure with nowhere to put a
 document.
 
 `crom down --all` is the exception to one shape for every failure. A sweep that failed
@@ -531,9 +531,8 @@ crom status [REF]             what the browser on its port actually is — pids 
 crom add NAME [--seed SEED]   declare a profile in the config governing this directory
 crom rm REF                   stop it if running, undeclare it, release its port, delete its data
 crom init [NS] [--seed SEED]  write a .crom.toml here
-crom snapshot capture         copy a stopped profile's data under a name, for other
-  NAME [REF]                  profiles to start from; refuses a profile a browser is
-                              writing, or one a browser was killed in
+crom snapshot capture         copy a stopped profile's data under a name; refuses a
+  NAME [REF]                  profile a browser is writing, or one a browser was killed in
 crom config [REF]             which config is in effect, and the exact Chrome command line
                               — each flag attributed to the layer that supplied it
 crom port [REF]               print the port
@@ -661,9 +660,11 @@ default to. The cost is that a mistyped ref no longer errors: it writes a declar
 a version-controlled `.crom.toml` and reserves a port, and under `crom up` copies a few
 hundred megabytes of Chrome profile as well. `crom rm <name>` undoes all of it.
 
-`crom down` and `crom rm` are the deliberate exception. They converge a profile toward
-*not* running and *not* existing, so declaring one on the way would be crom creating the
-thing it was asked to take away. `crom rm typo` is still an error, and leaves no profile
+`crom down`, `crom rm` and `crom snapshot capture` are the deliberate exceptions. The
+first two converge a profile toward *not* running and *not* existing, so declaring one on
+the way would be crom creating the thing it was asked to take away; the third copies a
+profile's data, and declaring one on the spot would invent an empty profile and then fail
+on it for having nothing to copy. `crom rm typo` is still an error, and leaves no profile
 named `typo` behind.
 
 A config file that will not tokenize as TOML at all is reset to the default crom would have
@@ -755,6 +756,7 @@ seeded from the Chrome you probably have open right now.
 ~/.config/crom/config.toml                    your profiles (the `user` namespace)
 ~/.local/state/crom/registry.json             port assignments + known namespaces
 ~/.local/state/crom/profiles/<ns>/<name>/     Chrome user-data-dirs
+~/.local/state/crom/snapshots/<name>/         captured profile data, one set per machine
 ~/.local/state/crom/profiles/<ns>/<name>/crom-stderr.log
                                               what Chrome has printed since its last launch
 ~/.local/state/crom/profiles/<ns>/<name>/crom-launch.json

@@ -560,9 +560,6 @@ class LiveSeedTest(unittest.TestCase):
         self.assertTrue(seed.materialize(profile(self.dest, SeedFresh())))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class CaptureTest(unittest.TestCase):
     """A snapshot is a copy of a profile Chrome finished writing.
@@ -645,6 +642,9 @@ class CaptureTest(unittest.TestCase):
         # snapshot of a live profile safe, so the refusal must not offer one.
         self.assertNotIn("fresh", message)
         self.assertFalse(self.destination.exists())
+        # `_staged` builds its directory before `_quiet` asks either question, so a
+        # refusal here is inside the window its guarantee has to cover.
+        self.assertEqual(list(self.destination.parent.iterdir()), [])
 
     def test_a_profile_that_was_killed_rather_than_quit_is_refused(self):
         """Chrome removes its singletons on the way out, so a directory nothing is
@@ -662,6 +662,7 @@ class CaptureTest(unittest.TestCase):
         self.assertIn("SingletonLock", message)
         self.assertIn("SingletonSocket", message)
         self.assertFalse(self.destination.exists())
+        self.assertEqual(list(self.destination.parent.iterdir()), [])
 
     def test_a_browser_that_crashed_during_the_copy_is_caught_and_the_copy_discarded(self):
         """The window one read leaves, and the reason this question is asked twice.
@@ -791,3 +792,6 @@ class CaptureTest(unittest.TestCase):
         self.assertTrue(seed.materialize(profile(dest, SeedPath(user_data / "Default"))))
         self.assertEqual((dest / "Cookies").read_text(), "sqlite")
 
+
+if __name__ == "__main__":
+    unittest.main()

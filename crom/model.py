@@ -268,7 +268,7 @@ class Reason(Enum):
     # it, so it sits under nearly every command rather than beneath the ones above.
     LOCK_UNAVAILABLE = ("lock_unavailable", CromError)
 
-    # A seed directory crom will not or cannot copy.
+    # A directory crom will not or cannot copy: a seed, or a capture's source profile.
     SEED_MISSING = ("seed_missing", CromError)
     SEED_UNREADABLE = ("seed_unreadable", CromError)
     SEED_UNSAFE = ("seed_unsafe", CromError)

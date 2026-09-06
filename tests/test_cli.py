@@ -27,6 +27,7 @@ from itertools import groupby, takewhile
 from pathlib import Path
 from unittest import mock
 
+import click
 from click.shell_completion import ShellComplete
 from click.testing import CliRunner
 
@@ -61,14 +62,18 @@ def _readme_names(fragment: str) -> tuple[str, ...]:
     return names
 
 
-def _commands_offering_json() -> set[str]:
-    """Both callers are drift guards: a change to how `--json` is declared has to fail
-    them for the right reason, rather than being patched into agreement in two places.
+def _commands_declaring(option: str) -> set[tuple[str, ...]]:
+    """Every runnable command declaring one option, as the words a user would type.
+
+    The three drift guards that used to ask this each read `cli.main.list_commands`,
+    which answers with `snapshot` — a group, whose `.params` are empty — and never
+    descends. An option added to a nested command would have sailed past all three while
+    they stayed green, which is the regression `_invocations` was written to close, left
+    open on the guards themselves. One walk answers for all of them.
+    [LAW:one-source-of-truth]
     """
     return {
-        name
-        for name in cli.main.list_commands(None)
-        if any("--json" in option.opts for option in cli.main.get_command(None, name).params)
+        path for path, command in _runnable() if any(option in p.opts for p in command.params)
     }
 
 
@@ -98,27 +103,26 @@ def _invocations() -> tuple[tuple[str, ...], ...]:
     class `CromSubGroup` exists to be would have gone untested by the very sweep written
     to catch an uncovered command. [LAW:one-source-of-truth]
     """
-    def walk(command, path: tuple[str, ...]) -> tuple[tuple[str, ...], ...]:
+    return tuple(path for path, _ in _runnable())
+
+
+def _runnable() -> tuple[tuple[tuple[str, ...], click.Command], ...]:
+    """Every command a user can run, paired with the click object that declares it.
+
+    The one traversal of the command tree in this file. `_invocations` and every drift
+    guard read it, so a group that a walk stops at is one bug rather than four.
+    [LAW:one-source-of-truth]
+    """
+
+    def walk(command, path: tuple[str, ...]):
         children = getattr(command, "commands", None)
         if not children:
-            return (path,)
+            return ((path, command),)
         return tuple(
             leaf for name, child in children.items() for leaf in walk(child, (*path, name))
         )
 
     return walk(cli.main, ())
-
-
-def _commands_offering_no_probe() -> set[str]:
-    """Read from click for the reason the `--json` set is: a list of names written into
-    this file is a second copy of a fact the CLI already holds, green for exactly as long
-    as nobody adds a command. [LAW:one-source-of-truth]
-    """
-    return {
-        name
-        for name in cli.main.list_commands(None)
-        if any("--no-probe" in option.opts for option in cli.main.get_command(None, name).params)
-    }
 
 
 class CliTest(unittest.TestCase):
@@ -2191,11 +2195,12 @@ class CliTest(unittest.TestCase):
         self.crom("add", "ci")
         directory = json.loads(self.crom("config", "ci", "--json"))["resolved"]["profile_dir"]
 
-        self.assertTrue(_commands_offering_no_probe(), "no command declares --no-probe")
-        for name in sorted(_commands_offering_no_probe()):
-            takes_ref = any(param.name == "ref" for param in cli.main.get_command(None, name).params)
-            command = (name, "ci") if takes_ref else (name,)
-            with self.subTest(command=name):
+        declared = dict(_runnable())
+        self.assertTrue(_commands_declaring("--no-probe"), "no command declares --no-probe")
+        for path in sorted(_commands_declaring("--no-probe")):
+            takes_ref = any(param.name == "ref" for param in declared[path].params)
+            command = (*path, "ci") if takes_ref else path
+            with self.subTest(command=" ".join(path)):
                 with (
                     mock.patch("crom.cli.seed.materialize_under_lock"),
                     mock.patch("crom.chrome.scan", return_value={directory: (4242,)}),
@@ -5044,6 +5049,13 @@ class CliTest(unittest.TestCase):
         """
         self.assertEqual(self.suggestions("mcp-serve"), ("mcp",))
 
+    def test_a_typo_under_a_subgroup_is_answered_like_any_other(self):
+        """`crom snapshot capture` is the CLI's first nested command, and a group that did
+        not inherit the suggestion answered a typo with click's bare "No such command" —
+        the dead end `resolve_command` exists to close, reappearing one level down. The
+        route forward belongs to every group crom has, not to the root alone."""
+        self.assertEqual(self.suggestions("snapshot", "captur"), ("capture",))
+
     def test_a_typo_one_character_off_routes_to_the_real_command(self):
         """`crom confg`, the other half of the pair: nothing contains anything here, so
         this is the arm containment cannot answer and difflib must."""
@@ -5262,6 +5274,31 @@ class CliTest(unittest.TestCase):
         # The profile is four megabytes of cache; the snapshot is the Cookies file.
         self.assertGreater((directory / "Default" / "Cache" / "blob").stat().st_size, 4_000_000)
         self.assertRegex(output, r"(?m)^  \d+B ", msg=output)
+
+    def test_a_capture_says_what_it_is_doing_before_it_starts_copying(self):
+        """A capture moves most of a profile while holding both locks, with nothing else
+        to report until it finishes — the unexplained pause `start_under_lock`'s own seed
+        line exists to prevent. Ordering is the claim rather than the wording: said after
+        the copy it is not progress, only a second report of finished work."""
+        self.crom("init")
+        self._a_profile_with_data()
+
+        with self._standing_in(None):
+            profile = cli.Session.begin().profile("ci")
+
+        said: list[str] = []
+        real_copytree = shutil.copytree
+
+        def noting_copytree(*args, **kwargs):
+            said.append("copy")
+            return real_copytree(*args, **kwargs)
+
+        with mock.patch.object(seed.shutil, "copytree", noting_copytree):
+            operations.capture(profile, "logged-in", log=said.append)
+
+        self.assertEqual(
+            [k for k, _ in groupby(said)], ["Capturing 'logged-in' from myproj/ci …", "copy"]
+        )
 
     def test_a_snapshot_lands_beside_the_profiles_and_not_under_them(self):
         """Machine-global, which is what `state_dir` makes a live question rather than a
@@ -6170,20 +6207,22 @@ class CliTest(unittest.TestCase):
         other.
         """
         self.crom("init")
-        offering = _commands_offering_json()
+        offering = _commands_declaring("--json")
         # A discovery that found nothing would loop zero times and assert nothing — an
         # answer-shaped void wearing a passing test as a costume. New commands may join
         # freely; the loop is what covers them. [LAW:parse-dont-validate]
-        self.assertGreaterEqual(offering, {"up", "down", "restart", "show", "list", "config"})
+        self.assertGreaterEqual(
+            offering, {("up",), ("down",), ("restart",), ("show",), ("list",), ("config",)}
+        )
 
         sentence = "a legacy Chrome is still running"
-        for name in offering:
-            with self.subTest(command=name):
+        for path in offering:
+            with self.subTest(command=" ".join(path)):
                 with mock.patch(
                     "crom.migrate.run_if_needed",
                     side_effect=Reason.MIGRATION_NEEDS_QUIET.error(sentence),
                 ):
-                    result = self.invoke(name, "--json", expect=1)
+                    result = self.invoke(*path, "--json", expect=1)
                 self.assertEqual(
                     json.loads(result.stdout)["error"],
                     {
@@ -6250,14 +6289,18 @@ class CliTest(unittest.TestCase):
         would be a third copy of the fact the test exists to keep at two, green for
         exactly as long as nobody touched the CLI. [LAW:behavior-not-structure]
         """
-        commands = set(cli.main.list_commands(None))
-        offering = _commands_offering_json()
+        # Invocations, not top-level names: `crom snapshot` runs nothing, and it is
+        # `crom snapshot capture` that either takes the flag or does not. A name admits a
+        # space for that reason, which is also what makes a nested command impossible to
+        # document by accident — it has to be written the way it is typed.
+        commands = {" ".join(path) for path, _ in _runnable()}
+        offering = {" ".join(path) for path in _commands_declaring("--json")}
         # The sentence is wrapped across lines in the file, so whitespace is normalised
         # before it is matched. Either side admits only a backticked list, so the search
         # cannot begin early at some unrelated backtick and swallow the prose between.
         sentence = re.search(
-            r"(`\w+`(?:(?:, | and )`\w+`)*) take the flag; "
-            r"(`\w+`(?:(?:, | and )`\w+`)*) answer in prose only\.",
+            r"(`[\w ]+`(?:(?:, | and )`[\w ]+`)*) take the flag; "
+            r"(`[\w ]+`(?:(?:, | and )`[\w ]+`)*) answer in prose only\.",
             " ".join(_README.read_text().split()),
         )
         self.assertIsNotNone(sentence, "README.md no longer says which commands take --json")
@@ -6283,9 +6326,9 @@ class CliTest(unittest.TestCase):
         option that has drifted, not merely the first the loop reached.
         """
         marked = {
-            f"crom {name} {parameter.opts[0]}"
-            for name in cli.main.list_commands(None)
-            for parameter in cli.main.get_command(None, name).params
+            f"crom {' '.join(path)} {parameter.opts[0]}"
+            for path, command in _runnable()
+            for parameter in command.params
             if "`" in (getattr(parameter, "help", None) or "")
         }
 

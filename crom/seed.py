@@ -228,7 +228,7 @@ def _held(source: Path) -> tuple[Path, str] | None:
 
 @contextlib.contextmanager
 def _undisturbed(copy: _Copy) -> Iterator[None]:
-    """Read the seed's ancestry before and after, and refuse unless both say idle.
+    """Read the source's ancestry before and after, and refuse unless both say idle.
 
     One check would only prove the browser was closed at the instant crom looked. Chrome
     takes its singleton at startup and holds it for the session, so a browser opened

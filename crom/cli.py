@@ -406,7 +406,8 @@ class CromCommand(click.Command):
 class CromSubGroup(click.Group):
     """A group of commands under one noun, as `crom snapshot capture` is.
 
-    It exists for `command_class` alone. That attribute reaches only the commands built
+    It carries what every crom group owes a user: `command_class`, and the route forward
+    an unrecognised word gets back. `command_class` reaches only the commands built
     directly on the group carrying it, so a subgroup made by click's default
     `group_class` would build plain `click.Command`s — and a plain command never calls
     `Session.begin`, leaving `crom snapshot capture` the one command in the CLI that ran
@@ -414,22 +415,103 @@ class CromSubGroup(click.Group):
     covering both places a command can be declared, rather than being remembered at the
     second one.
 
-    Separate from `CromGroup` rather than derived from it, because the root group's two
-    other behaviours are about being the root: a bare `crom` means `crom up`, where a
-    bare `crom snapshot` means the help for snapshots, and the curated `--help` sections
-    map the whole CLI rather than one noun's verbs. Failures need nothing here — a
-    `CromError` raised under a subcommand propagates through the root's `invoke`, which
-    reads `--json` from `ctx.meta` and so answers for a nested command exactly as it does
-    for a top-level one.
+    The base of `CromGroup` rather than a sibling of it, because a subgroup is the
+    general case and the root is the special one: what the root adds is about being the
+    root — a bare `crom` means `crom up`, where a bare `crom snapshot` means the help for
+    snapshots, and its curated `--help` sections map the whole CLI rather than one noun's
+    verbs. Derived the other way round, `resolve_command`'s near-match suggestion would
+    have to be copied to be shared, which is how one rule becomes two that drift.
+    [LAW:one-source-of-truth] Failures need nothing here — a `CromError` raised under a
+    subcommand propagates through the root's `invoke`, which reads `--json` from
+    `ctx.meta` and so answers for a nested command exactly as it does for a top-level one.
     """
 
     command_class = CromCommand
 
+    def resolve_command(self, ctx, args):
+        """Answer an unrecognised word with a route forward rather than a dead end.
 
-class CromGroup(click.Group):
+        crom converges rather than errors (`report.py`), and this was the last surface
+        handing back nothing to do next: `crom mcp-serve` said only that no such command
+        existed, one character away from the `mcp` the user wanted.
+
+        Raised before delegating rather than caught after, because click's own arm is
+        `ctx.fail` — by the time this frame could see it, it is a `UsageError` carrying
+        nothing that separates it from click's other refusals, so enriching it would mean
+        matching on its wording. The lookup is click's own `get_command`, the same call
+        the overridden method makes, not a second index of the same names.
+        [LAW:one-source-of-truth]
+
+        `resilient_parsing` is the discriminator `CromGroup.parse_args` uses, for the
+        same reason: `crom mcp-ser <TAB>` is shell completion resolving a word it will not run,
+        and click answers that with a `None` command rather than a refusal.
+        [LAW:dataflow-not-control-flow]
+
+        crom answers for words, and only for words. `crom --nope` never reaches
+        resolution — the group's parser refuses it first — but `crom -- --nope` puts the
+        same token where a command goes, and there click is the better answer: "No such
+        option" is accurate, where a map of sixteen commands, none of them starting with
+        a dash, is noise. `isalnum` is click's own test for the same thing, in
+        `_split_opt`; restated rather than imported because that name is private.
+        """
+        typed = args[0]
+        word = typed[:1].isalnum() and self.get_command(ctx, typed) is None
+        if word and not ctx.resilient_parsing:
+            raise self._unrecognised(ctx, typed)
+        return super().resolve_command(ctx, args)
+
+    def _unrecognised(self, ctx, typed: str) -> click.UsageError:
+        """What crom offers instead of the dead end: the commands nearest what was typed,
+        or — when nothing is near — everything the group has, from `_sections`.
+
+        Both arms are one value, `((heading, names), ...)`, written by the same hand that
+        writes `--help`, so a suggestion and the full listing cannot drift into two
+        pictures of one CLI. [LAW:one-type-per-behavior] a suggestion is that listing
+        filtered, not a second kind of thing.
+
+        No near match renders that listing rather than an empty "Did you mean" — "did
+        you mean nothing" is an answer-shaped void where "here is everything this group
+        does" is the answer crom actually has. [LAW:parse-dont-validate]
+
+        Still a `UsageError`, so exit 2 is unchanged: a suggestion is more text, never a
+        different outcome. [CLI binding] exit codes are the contract a script branches
+        on, and this changes what a human reads.
+        """
+        near = _nearest(typed, tuple(self.list_commands(ctx)))
+        route = (("Did you mean", near),) if near else self._sections(ctx)
+        formatter = ctx.make_formatter()
+        self._write_sections(ctx, formatter, route)
+        return click.UsageError(f"No such command {typed!r}.\n{formatter.getvalue().rstrip()}", ctx)
+
+    def _sections(self, ctx) -> tuple[tuple[str, tuple[str, ...]], ...]:
+        """Where a reader goes when nothing they typed was near: this group's own verbs.
+
+        The one thing the root and a subgroup answer differently, so it is the one thing
+        left to the subclass — a value each supplies, rather than a branch inside the
+        method both share. [LAW:dataflow-not-control-flow]
+        """
+        return (("Commands", tuple(self.list_commands(ctx))),)
+
+    def _write_sections(self, ctx, formatter, sections) -> None:
+        """Write titled groups of commands, each row a name beside its short help."""
+        for title, names in sections:
+            rows = [
+                (name, self.get_command(ctx, name).get_short_help_str(limit=68))
+                for name in names
+                if self.get_command(ctx, name) is not None
+            ]
+            if rows:
+                with formatter.section(title):
+                    formatter.write_dl(rows)
+
+    def format_commands(self, ctx, formatter) -> None:
+        """Render the command list in sections, and never omit a command."""
+        self._write_sections(ctx, formatter, self._sections(ctx))
+
+
+class CromGroup(CromSubGroup):
     """Turns a failed command into the CLI's exit-code contract, in one place."""
 
-    command_class = CromCommand
     group_class = CromSubGroup
 
     def parse_args(self, ctx, args):
@@ -493,61 +575,6 @@ class CromGroup(click.Group):
             parts = (error.filename, error.strerror or error)
             raise _answer(ctx, error, ": ".join(str(part) for part in parts if part)) from error
 
-    def resolve_command(self, ctx, args):
-        """Answer an unrecognised word with a route forward rather than a dead end.
-
-        crom converges rather than errors (`report.py`), and this was the last surface
-        handing back nothing to do next: `crom mcp-serve` said only that no such command
-        existed, one character away from the `mcp` the user wanted.
-
-        Raised before delegating rather than caught after, because click's own arm is
-        `ctx.fail` — by the time this frame could see it, it is a `UsageError` carrying
-        nothing that separates it from click's other refusals, so enriching it would mean
-        matching on its wording. The lookup is click's own `get_command`, the same call
-        the overridden method makes, not a second index of the same names.
-        [LAW:one-source-of-truth]
-
-        `resilient_parsing` is the discriminator `parse_args` uses above, for the same
-        reason: `crom mcp-ser <TAB>` is shell completion resolving a word it will not run,
-        and click answers that with a `None` command rather than a refusal.
-        [LAW:dataflow-not-control-flow]
-
-        crom answers for words, and only for words. `crom --nope` never reaches
-        resolution — the group's parser refuses it first — but `crom -- --nope` puts the
-        same token where a command goes, and there click is the better answer: "No such
-        option" is accurate, where a map of sixteen commands, none of them starting with
-        a dash, is noise. `isalnum` is click's own test for the same thing, in
-        `_split_opt`; restated rather than imported because that name is private.
-        """
-        typed = args[0]
-        word = typed[:1].isalnum() and self.get_command(ctx, typed) is None
-        if word and not ctx.resilient_parsing:
-            raise self._unrecognised(ctx, typed)
-        return super().resolve_command(ctx, args)
-
-    def _unrecognised(self, ctx, typed: str) -> click.UsageError:
-        """What crom offers instead of the dead end: the commands nearest what was typed,
-        or — when nothing is near — the whole curated map.
-
-        Both arms are one value, `((heading, names), ...)`, written by the same hand that
-        writes `--help`, so a suggestion and the full listing cannot drift into two
-        pictures of one CLI. [LAW:one-type-per-behavior] a suggestion is that listing
-        filtered, not a second kind of thing.
-
-        No near match renders the map rather than an empty "Did you mean" — "did you mean
-        nothing" is an answer-shaped void where "here is everything crom does" is the
-        answer crom actually has. [LAW:parse-dont-validate]
-
-        Still a `UsageError`, so exit 2 is unchanged: a suggestion is more text, never a
-        different outcome. [CLI binding] exit codes are the contract a script branches
-        on, and this changes what a human reads.
-        """
-        near = _nearest(typed, tuple(self.list_commands(ctx)))
-        route = (("Did you mean", near),) if near else self._sections(ctx)
-        formatter = ctx.make_formatter()
-        self._write_sections(ctx, formatter, route)
-        return click.UsageError(f"No such command {typed!r}.\n{formatter.getvalue().rstrip()}", ctx)
-
     def _sections(self, ctx) -> tuple[tuple[str, tuple[str, ...]], ...]:
         """The curated map, plus a heading for whatever the curation missed.
 
@@ -562,22 +589,6 @@ class CromGroup(click.Group):
         listed = {name for _, names in _COMMAND_SECTIONS for name in names}
         leftover = tuple(n for n in self.list_commands(ctx) if n not in listed)
         return (*_COMMAND_SECTIONS, ("Other", leftover))
-
-    def _write_sections(self, ctx, formatter, sections) -> None:
-        """Write titled groups of commands, each row a name beside its short help."""
-        for title, names in sections:
-            rows = [
-                (name, self.get_command(ctx, name).get_short_help_str(limit=68))
-                for name in names
-                if self.get_command(ctx, name) is not None
-            ]
-            if rows:
-                with formatter.section(title):
-                    formatter.write_dl(rows)
-
-    def format_commands(self, ctx, formatter) -> None:
-        """Render the command list in sections, and never omit a command."""
-        self._write_sections(ctx, formatter, self._sections(ctx))
 
 
 def _emit(as_json: bool, payload, lines: list[str]) -> None:
@@ -1593,11 +1604,11 @@ def rm_cmd(session: Session, ref: str, yes: bool, keep_data: bool):
 
 @main.group("snapshot")
 def snapshot_cmd():
-    """Keep a stopped profile's logins under a name, to start other profiles from.
+    """Keep a stopped profile's logins under a name.
 
-    A snapshot is a copy of a profile's user-data-dir, taken once and kept for the
-    machine rather than for one namespace — so a login done in one project's profile
-    becomes the starting state of any profile in any project.
+    A snapshot is a copy of a profile's user-data-dir, kept for the machine rather than
+    for one namespace: `~/.local/state/crom/snapshots/<name>/`, wherever the project
+    whose profile it came from keeps its own state.
 
     The profile has to be stopped, and crom will not stop it for you. Chrome takes no
     checkpoint while it runs, so a quit is the only moment its Cookies, History and

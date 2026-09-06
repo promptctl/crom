@@ -692,7 +692,7 @@ class Capture:
     size: int
 
 
-def capture(profile: ResolvedProfile, name: str) -> Capture:
+def capture(profile: ResolvedProfile, name: str, log=report.to_stderr) -> Capture:
     """Keep a copy of a stopped profile's user-data-dir under a name.
 
     Refuses a name a directory already answers to rather than reporting the state as
@@ -723,6 +723,10 @@ def capture(profile: ResolvedProfile, name: str) -> Capture:
     The size is measured from the finished snapshot rather than from the profile, so what
     the caller reports is what was actually kept — a profile is several times its
     snapshot, and quoting the source would name a number that appears nowhere on disk.
+
+    `log=` for the same reason `start_under_lock` takes one, and rendered by the same
+    hand: the copy moves most of a profile while holding both locks, and an unexplained
+    pause looks like a hang. [LAW:effects-at-boundaries]
     """
     destination = paths.snapshot_dir(name)
     with locking.exclusive(destination), seed.profile_lock(profile):
@@ -749,6 +753,9 @@ def capture(profile: ResolvedProfile, name: str) -> Capture:
                 f"tell whether those are still wanted. Capture under another name, or "
                 f"remove that directory first."
             )
+        # Said before the copy, not after, the way `start_under_lock` says it: this is
+        # the point past which the command has nothing else to report until it finishes.
+        log(f"Capturing '{name}' from {profile.ref} …")
         seed.capture(profile.profile_dir, destination, f"profile '{profile.ref}'")
     return Capture(name=name, path=destination, size=doctor.measure(destination))
 
