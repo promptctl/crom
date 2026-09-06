@@ -8,7 +8,7 @@ other module asks here rather than composing `~/.config` itself.
 import os
 from pathlib import Path
 
-from .model import Reason
+from .model import Reason, validate_name
 
 CONFIG_FILENAME = "config.toml"
 REGISTRY_FILENAME = "registry.json"
@@ -96,3 +96,26 @@ def registry_file() -> Path:
 def default_profiles_root() -> Path:
     """Where profile user-data-dirs live unless a scope overrides `state_dir`."""
     return state_home() / "profiles"
+
+
+def snapshots_root() -> Path:
+    """Where captured profiles live — one directory per snapshot name.
+
+    Under `state_home` rather than under a profiles root, which is the decision
+    `docs/snapshots.md` records: `profiles_root` moves when a scope sets `state_dir`, so
+    snapshots kept beneath it would be project-local for exactly the projects that set
+    that key — silently contradicting `snapshot:<name>` naming one directory from every
+    namespace, and only for some users.
+    """
+    return state_home() / "snapshots"
+
+
+def snapshot_dir(name: str) -> Path:
+    """One snapshot's directory, by the name a user typed.
+
+    The name is checked here rather than by each caller because this is the one function
+    that turns a snapshot name into a path, and therefore the one place a `..` could walk
+    out of the root. Capture, `snapshot:` seeding and removal all arrive through it, so
+    none of them can be the one that forgot. [LAW:parse-dont-validate]
+    """
+    return snapshots_root() / validate_name("snapshot name", name)

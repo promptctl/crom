@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from pathlib import Path
 
-from . import chrome, config, configwrite, drift, flags, registry, report, seed
+from . import chrome, config, configwrite, doctor, drift, flags, paths, registry, report, seed
 from . import resolve as resolver
 from .model import (
     DEFAULT_SEED,
@@ -681,6 +681,49 @@ def rm(
         registry.forget(str(profile.ref))
         configwrite.remove_profile(config.write_target(scope), profile.ref.name)
     return stopped
+
+
+@dataclass(frozen=True)
+class Capture:
+    """A snapshot that now exists: where it went, and what it weighs."""
+
+    name: str
+    path: Path
+    size: int
+
+
+def capture(profile: ResolvedProfile, name: str) -> Capture:
+    """Keep a copy of a stopped profile's user-data-dir under a name.
+
+    Refuses a name a directory already answers to rather than reporting the state as
+    already reached, which is the one place snapshots part company with the rest of crom.
+    `crom add` can say "already declared" because a declaration is the whole of what it
+    was asked for; a snapshot's point is its *contents*, and two captures of one profile
+    an hour apart are two different snapshots. crom cannot tell which one is on disk, so
+    the only honest answers are "made it" and "there is already one of those".
+    [LAW:no-silent-failure]
+
+    Under the profile's own lock, so a `crom up` racing this waits rather than launching
+    Chrome into the directory being read. That does not cover a browser the user starts
+    by hand, which is what `seed.capture`'s before-and-after reads are for; the two close
+    different halves of the same window. [LAW:no-ambient-temporal-coupling]
+
+    The size is measured from the finished snapshot rather than from the profile, so what
+    the caller reports is what was actually kept — a profile is several times its
+    snapshot, and quoting the source would name a number that appears nowhere on disk.
+    """
+    destination = paths.snapshot_dir(name)
+    with seed.profile_lock(profile):
+        if destination.exists():
+            raise Reason.SNAPSHOT_EXISTS.error(
+                f"a snapshot named '{name}' is already there:\n"
+                f"  {destination}\n"
+                f"crom will not overwrite one: a snapshot is its contents, and it cannot "
+                f"tell whether those are still wanted. Capture under another name, or "
+                f"remove that directory first."
+            )
+        seed.capture(profile.profile_dir, destination, f"profile '{profile.ref}'")
+    return Capture(name=name, path=destination, size=doctor.measure(destination))
 
 
 def init(here: Path, namespace: str | None, seed_text: str | None) -> Init:

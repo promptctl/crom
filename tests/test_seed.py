@@ -17,7 +17,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from crom import chrome, seed
+from crom import chrome, launched, seed
 from crom.model import (
     CromError,
     ProfileRef,
@@ -562,3 +562,164 @@ class LiveSeedTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CaptureTest(unittest.TestCase):
+    """A snapshot is a copy of a profile Chrome finished writing.
+
+    Everything here is about the two halves of that sentence: what a snapshot keeps, and
+    what crom refuses to snapshot. The copy machinery itself is `MaterializeTest`'s
+    subject — capture runs the same `_staged` commit over the same `_copy`, so what is
+    asserted here is only what capture decides differently.
+    """
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.source = self.root / "profiles" / "user" / "default"
+        self.destination = self.root / "snapshots" / "logged-in"
+        (self.source / "Default").mkdir(parents=True)
+
+    def _lived_in(self) -> None:
+        """A profile with all four kinds of thing capture has to tell apart: the session
+        state a snapshot exists for, a cache under `Default/`, a cache at the root, and
+        crom's own record of a launch."""
+        (self.source / "Default" / "Cookies").write_text("sqlite")
+        (self.source / "Default" / "Service Worker").mkdir()
+        (self.source / "Default" / "Service Worker" / "auth").write_text("token")
+        (self.source / "Default" / "Cache").mkdir()
+        (self.source / "Default" / "Cache" / "blob").write_text("x" * 100)
+        (self.source / "component_crx_cache").mkdir()
+        (self.source / "component_crx_cache" / "blob").write_text("x" * 100)
+        (self.source / launched.FILENAME).write_text("{}")
+        (self.source / chrome.STDERR_FILENAME).write_text("log line")
+
+    def capture(self) -> None:
+        seed.capture(self.source, self.destination, "profile 'user/default'")
+
+    def test_a_snapshot_keeps_the_state_it_is_taken_for(self):
+        """Cookies and service workers are where a logged-in session lives, so a snapshot
+        that dropped them to run leaner would be a snapshot of nothing worth having."""
+        self._lived_in()
+        self.capture()
+
+        self.assertEqual((self.destination / "Default" / "Cookies").read_text(), "sqlite")
+        self.assertEqual(
+            (self.destination / "Default" / "Service Worker" / "auth").read_text(), "token"
+        )
+
+    def test_a_snapshot_drops_what_chrome_rebuilds_wherever_it_sits(self):
+        """Both depths, because the exclusions are matched by name rather than by path:
+        Chrome puts `Cache` under `Default/` and `component_crx_cache` at the root, and a
+        rule that only knew one of those layouts would pass on half the tree."""
+        self._lived_in()
+        self.capture()
+
+        self.assertFalse((self.destination / "Default" / "Cache").exists())
+        self.assertFalse((self.destination / "component_crx_cache").exists())
+
+    def test_a_snapshot_leaves_behind_croms_record_of_the_profile_it_came_from(self):
+        """A launch record names the argv and port of the profile it was captured from.
+        Carried into a snapshot it would arrive in a brand-new profile's directory as a
+        ready-made answer to "how was this launched", about a browser that never ran."""
+        self._lived_in()
+        self.capture()
+
+        self.assertFalse((self.destination / launched.FILENAME).exists())
+        self.assertFalse((self.destination / chrome.STDERR_FILENAME).exists())
+        # The profile keeps its own: capture reads, and changes nothing it read.
+        self.assertTrue((self.source / launched.FILENAME).exists())
+
+    def test_a_profile_a_browser_is_writing_is_refused_by_name(self):
+        os.symlink(
+            f"{socket.gethostname()}-{os.getpid()}", self.source / chrome.SINGLETON_LOCK
+        )
+
+        with self.assertRaises(CromError) as caught:
+            self.capture()
+
+        message = str(caught.exception)
+        self.assertIs(caught.exception.reason, Reason.SEED_BUSY)
+        self.assertIn("profile 'user/default' is in use", message)
+        # The seed's way out is not capture's: there is no `seed = "fresh"` that makes a
+        # snapshot of a live profile safe, so the refusal must not offer one.
+        self.assertNotIn("fresh", message)
+        self.assertFalse(self.destination.exists())
+
+    def test_a_profile_that_was_killed_rather_than_quit_is_refused(self):
+        """Chrome removes its singletons on the way out, so a directory nothing is
+        running in that still holds them is one a browser was killed in — and a killed
+        Chrome left its SQLite databases mid-transaction."""
+        os.symlink(f"{socket.gethostname()}-{_dead_pid()}", self.source / chrome.SINGLETON_LOCK)
+        os.symlink("/var/folders/socket", self.source / "SingletonSocket")
+
+        with self.assertRaises(CromError) as caught:
+            self.capture()
+
+        message = str(caught.exception)
+        self.assertIs(caught.exception.reason, Reason.PROFILE_UNCLEAN)
+        self.assertIn("profile 'user/default' was not shut down cleanly", message)
+        self.assertIn("SingletonLock", message)
+        self.assertIn("SingletonSocket", message)
+        self.assertFalse(self.destination.exists())
+
+    def test_an_unclean_profile_is_refused_before_the_link_rule_can_mistake_it(self):
+        """The reason this refusal is worth its own arm rather than being left to
+        `_link_guard`. `SingletonSocket` is an absolute link, so the copy was already
+        going to fail — but as "contains an absolute symlink … make it relative", which
+        is advice about a seed someone wrote, aimed at a user whose browser crashed."""
+        os.symlink("/var/folders/socket", self.source / "SingletonSocket")
+
+        with self.assertRaises(CromError) as caught:
+            self.capture()
+
+        self.assertNotIn("Make it relative", str(caught.exception))
+
+    def test_an_excluded_entry_is_dropped_before_the_link_rule_looks_at_it(self):
+        """Dropping happens before vetting, and the order is the whole reason both share
+        one hook. A cache the user has moved elsewhere and symlinked into place is a link
+        `_link_guard` would refuse — over a tree capture was never going to read.
+
+        The link is the excluded entry *itself*, not a file inside one: `copytree` never
+        calls the hook for a directory it was told to skip, so a link buried in a dropped
+        tree is unreachable either way and would prove nothing about the order.
+        """
+        self._lived_in()
+        elsewhere = self.root / "big-disk-cache"
+        elsewhere.mkdir()
+        (self.source / "Default" / "GPUCache").symlink_to(elsewhere)  # absolute, escaping
+
+        self.capture()
+
+        self.assertEqual((self.destination / "Default" / "Cookies").read_text(), "sqlite")
+        self.assertFalse((self.destination / "Default" / "GPUCache").exists())
+
+    def test_a_capture_that_dies_partway_leaves_no_snapshot_to_seed_from(self):
+        """Same commit as a profile's, and it matters for the same reason: a stump here
+        is a directory `snapshot:<name>` would read as a finished snapshot."""
+        self._lived_in()
+        with mock.patch.object(seed.shutil, "copytree", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                self.capture()
+
+        self.assertFalse(self.destination.exists())
+        self.assertEqual(list(self.destination.parent.iterdir()), [])
+
+    def test_seeding_still_copies_a_user_data_dir_a_browser_died_in(self):
+        """The scope of the clean-exit rule, pinned deliberately.
+
+        Capture holds a profile to it; seeding does not, and must not. A `chrome` seed
+        copies `Chrome/<Profile>` while the singletons sit one level up at the
+        user-data-dir root, so extending the rule to seeds would refuse `crom up` on
+        every machine whose real Chrome ever crashed — the default seed, on the path a
+        new install takes first.
+        """
+        user_data = self.root / "Chrome"
+        (user_data / "Default").mkdir(parents=True)
+        (user_data / "Default" / "Cookies").write_text("sqlite")
+        os.symlink(f"{socket.gethostname()}-{_dead_pid()}", user_data / chrome.SINGLETON_LOCK)
+
+        dest = self.root / "profiles" / "myapp" / "dev"
+        self.assertTrue(seed.materialize(profile(dest, SeedPath(user_data / "Default"))))
+        self.assertEqual((dest / "Cookies").read_text(), "sqlite")
+

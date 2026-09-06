@@ -14,6 +14,7 @@ import os
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import tempfile
 import unittest
@@ -5176,6 +5177,109 @@ class CliTest(unittest.TestCase):
         profile_dir = json.loads(self.crom("config", "default", "--json"))["resolved"]["profile_dir"]
         self.assertTrue(profile_dir.startswith(str(self.project / ".crom" / "profiles")))
         self.assertFalse(profile_dir.startswith(str(state_home())))
+
+
+    # --- snapshots ------------------------------------------------------------------
+
+    def _a_profile_with_data(self, ref: str = "ci") -> Path:
+        """A declared profile whose directory exists, as one that has been up would have.
+
+        Written here rather than by running `crom up`, which would launch a browser: what
+        every test below is about is a *stopped* profile, and the directory is the whole
+        of what capture reads.
+        """
+        self.crom("add", ref)
+        directory = Path(json.loads(self.crom("config", ref, "--json"))["resolved"]["profile_dir"])
+        (directory / "Default").mkdir(parents=True)
+        (directory / "Default" / "Cookies").write_text("sqlite")
+        (directory / "Default" / "Cache").mkdir()
+        (directory / "Default" / "Cache" / "blob").write_text("x" * 4096)
+        return directory
+
+    def test_capturing_a_stopped_profile_writes_a_named_snapshot(self):
+        """The ticket's done-when, read from the filesystem rather than from the report:
+        the directory is the fact a `snapshot:` seed will later look for, and a message
+        saying a snapshot was made is not evidence that one is there."""
+        self.crom("init")
+        self._a_profile_with_data()
+
+        output = self.crom("snapshot", "capture", "logged-in", "ci")
+
+        snapshot = state_home() / "snapshots" / "logged-in"
+        self.assertEqual((snapshot / "Default" / "Cookies").read_text(), "sqlite")
+        self.assertFalse((snapshot / "Default" / "Cache").exists())
+        self.assertIn("Captured 'logged-in' from myproj/ci", output)
+        self.assertIn(str(snapshot), output)
+
+    def test_a_snapshot_lands_beside_the_profiles_and_not_under_them(self):
+        """Machine-global, which is what `state_dir` makes a live question rather than a
+        theoretical one: a project that relocates its profiles must not thereby relocate
+        its snapshots, or `snapshot:<name>` would mean a different directory depending on
+        where the user was standing when they captured it."""
+        self.crom("init")
+        path = self.project / ".crom.toml"
+        path.write_text('state_dir = ".crom/profiles"\n' + path.read_text())
+        directory = self._a_profile_with_data()
+        self.assertTrue(str(directory).startswith(str(self.project)))
+
+        self.crom("snapshot", "capture", "logged-in", "ci")
+
+        self.assertTrue((state_home() / "snapshots" / "logged-in").is_dir())
+        self.assertFalse((self.project / ".crom" / "profiles" / "snapshots").exists())
+
+    def test_capturing_a_profile_a_browser_is_writing_is_refused_by_name(self):
+        """The correctness rule the feature is built around. Chrome writes Cookies,
+        History and Login Data continuously, so a copy taken now can catch one
+        mid-transaction — and the damage surfaces weeks later with nothing pointing
+        back."""
+        self.crom("init")
+        directory = self._a_profile_with_data()
+        os.symlink(f"{socket.gethostname()}-{os.getpid()}", directory / chrome.SINGLETON_LOCK)
+
+        error = self.failure("snapshot", "capture", "logged-in", "ci")
+
+        self.assertIs(error.reason, Reason.SEED_BUSY)
+        self.assertIn("profile 'myproj/ci' is in use", str(error))
+        self.assertFalse((state_home() / "snapshots" / "logged-in").exists())
+
+    def test_a_name_a_snapshot_already_answers_to_is_refused_rather_than_overwritten(self):
+        """The one place snapshots part company with the rest of crom, which reports a
+        state already reached and exits 0. A snapshot is its contents, and two captures
+        an hour apart are two different snapshots, so "already there" cannot be reported
+        as the thing that was asked for."""
+        self.crom("init")
+        self._a_profile_with_data()
+        self.crom("snapshot", "capture", "logged-in", "ci")
+
+        error = self.failure("snapshot", "capture", "logged-in", "ci")
+
+        self.assertIs(error.reason, Reason.SNAPSHOT_EXISTS)
+        # Exit 4, the conflict code, and not the 0 a "state already reached" would carry:
+        # a script capturing on a schedule has to be able to tell the two apart.
+        refusal = self.crom("snapshot", "capture", "logged-in", "ci", expect=4)
+        self.assertIn("a snapshot named 'logged-in' is already there", refusal)
+
+    def test_a_snapshot_name_cannot_walk_out_of_the_snapshot_root(self):
+        """The name reaches a path, so it is checked where it becomes one."""
+        self.crom("init")
+        self._a_profile_with_data()
+
+        error = self.failure("snapshot", "capture", "../escape", "ci")
+
+        self.assertIs(error.reason, Reason.INVALID_NAME)
+        self.assertIn("snapshot name", str(error))
+
+    def test_capture_declares_no_profile_it_was_asked_to_copy(self):
+        """`crom up dev` declares `dev` on the spot, because asking where a profile is is
+        a request to have one. Asking crom to keep the state of a profile that does not
+        exist is not: declaring one here would answer with an empty snapshot of a browser
+        that never ran."""
+        self.crom("init")
+
+        error = self.failure("snapshot", "capture", "logged-in", "nosuch")
+
+        self.assertIs(error.reason, Reason.PROFILE_UNKNOWN)
+        self.assertNotIn("nosuch", (self.project / ".crom.toml").read_text())
 
 
     # --- the failure contract ---------------------------------------------------------

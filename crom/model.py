@@ -220,6 +220,13 @@ class Reason(Enum):
     RESERVATION_DECLARED = ("reservation_declared", Conflict)
     RESERVATION_IN_USE = ("reservation_in_use", Conflict)
 
+    # A snapshot name that already names a directory. A conflict rather than a
+    # not-found's opposite: two captures of one profile at different times are different
+    # snapshots, so "it already exists" cannot be reported as the state already reached
+    # the way `crom add` reports a profile already declared — crom has no way to know
+    # whether the contents are what the caller meant to have.
+    SNAPSHOT_EXISTS = ("snapshot_exists", Conflict)
+
     # A config file crom cannot act on.
     CONFIG_INVALID = ("config_invalid", CromError)
     CONFIG_HEADER_REQUIRED = ("config_header_required", CromError)
@@ -266,6 +273,12 @@ class Reason(Enum):
     SEED_UNREADABLE = ("seed_unreadable", CromError)
     SEED_UNSAFE = ("seed_unsafe", CromError)
     SEED_BUSY = ("seed_busy", CromError)
+
+    # A profile crom will not snapshot, said apart from the seed reasons above because
+    # the next move differs: `seed_busy` means quit the browser, this one means the
+    # browser was killed rather than quit and the profile has to be brought back to a
+    # clean state before a copy of it is worth keeping.
+    PROFILE_UNCLEAN = ("profile_unclean", CromError)
 
     # The move to the namespaced layout, which runs before every command until it takes.
     MIGRATION_BLOCKED = ("migration_blocked", CromError)

@@ -7,6 +7,11 @@ and every cookie in it, so `fresh` is the default and `chrome` is opt-in.
 
 A seed is copied only while nothing is writing it: crom reads the seed's ancestry before
 and after, and refuses — saying what it saw — if a browser holds it at either read.
+
+`capture` runs the same machinery the other way, copying a stopped profile out to a
+snapshot. What differs is data, not shape: a snapshot leaves behind what Chrome would
+rebuild anyway, and it holds a source to a stricter standard than a seed, because the
+source is a profile crom itself owns and can tell the user how to quieten.
 """
 
 import contextlib
@@ -19,7 +24,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import chrome
+from . import chrome, launched
 from .locking import exclusive
 from .model import CromError, Reason, ResolvedProfile, Seed, SeedChrome, SeedFresh, SeedPath
 
@@ -102,21 +107,21 @@ def _link_guard(source: Path, described: str):
             raw = entry.readlink()
             if raw.is_absolute():
                 raise Reason.SEED_UNSAFE.error(
-                    f"seed {described} contains an absolute symlink:\n"
+                    f"{described} contains an absolute symlink:\n"
                     f"  {entry.relative_to(source)} -> {raw}\n"
                     f"crom copies links verbatim, so an absolute link would still point "
-                    f"at the original seed from inside the finished profile — and Chrome "
-                    f"would write through it into the seed. Make it relative."
+                    f"at the original from inside the finished copy — and Chrome would "
+                    f"write through it into the source. Make it relative."
                 )
             target = (entry.parent / raw).resolve()
             if target == root or root in target.parents:
                 continue
             raise Reason.SEED_UNSAFE.error(
-                f"seed {described} contains a symlink that points outside it:\n"
+                f"{described} contains a symlink that points outside it:\n"
                 f"  {entry.relative_to(source)} -> {target}\n"
                 f"crom will not copy it: following the link would pull that file into "
-                f"the profile, and keeping it would let Chrome write through it. Remove "
-                f"the link, or point it inside the seed."
+                f"the copy, and keeping it would let Chrome write through it. Remove the "
+                f"link, or point it inside the directory being copied."
             )
         return set()
 
@@ -125,18 +130,72 @@ def _link_guard(source: Path, described: str):
 
 @dataclass(frozen=True)
 class _Copy:
-    """One directory to duplicate."""
+    """One directory to duplicate, and everything about it that a caller decides.
+
+    Seeding and capture run the same machinery over different values rather than through
+    different code: the two ways they differ — what a copy leaves behind, and what a
+    refusal offers as the way out — arrive here as data, so nothing below has to ask
+    which caller it is serving. [LAW:dataflow-not-control-flow]
+
+    `described` carries its own noun (`seed 'chrome:Default'`, `profile 'user/dev'`)
+    because every message below is about the thing being copied, and a hardcoded "seed"
+    in those sentences would be a copy machine that can only ever be told about seeds.
+    """
 
     source: Path
     dest: Path
     described: str
+    # Entry names never copied, matched wherever they appear in the tree. Empty for a
+    # seed, which duplicates what it was pointed at.
+    excluded: frozenset[str]
+    # The sentence that ends a refusal: what this caller's user can do about it.
+    remedy: str
+
+
+def _ignoring(copy: _Copy):
+    """`copytree`'s one hook: drop what this copy leaves behind, vet what survives.
+
+    Both jobs share the hook rather than taking one each, because `copytree` allows one
+    `ignore` and the whole value of `_link_guard` living there is that a single traversal
+    decides what the tree contains. A second walk to apply exclusions would reopen the
+    TOCTOU window that hook was written to close.
+
+    Dropping comes first, and the guard is shown only the survivors: an excluded tree is
+    never descended into, so vetting a link inside one would refuse a copy over a file
+    that was never going to be read. [LAW:dataflow-not-control-flow] a seed passes an
+    empty `excluded` and reaches `guard` with the same listing it always did.
+    """
+    guard = _link_guard(copy.source, copy.described)
+
+    def ignore(dirpath: str, names: list[str]) -> set[str]:
+        dropped = {name for name in names if name in copy.excluded}
+        return dropped | guard(dirpath, [name for name in names if name not in dropped])
+
+    return ignore
+
+
+# What a seed copy is: everything it was pointed at, and one way out when the source is
+# busy. Stated once rather than at each `_plan` arm, so `chrome` and `path` cannot come
+# to word a refusal differently. [LAW:one-source-of-truth]
+def _seeding(source: Path, dest: Path, described: str) -> _Copy:
+    return _Copy(
+        source,
+        dest,
+        described,
+        excluded=frozenset(),
+        remedy=(
+            'Quit that browser and run this again, or set `seed = "fresh"` for a '
+            "profile that starts empty."
+        ),
+    )
 
 
 def _refuse(copy: _Copy, held: Path, holder: str, lead: str) -> CromError:
-    """The one thing crom says when it will not read a seed: what it saw, and the way out."""
+    """The one thing crom says when it will not read a directory: what it saw, and the
+    way out."""
     return Reason.SEED_BUSY.error(
         chrome.printable(
-            f"seed {copy.described} {lead}:\n"
+            f"{copy.described} {lead}:\n"
             f"  {held}\n"
             f"  {holder}\n"
             f"crom will not copy a user-data-dir a browser is writing. Chrome keeps Cookies, "
@@ -144,8 +203,7 @@ def _refuse(copy: _Copy, held: Path, holder: str, lead: str) -> CromError:
             f"so a copy taken now can catch one mid-transaction — and the damage surfaces "
             f"much later as missing history or a profile-error dialog, with nothing pointing "
             f"back here.\n"
-            f'Quit that browser and run this again, or set `seed = "fresh"` for a '
-            f"profile that starts empty."
+            f"{copy.remedy}"
         )
     )
 
@@ -201,12 +259,12 @@ def _copy(copy: _Copy) -> None:
     except OSError as e:
         raise Reason.SEED_UNREADABLE.error(
             chrome.printable(
-                f"seed {copy.described} cannot be read: {copy.source}: {e.strerror}"
+                f"{copy.described} cannot be read: {copy.source}: {e.strerror}"
             )
         ) from e
     if not present:
         raise Reason.SEED_MISSING.error(
-            chrome.printable(f"seed {copy.described} does not exist: {copy.source}")
+            chrome.printable(f"{copy.described} does not exist: {copy.source}")
         )
     copy.dest.parent.mkdir(parents=True, exist_ok=True)
     # `dest` is either absent or the freshly-made empty staging directory, never a
@@ -217,7 +275,7 @@ def _copy(copy: _Copy) -> None:
     # recreated is relative and resolves inside the tree.
     shutil.copytree(
         copy.source, copy.dest, dirs_exist_ok=True, symlinks=True,
-        ignore=_link_guard(copy.source, copy.described),
+        ignore=_ignoring(copy),
     )
 
 
@@ -307,6 +365,112 @@ def _plan(seed: Seed, staging: Path) -> tuple[_Copy, ...]:
             # A Chrome user-data-dir holds one directory per profile; we copy the named
             # one into the canonical slot so the browser opens straight into it.
             root = chrome_user_data_dir()
-            return (_Copy(root / which, staging / "Default", f"'chrome:{which}'"),)
+            return (_seeding(root / which, staging / "Default", f"seed 'chrome:{which}'"),)
         case SeedPath(path=path):
-            return (_Copy(path, staging, f"path '{path}'"),)
+            return (_seeding(path, staging, f"seed path '{path}'"),)
+
+
+# What a snapshot leaves behind, matched by entry name wherever it appears in the tree.
+# Names rather than paths because Chrome puts `Cache` under `Default/` and
+# `component_crx_cache` at the root, and a list of paths would have to track that layout
+# to stay true. [LAW:one-source-of-truth] `docs/snapshots.md` records the measurements
+# and the argument; this is the list.
+#
+# Every entry is rebuilt or re-downloaded on demand, and together they are most of a
+# profile: 2015 MB against 249 MB without them, measured on `user/default`. `Extensions`,
+# `Service Worker` and `IndexedDB` are deliberately absent — the last two are where
+# single-page applications keep session and auth state, which is the state a snapshot is
+# taken for, so dropping them to halve a snapshot would break the logins it carries.
+_REGENERATED = frozenset({
+    "Cache",
+    "Code Cache",
+    "GPUCache",
+    "DawnWebGPUCache",
+    "GraphiteDawnCache",
+    "ShaderCache",
+    "component_crx_cache",
+    "extensions_crx_cache",
+    "optimization_guide_model_store",
+    "WasmTtsEngine",
+    "OnDeviceHeadSuggestModel",
+    "Safe Browsing",
+    "ActorSafetyLists",
+    "CertificateRevocation",
+})
+
+# crom's own files in the profile, which say nothing true about the profile a snapshot
+# will seed: a launch record names the argv and the port of the profile it was captured
+# from, and a later `crom up` on a *different* profile would find that record already
+# sitting in its brand-new directory. [LAW:one-source-of-truth] Read from the modules
+# that own the names, so a rename cannot leave a stale spelling here.
+_BOOKKEEPING = frozenset({launched.FILENAME, chrome.STDERR_FILENAME})
+
+# Chrome's process singletons, which it creates at startup and removes on a clean exit.
+# Their presence in a directory nothing is running in is therefore the record of a
+# browser that was killed rather than quit. [LAW:one-source-of-truth] `SINGLETON_LOCK` is
+# named from `chrome`, which reads it as evidence of a live browser; the other two have
+# no reader but this one.
+_SINGLETONS = (chrome.SINGLETON_LOCK, "SingletonCookie", "SingletonSocket")
+
+
+@contextlib.contextmanager
+def _quiet(copy: _Copy) -> Iterator[None]:
+    """`_undisturbed`, plus the read only a captured profile can afford: a clean exit.
+
+    A snapshot is worth taking only if the profile it copies is one Chrome finished
+    writing, and `docs/snapshots.md` records that a clean exit is the only checkpoint
+    Chrome takes — there is no CDP command that quiesces a user-data-dir. So a profile
+    that still carries the singletons Chrome removes on its way out is refused: the
+    browser in it was killed, and a killed Chrome leaves SQLite mid-transaction.
+
+    Only capture asks this, and the narrowness is the point rather than an omission. A
+    `chrome:` seed copies `Chrome/<Profile>` while the singletons sit one level up at the
+    user-data-dir root, so extending the rule to seeding would refuse `crom up` on every
+    machine whose real Chrome ever crashed — the default seed, on the most common path.
+    Capture's source is a profile crom itself owns, which is what makes "bring it up and
+    quit it" a remedy crom can actually offer.
+
+    Inside `_undisturbed` rather than beside it, because residue only means an unclean
+    exit once nothing is running: a live browser holds the same three files, and reading
+    them without that established first would tell a user their browser had crashed while
+    they were looking at it. [LAW:no-ambient-temporal-coupling] the ordering is the
+    nesting, not a convention.
+    """
+    with _undisturbed(copy):
+        left = tuple(name for name in _SINGLETONS if os.path.lexists(copy.source / name))
+        if left:
+            raise Reason.PROFILE_UNCLEAN.error(
+                chrome.printable(
+                    f"{copy.described} was not shut down cleanly:\n"
+                    f"  {copy.source}\n"
+                    f"  {', '.join(left)} — Chrome removes these on a clean exit\n"
+                    f"A browser that left them behind was killed rather than quit, so its "
+                    f"Cookies, History and Login Data were last written mid-transaction. "
+                    f"A snapshot of that is a profile that fails weeks from now, with "
+                    f"nothing pointing back here.\n"
+                    f"Bring that profile up and quit the browser from its own menu, then "
+                    f"run this again."
+                )
+            )
+        yield
+
+
+def capture(source: Path, destination: Path, described: str) -> None:
+    """Copy a stopped profile to `destination`, whole or not at all.
+
+    The same shape as `materialize_under_lock`, over a `_Copy` that carries a snapshot's
+    two differences: the entries it leaves behind, and a refusal that has no `seed =
+    "fresh"` to offer. `_staged` means a capture that dies partway — disk full, a browser
+    opened mid-copy — leaves no directory for a later `snapshot:` seed to read as a
+    finished snapshot. [LAW:no-silent-failure]
+    """
+    with _staged(destination) as staging:
+        copy = _Copy(
+            source,
+            staging,
+            described,
+            excluded=_REGENERATED | _BOOKKEEPING,
+            remedy="Quit that browser and run this again.",
+        )
+        with _quiet(copy):
+            _copy(copy)

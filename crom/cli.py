@@ -311,6 +311,7 @@ _COMMAND_SECTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Run a browser", ("up", "down", "restart", "show", "list", "status")),
     ("Point tools at one", ("mcp", "env", "port")),
     ("Declare what exists", ("init", "add", "rm", "config", "forget")),
+    ("Keep a profile's data", ("snapshot",)),
     ("Look after crom's own state", ("doctor", "release", "clean")),
 )
 
@@ -402,10 +403,34 @@ class CromCommand(click.Command):
         return super().invoke(ctx)
 
 
+class CromSubGroup(click.Group):
+    """A group of commands under one noun, as `crom snapshot capture` is.
+
+    It exists for `command_class` alone. That attribute reaches only the commands built
+    directly on the group carrying it, so a subgroup made by click's default
+    `group_class` would build plain `click.Command`s — and a plain command never calls
+    `Session.begin`, leaving `crom snapshot capture` the one command in the CLI that ran
+    without crom being ready. [LAW:single-enforcer] the readying rule keeps one home by
+    covering both places a command can be declared, rather than being remembered at the
+    second one.
+
+    Separate from `CromGroup` rather than derived from it, because the root group's two
+    other behaviours are about being the root: a bare `crom` means `crom up`, where a
+    bare `crom snapshot` means the help for snapshots, and the curated `--help` sections
+    map the whole CLI rather than one noun's verbs. Failures need nothing here — a
+    `CromError` raised under a subcommand propagates through the root's `invoke`, which
+    reads `--json` from `ctx.meta` and so answers for a nested command exactly as it does
+    for a top-level one.
+    """
+
+    command_class = CromCommand
+
+
 class CromGroup(click.Group):
     """Turns a failed command into the CLI's exit-code contract, in one place."""
 
     command_class = CromCommand
+    group_class = CromSubGroup
 
     def parse_args(self, ctx, args):
         """A bare `crom` is `crom up`, said as an argument rather than as a second way in.
@@ -1564,6 +1589,49 @@ def rm_cmd(session: Session, ref: str, yes: bool, keep_data: bool):
     # would otherwise have been its only mention. [LAW:no-silent-failure]
     stopped_note = f" (stopped pid {', '.join(map(str, stopped))})" if stopped else ""
     click.echo(f"Removed {profile.ref}{stopped_note}")
+
+
+@main.group("snapshot")
+def snapshot_cmd():
+    """Keep a stopped profile's logins under a name, to start other profiles from.
+
+    A snapshot is a copy of a profile's user-data-dir, taken once and kept for the
+    machine rather than for one namespace — so a login done in one project's profile
+    becomes the starting state of any profile in any project.
+
+    The profile has to be stopped, and crom will not stop it for you. Chrome takes no
+    checkpoint while it runs, so a quit is the only moment its Cookies, History and
+    Login Data are whole on disk — and stopping it on your behalf would mean killing it,
+    which manufactures exactly the half-written profile the refusal exists to prevent.
+    Quit the browser, then capture.
+
+    What Chrome rebuilds by itself is left out: a snapshot is roughly an eighth of the
+    profile it came from, and carries the extensions, service workers and IndexedDB
+    stores that hold a logged-in session.
+    """
+
+
+@snapshot_cmd.command("capture")
+@click.argument("name")
+@click.argument("ref", required=False, default="default")
+@click.pass_obj
+def snapshot_capture_cmd(session: Session, name: str, ref: str):
+    """Copy a stopped profile's data into a snapshot called NAME.
+
+    REF is the profile to copy, `default` in the namespace you are standing in unless you
+    name another. Refused rather than overwritten if NAME is taken: a snapshot is its
+    contents, so crom cannot tell an accidental second capture from a deliberate one.
+    """
+    # `session.profile`, not `session.working`: a profile crom would have to declare on
+    # the spot has no directory to copy, so declaring one here would answer a request to
+    # keep existing state by inventing an empty profile and then failing on it.
+    profile = session.profile(ref)
+    made = operations.capture(profile, name)
+    click.echo(f"Captured '{made.name}' from {profile.ref}")
+    # The size is the snapshot's own, and it is worth printing precisely because it is
+    # not the profile's: a reader who knows their profile is two gigabytes needs to see
+    # that what crom kept is a fraction of it, or the number looks like a failed copy.
+    click.echo(f"  {_human_size(made.size)} · {made.path}")
 
 
 @main.command("init")
