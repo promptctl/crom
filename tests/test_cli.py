@@ -1521,6 +1521,144 @@ class CliTest(unittest.TestCase):
         self.assertIn("stopped :", row)
         self.assertNotIn("ready :", row)
 
+    # --- the fleet, narrowed ------------------------------------------------------------
+
+    def _dir_of(self, ref: str, cwd: Path | None = None) -> str:
+        """Where a declared profile's user-data-dir is — what `chrome.scan` is keyed by."""
+        return json.loads(self.crom("config", ref, "--json", cwd=cwd))["resolved"]["profile_dir"]
+
+    def test_running_keeps_every_profile_a_process_holds_and_no_others(self):
+        """`--running` filters on liveness, and liveness is not reachability.
+
+        A wedged browser is precisely what a fleet sweep must still find: something holds
+        the user-data-dir, nothing answers on the port, and the port stays held until
+        someone goes and stops it. A filter keeping only the rows that read `ready` would
+        drop the one profile a user ran this command to deal with — and every row it did
+        keep would look correct, which is why both live states are asserted from one
+        listing rather than either alone.
+        """
+        self.crom("init")
+        self.crom("add", "works", "--port", "9401")
+        self.crom("add", "wedged", "--port", "9402")
+        self.crom("add", "idle", "--port", "9403")
+        working, wedged = self._dir_of("works"), self._dir_of("wedged")
+
+        with (
+            mock.patch("crom.chrome.scan", return_value={working: (4242,), wedged: (4243,)}),
+            mock.patch(
+                "crom.chrome._probe_port",
+                side_effect=lambda port: chrome._Answered(chrome._Version(BROWSER, BROWSER_WEBSOCKET)) if port == 9401 else chrome._Silent(),
+            ),
+        ):
+            listing = self.crom("list", "--running")
+
+        self.assertIn("myproj/works", listing)
+        self.assertIn("myproj/wedged", listing)
+        self.assertNotIn("myproj/idle", listing)
+
+    def test_running_json_publishes_exactly_the_records_that_say_running(self):
+        """The flag and the key are one fact, checked from outside the process.
+
+        `--running` narrows on the same `running` a record publishes, so a row this drops
+        and a row that would have printed `"running": true` cannot be the same row. Asserted
+        over every surviving record rather than over the refs alone: a filter keyed on
+        anything else — the slug, the pids, the port — passes the ref check on this fixture
+        and fails here the moment the two disagree.
+        """
+        self.crom("init")
+        self.crom("add", "wedged", "--port", "9402")
+        self.crom("add", "idle", "--port", "9403")
+
+        with mock.patch("crom.chrome.scan", return_value={self._dir_of("wedged"): (4243,)}):
+            records = json.loads(self.crom("list", "--running", "--json"))
+
+        self.assertEqual({row["ref"] for row in records}, {"myproj/wedged"})
+        self.assertTrue(all(row["running"] for row in records))
+
+    def test_running_narrows_every_namespace_that_all_widened_to(self):
+        """The two flags are independent axes and compose into the fleet worth acting on.
+
+        A stopped profile in the *other* namespace is what makes this more than a rerun of
+        the ambient case: narrowing applied to the scope crom is standing in and left the
+        swept ones whole would still list a machine's worth of stopped browsers, which is
+        the shell loop this epic exists to delete.
+        """
+        other = self.root / "other"
+        other.mkdir()
+        self.crom("init", cwd=other)
+        self.crom("add", "dev", "--port", "9404", cwd=other)
+        self.crom("add", "rest", "--port", "9405", cwd=other)
+        self.crom("init")
+        self.crom("add", "ci", "--port", "9406")
+        self.crom("add", "idle", "--port", "9407")
+        elsewhere = self._dir_of("dev", cwd=other)
+
+        with mock.patch(
+            "crom.chrome.scan", return_value={elsewhere: (4242,), self._dir_of("ci"): (4243,)}
+        ):
+            listing = self.crom("list", "--all", "--running")
+
+        self.assertIn("other/dev", listing)
+        self.assertIn("myproj/ci", listing)
+        self.assertNotIn("other/rest", listing)
+        self.assertNotIn("myproj/idle", listing)
+
+    def test_running_still_names_what_crom_read_no_state_for(self):
+        """A declaration crom could not resolve is not a browser crom found stopped.
+
+        Both rows here are reports of crom's own blindness, and a namespace it cannot load
+        is exactly where a browser it cannot see would be hiding. Filtering them out would
+        answer a question nobody was able to put, in the one command a user runs *because*
+        something is broken — so `--running` hides the profiles it probed and found idle,
+        and nothing else.
+        """
+        gone = self.root / "gone"
+        gone.mkdir()
+        self.crom("init", cwd=gone)
+        self.crom("add", "dev", cwd=gone)
+        (gone / ".crom.toml").unlink()
+
+        self.crom("init")
+        self.crom("add", "idle")
+        config_path = self.project / ".crom.toml"
+        config_path.write_text(
+            config_path.read_text() + '\n[profiles.broken]\nflags = ["--x=${CROM_NOPE}"]\n'
+        )
+
+        output = self.crom("list", "--all", "--running")
+
+        self.assertIn("unresolved", output)
+        self.assertIn("unavailable", output)
+        self.assertNotIn("myproj/idle", output)
+
+    def test_no_probe_changes_the_state_a_row_reports_and_not_which_rows_survive(self):
+        """The two flags read one fold and must not multiply into four behaviours.
+
+        `--no-probe` decides which reading `chrome.health` folds, so the same live profile
+        reports `unprobed` where it would have reported `ready` or `unreachable`. Liveness
+        is the process table's half of that answer and the flag suppresses the port's, so
+        the set of profiles `--running` keeps is the one thing suppression must leave
+        alone. A filter reading the slug would pass every other test in this file and
+        empty this listing.
+        """
+        self.crom("init")
+        self.crom("add", "up", "--port", "9401")
+        self.crom("add", "idle", "--port", "9402")
+
+        with (
+            mock.patch("crom.chrome.scan", return_value={self._dir_of("up"): (4242,)}),
+            self._the_network_must_not_be_touched(),
+        ):
+            listing = self.crom("list", "--running", "--no-probe")
+
+        self.assertIn("myproj/up", listing)
+        self.assertIn("unprobed", listing)
+        self.assertNotIn("myproj/idle", listing)
+
+    def test_list_documents_the_running_flag(self):
+        """The flag is only usable if `crom list --help` says it exists."""
+        self.assertIn("--running", self.crom("list", "--help"))
+
     # --- the fourth state, and the flag that produces it --------------------------------
 
     @contextlib.contextmanager
