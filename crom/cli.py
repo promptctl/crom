@@ -1099,11 +1099,28 @@ def status_cmd(session: Session, ref: str, reading: chrome.PortReading, as_json:
 
 @main.command("list")
 @click.option("--all", "everything", is_flag=True, help="Include every namespace crom knows.")
+@click.option(
+    "--running",
+    "only_running",
+    is_flag=True,
+    help="Only the profiles a browser is up for, ready to act on.",
+)
 @_probe_option
 @_json_option
 @click.pass_obj
-def list_cmd(session: Session, everything: bool, reading: chrome.PortReading, as_json: bool):
-    """List the profiles addressable from here."""
+def list_cmd(
+    session: Session,
+    everything: bool,
+    only_running: bool,
+    reading: chrome.PortReading,
+    as_json: bool,
+):
+    """List the profiles addressable from here.
+
+    The two narrowings are independent and compose: `--all` widens which namespaces are
+    asked, `--running` drops the profiles nothing is up for. Together they are the fleet
+    you can act on right now, across every project on the machine.
+    """
     scopes, unavailable = _scopes_to_list(session, everything)
 
     # Every row is resolved before any row is judged, because the probe behind
@@ -1117,6 +1134,31 @@ def list_cmd(session: Session, everything: bool, reading: chrome.PortReading, as
         chrome.scan(),
         reading,
     )
+
+    # What `--running` becomes: the refs the listing leaves out, empty where the flag was
+    # not typed. The narrowing below then runs once either way over a value, rather than
+    # the rendering growing an arm that asks which flag it is under.
+    # [LAW:dataflow-not-control-flow]
+    #
+    # `state.running` and not the slug, because `running` is the verdict `describe`
+    # publishes under that very name — so the filter and the JSON key are one fact read
+    # twice, and `crom list --running --json` cannot drop a row that would have carried
+    # `"running": true`. Matching slugs here would be a second copy of crom's
+    # state-to-liveness rule, free to disagree with the first the day a fifth state lands.
+    # [LAW:one-source-of-truth]
+    #
+    # Only a ref crom probed can reach this set, which is what keeps an unresolvable
+    # declaration and an unavailable namespace in the listing under `--running`: crom read
+    # no state for either, and reporting them as not-running would answer a question
+    # nobody got to ask. [LAW:parse-dont-validate] the absence of an answer is not the
+    # answer "no" — and a namespace crom could not load is exactly where a browser it
+    # cannot see would be hiding, in the command a user runs *because* something is
+    # broken. [LAW:no-silent-failure]
+    hidden = {ref for ref, state in standing.items() if only_running and not state.running}
+    listing = [
+        (scope, [entry for entry in entries if entry.ref not in hidden])
+        for scope, entries in listing
+    ]
 
     records, lines = [], []
     for scope, entries in listing:
