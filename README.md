@@ -179,7 +179,11 @@ reports, not the launch handshake.
 
 Five commands add keys to that record. `crom restart --json` and `crom down --json` add
 `stopped`, the pids they killed, empty when the profile was not running — what a run took
-down is a fact about the act, and the record describes the profile. `crom show --json`
+down is a fact about the act, and the record describes the profile.
+`crom down --all --json` publishes an array of those records rather than one object, a row
+per profile the sweep reached, and each row adds `error`: the message where a stop failed,
+`null` where it took. A row whose stop failed still reads `running: true` and the state
+crom saw before the attempt, because the stop is exactly what did not happen. `crom show --json`
 adds `started`, whether it had to launch the browser first, and `windows`, how many came
 forward — zero for a headless profile, which is raised successfully and simply has no
 window to show for it. `crom up --json` adds two: `found`, the drift verdict it reached,
@@ -491,7 +495,7 @@ crom                          launch the default profile
 crom up [REF] [--no-restart]  launch it, or bring a running browser onto its current
                               config; --no-restart names a drifted browser's changes
                               instead of replacing it
-crom down [REF]               stop it
+crom down [REF | --all]       stop it, or every profile crom list --running shows
 crom restart [REF]            stop it and start it again on its current config
 crom show [REF]               bring its window to the front, launching it if needed
 crom list [--all] [--running] profiles addressable from here, and how each stands against
@@ -516,9 +520,11 @@ crom forget NAMESPACE         drop a namespace deliberately, releasing its ports
 ```
 
 `REF` is `name` (resolved in the ambient namespace) or `namespace/name`. It defaults to
-`default`, with two exceptions: `crom config` without a REF reports the ambient scope
+`default`, with three exceptions: `crom config` without a REF reports the ambient scope
 alone (which config is in effect, and what it declares) rather than resolving a profile,
-and `crom rm` requires a REF — it will not guess which profile you meant to delete.
+`crom down --all` takes no REF and refuses one as bad usage, since a REF names a single
+profile and `--all` names every profile at once, and `crom rm` requires a REF — it will
+not guess which profile you meant to delete.
 `crom release` and `crom clean` take no REF at all: their arguments are a raw ledger key
 and a directory path, each spelled the way `crom doctor` printed it.
 
@@ -537,6 +543,17 @@ and the port free.
 its process is up and its port is still held, which is the thing you were looking for —
 and so does a namespace crom could not load, which is where an unseen browser would be
 hiding.
+
+`crom down --all` stops exactly that set, so `crom list --running` is the sweep's preview:
+what the listing shows is what goes down. A wedged browser goes down with the rest, which
+is the reason to include them — the port one is sitting on comes back only when something
+stops it, and that is usually the profile you ran the sweep for. Liveness there comes from
+the process table and the CDP port is never asked, since a port's answer cannot change
+which profiles a process is holding. One profile failing to stop does not end the run:
+crom tries each, says what happened to every one, and exits 1 if any stop went
+unestablished. A declaration crom could not resolve is reported and never acted on, and it
+does not move the exit code — crom read no state for it, so there is nothing there to
+stop.
 
 `crom show` is the one macOS-only command. Every crom-managed Chrome is the same
 application bundle, so `activate` cannot pick between them — it raises whichever instance
