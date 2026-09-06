@@ -263,8 +263,12 @@ def _copy(copy: _Copy) -> None:
             )
         ) from e
     if not present:
+        # The path is the subject of "does not exist", not `described`. Said the other
+        # way round it was true only while the only caller was a seed: capture describes
+        # a *declared* profile, and "profile 'proj/ci' does not exist" contradicts the
+        # `crom list` the reader just ran. What is missing is the directory.
         raise Reason.SEED_MISSING.error(
-            chrome.printable(f"{copy.described} does not exist: {copy.source}")
+            chrome.printable(f"{copy.described}: {copy.source} does not exist")
         )
     copy.dest.parent.mkdir(parents=True, exist_ok=True)
     # `dest` is either absent or the freshly-made empty staging directory, never a
