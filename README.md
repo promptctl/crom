@@ -494,8 +494,9 @@ crom up [REF] [--no-restart]  launch it, or bring a running browser onto its cur
 crom down [REF]               stop it
 crom restart [REF]            stop it and start it again on its current config
 crom show [REF]               bring its window to the front, launching it if needed
-crom list [--all]             profiles addressable from here, and how each stands against
-                              its config; --all covers every namespace
+crom list [--all] [--running] profiles addressable from here, and how each stands against
+                              its config; --all covers every namespace, --running keeps only
+                              the profiles a browser is actually up for
 crom status [REF]             what the browser on its port actually is — pids and uptimes,
                               what CDP calls itself, and the pages it has open
 crom add NAME [--seed SEED]   declare a profile in the config governing this directory
@@ -531,6 +532,11 @@ table, with its CDP port left unasked — instead of `ready` or `unreachable`. `
 does not take it, because there is no probe there to suppress: `down` reports `stopped`
 from what it established itself, its kill having returned only once the process was gone
 and the port free.
+
+`crom list --running` drops only what crom found `stopped`, so a wedged browser stays —
+its process is up and its port is still held, which is the thing you were looking for —
+and so does a namespace crom could not load, which is where an unseen browser would be
+hiding.
 
 `crom show` is the one macOS-only command. Every crom-managed Chrome is the same
 application bundle, so `activate` cannot pick between them — it raises whichever instance
