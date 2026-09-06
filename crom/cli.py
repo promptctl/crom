@@ -921,7 +921,14 @@ def down_cmd(session: Session, ref: str | None, everything: bool, as_json: bool)
     if everything:
         return _sweep(session, as_json)
 
-    profile = session.profile(ref or "default")
+    # `if ref is None` and not `ref or`, because the two facts an optional argument can
+    # carry — "no REF was given" and "the REF given was empty" — are different, and `or`
+    # collapses them. A script interpolating an unset `$PROFILE` writes `crom down ""`,
+    # which used to be refused by `validate_name` with `invalid_name` and would otherwise
+    # stop `default` instead: a wrong profile stopped quietly, in place of a loud refusal.
+    # [LAW:no-silent-failure] the discriminator is whether click was given the argument,
+    # which it already answers with `None`. [LAW:parse-dont-validate]
+    profile = session.profile("default" if ref is None else ref)
     pids = operations.down(profile)
     message = _stop_line(profile.ref, pids)
     # `Stopped()` rather than a reading taken here: `chrome.kill` returns only once the
