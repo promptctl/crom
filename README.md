@@ -517,7 +517,9 @@ crom                          launch the default profile
 crom up [REF] [--no-restart]  launch it, or bring a running browser onto its current
                               config; --no-restart names a drifted browser's changes
                               instead of replacing it
-crom down [REF | --all]       stop it, or every profile crom list --running shows
+crom down [REF | --all]       stop it, or every profile crom list --running --all shows;
+                              --all reaches every namespace on the machine, not only the
+                              ones addressable from here
 crom restart [REF]            stop it and start it again on its current config
 crom show [REF]               bring its window to the front, launching it if needed
 crom list [--all] [--running] profiles addressable from here, and how each stands against
@@ -566,16 +568,18 @@ its process is up and its port is still held, which is the thing you were lookin
 and so does a namespace crom could not load, which is where an unseen browser would be
 hiding.
 
-`crom down --all` stops exactly that set, so `crom list --running` is the sweep's preview:
-what the listing shows is what goes down. A wedged browser goes down with the rest, which
-is the reason to include them — the port one is sitting on comes back only when something
-stops it, and that is usually the profile you ran the sweep for. Liveness there comes from
-the process table and the CDP port is never asked, since a port's answer cannot change
-which profiles a process is holding. One profile failing to stop does not end the run:
-crom tries each, says what happened to every one, and exits 1 if any stop went
-unestablished. A declaration crom could not resolve is reported and never acted on, and it
-does not move the exit code — crom read no state for it, so there is nothing there to
-stop.
+`crom down --all` reaches every namespace crom knows, so `crom list --running --all` is
+the sweep's preview: what that listing shows is what goes down. crom sweeps that wide
+because the browser you have forgotten about is rarely in the project you are standing in,
+and a sweep bounded by this directory would leave exactly that one running. A wedged
+browser goes down with the rest, which is the reason to include them — the port one is
+sitting on comes back only when something stops it, and that is usually the profile you
+ran the sweep for. Liveness there comes from the process table and the CDP port is never
+asked, since a port's answer cannot change which profiles a process is holding. One
+profile failing to stop does not end the run: crom tries each, says what happened to every
+one, and exits 1 if any stop went unestablished. A declaration crom could not resolve is
+reported and never acted on, and it does not move the exit code — crom read no state for
+it, so there is nothing there to stop.
 
 `crom show` is the one macOS-only command. Every crom-managed Chrome is the same
 application bundle, so `activate` cannot pick between them — it raises whichever instance
