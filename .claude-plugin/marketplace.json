@@ -1,0 +1,14 @@
+{
+  "name": "crom",
+  "description": "A real Chrome per project, each on a CDP port that never moves.",
+  "owner": {
+    "name": "Brandon Fryslie"
+  },
+  "plugins": [
+    {
+      "name": "crom",
+      "source": "./plugins/crom",
+      "description": "Teaches Claude to drive a real Chrome through the crom CLI: per-project profiles, a stable CDP port, chrome-devtools-mcp wiring, and the hazards that cost a user their session."
+    }
+  ]
+}
