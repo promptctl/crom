@@ -7,6 +7,5 @@
   },
   "homepage": "https://github.com/promptctl/crom",
   "repository": "https://github.com/promptctl/crom",
-  "license": "MIT",
   "keywords": ["chrome", "cdp", "browser", "chrome-devtools-mcp", "automation"]
 }

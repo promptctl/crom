@@ -106,20 +106,6 @@ them otherwise. And `--yes` on `rm` and `clean` skips the prompt that is the las
 standing between a mistyped ref and someone's logins, so type it only for the specific
 removal the user asked for.
 
-## A snapshot needs a quit, and `crom down` is not a quit
-
-`crom snapshot capture <name> [ref]` keeps a stopped profile's logins under a name. It
-refuses a running profile and it will not stop one for you.
-
-The obvious move is `crom down <ref> && crom snapshot capture ...`, and it is wrong.
-Chrome writes no checkpoint while it runs, so a real quit is the only moment Cookies,
-History and Login Data are whole on disk — and `crom down` is a kill, which manufactures
-exactly the half-written profile the refusal exists to prevent. The capture will
-succeed. What it captured is a torn session, and you find that out the next time those
-logins are needed.
-
-Ask the user to quit the browser, then capture.
-
 ## Do not launch Chrome yourself
 
 The moment crom feels like it is in the way — a flag it refuses, a port you would rather
@@ -194,9 +180,8 @@ that `unprobed` is not a promise that anything is reachable.
 
 ## Before you act
 
-Four lines that will still be true long after this file has scrolled out of reach:
+Three lines that will still be true long after this file has scrolled out of reach:
 
 - Connect on `state: "ready"`. `running: true` is only the lights being on.
 - `crom up` on a browser you did not launch costs someone their tabs. `--no-restart`.
 - `down --all`, `rm`, `release`, `clean` are requests, not repairs.
-- A snapshot needs a real quit. `crom down` is a kill.
