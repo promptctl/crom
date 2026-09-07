@@ -1,0 +1,11 @@
+{
+  "name": "crom",
+  "version": "0.1.0",
+  "description": "Drive a real Chrome from any project through the crom CLI — a per-project profile on a CDP port that never moves, wired to chrome-devtools-mcp.",
+  "author": {
+    "name": "Brandon Fryslie"
+  },
+  "homepage": "https://github.com/promptctl/crom",
+  "repository": "https://github.com/promptctl/crom",
+  "keywords": ["chrome", "cdp", "browser", "chrome-devtools-mcp", "automation"]
+}
